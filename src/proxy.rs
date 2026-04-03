@@ -1,5 +1,5 @@
-use crate::config::Config;
 use anyhow::{Context, Result};
+use log::debug;
 use std::process::Command;
 
 fn run_networksetup(args: &[&str]) -> Result<String> {
@@ -16,23 +16,18 @@ fn run_networksetup(args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Enable SOCKS5, HTTP, and HTTPS system proxies.
-pub fn enable(service: &str, config: &Config) -> Result<()> {
-    let socks_port = config.socks_port.to_string();
-    let http_port = config.http_port.to_string();
+/// Enable SOCKS5, HTTP, and HTTPS system proxies on the given host:port.
+pub fn enable(service: &str, host: &str, port: u16) -> Result<()> {
+    debug!("enabling proxies on '{}' -> {}:{}", service, host, port);
+    let port_str = port.to_string();
 
-    run_networksetup(&[
-        "-setsocksfirewallproxy",
-        service,
-        &config.socks_host,
-        &socks_port,
-    ])?;
+    run_networksetup(&["-setsocksfirewallproxy", service, host, &port_str])?;
     run_networksetup(&["-setsocksfirewallproxystate", service, "on"])?;
 
-    run_networksetup(&["-setwebproxy", service, &config.http_host, &http_port])?;
+    run_networksetup(&["-setwebproxy", service, host, &port_str])?;
     run_networksetup(&["-setwebproxystate", service, "on"])?;
 
-    run_networksetup(&["-setsecurewebproxy", service, &config.http_host, &http_port])?;
+    run_networksetup(&["-setsecurewebproxy", service, host, &port_str])?;
     run_networksetup(&["-setsecurewebproxystate", service, "on"])?;
 
     Ok(())
@@ -40,6 +35,7 @@ pub fn enable(service: &str, config: &Config) -> Result<()> {
 
 /// Disable SOCKS5, HTTP, and HTTPS system proxies.
 pub fn disable(service: &str) -> Result<()> {
+    debug!("disabling proxies on '{}'", service);
     run_networksetup(&["-setsocksfirewallproxystate", service, "off"])?;
     run_networksetup(&["-setwebproxystate", service, "off"])?;
     run_networksetup(&["-setsecurewebproxystate", service, "off"])?;

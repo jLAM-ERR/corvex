@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use log::debug;
 use std::process::Command;
 
 /// Detects the active macOS network service by finding the default route interface
@@ -11,8 +12,14 @@ pub fn detect_active_service() -> Result<String> {
     let route_str = String::from_utf8_lossy(&route_output.stdout);
 
     let iface = match parse_default_interface(&route_str) {
-        Some(iface) => iface,
-        None => return Ok("Wi-Fi".to_string()),
+        Some(iface) => {
+            debug!("default interface: {}", iface);
+            iface
+        }
+        None => {
+            debug!("no default interface found, falling back to Wi-Fi");
+            return Ok("Wi-Fi".to_string());
+        }
     };
 
     let ports_output = Command::new("networksetup")
@@ -21,7 +28,10 @@ pub fn detect_active_service() -> Result<String> {
         .context("Failed to run 'networksetup -listallhardwareports'")?;
     let ports_str = String::from_utf8_lossy(&ports_output.stdout);
 
-    Ok(parse_service_for_interface(&ports_str, &iface).unwrap_or_else(|| "Wi-Fi".to_string()))
+    let service =
+        parse_service_for_interface(&ports_str, &iface).unwrap_or_else(|| "Wi-Fi".to_string());
+    debug!("detected network service: '{}'", service);
+    Ok(service)
 }
 
 /// Extracts the interface name (e.g. "en0") from `route get default` output.
