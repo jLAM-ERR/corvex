@@ -1,0 +1,383 @@
+# Redesign CLI Flow v0.2.0
+
+## Overview
+- Redesign start/stop/status commands with auto-discovery and server health checks
+- `start` (no args): auto-discover working VLESS server from subscription URLs in `free.txt`
+- `start <VLESS_URL>`: create config from URL with corp DNS handling, then start
+- `start --ru` / `start <VLESS_URL> --ru`: add `.ru` TLD direct routing rule
+- Dynamic port allocation (20000-60000) instead of fixed 1080
+- Traffic routing via text files: `ctraffic.txt` (direct/corporate) and `ptraffic.txt` (proxy)
+- Server alive checking: TCP pre-filter + tunnel check with latency measurement
+- Auto-install xray via brew if missing
+- Remove `load`, `restart`, `dns`, `domain` commands; keep `reload`, `logs`
+- All config files follow XDG Base Directory Specification (`$XDG_CONFIG_HOME/xray/`)
+
+## Context (from discovery)
+- Branch: `release/0.2.0` from `v0.1.0`
+- Current CLI: start/stop/restart/reload/status/logs/load/domain/dns
+- Fixed port 1080 in `Config::new()` — used by `proxy::enable`, `xray::start`, `vless::create_config`
+- `vless.rs` already has VLESS URI parser and config creator — reused in new start flow
+- `dns.rs` has scutil parser, sync_to_config, init — reused internally by start
+- `proxy.rs` has networksetup enable/disable taking `config: &Config` for host:port
+- No HTTP client dependency yet — adding `ureq` for subscription downloads
+- 34 existing tests
+
+## Development Approach
+- **testing approach**: Regular (code first, then tests)
+- Complete each task fully before moving to the next
+- All parsing/checking functions take `&str` or simple inputs — unit testable without system calls
+- All tests must pass before starting next task
+- Update this plan file when scope changes during implementation
+
+## Testing Strategy
+- **unit tests**: required for every task
+- Pure parsing functions: direct unit tests
+- System-call functions: test the parsing logic separately from the Command execution
+
+## Progress Tracking
+- Mark completed items with `[x]` immediately when done
+- Add newly discovered tasks with + prefix
+- Document issues/blockers with warning prefix
+
+## Implementation Steps
+
+### Task 0: Rename app from xray-proxy to corvex
+
+**Files:**
+- Modify: `Cargo.toml`
+- Modify: `src/main.rs`
+- Modify: `CLAUDE.md`
+
+- [x] Rename package in Cargo.toml: `name = "corvex"`
+- [x] Update clap `#[command(name = "corvex")]` in main.rs
+- [x] Update `about` description in clap to reflect new name
+- [x] Update all references in CLAUDE.md
+- [x] Verify `cargo build` produces `corvex` binary
+- [x] Run tests — must pass before next task
+
+### Task 1: XDG paths and restructure CLI commands
+
+**Files:**
+- Modify: `Cargo.toml`
+- Modify: `src/main.rs`
+- Modify: `src/config.rs`
+
+- [ ] Add `ureq` dependency to Cargo.toml
+- [ ] Add `base64` dependency to Cargo.toml (for subscription decoding)
+- [ ] Add `rand` dependency to Cargo.toml (for random port selection)
+- [ ] Update `Config::new()` to use `$XDG_CONFIG_HOME/xray/` (fall back to `~/.config/xray/` if unset)
+- [ ] Add `free_urls: PathBuf` to Config (default: `$XDG_CONFIG_HOME/xray/free.txt`)
+- [ ] Add `ctraffic: PathBuf` to Config (default: `$XDG_CONFIG_HOME/xray/ctraffic.txt`)
+- [ ] Add `ptraffic: PathBuf` to Config (default: `$XDG_CONFIG_HOME/xray/ptraffic.txt`)
+- [ ] Remove old `direct_domains`/`proxy_domains` fields from Config
+- [ ] Restructure CLI: remove `Load`, `Restart`, `Dns`, `Domain` commands and all their variants
+- [ ] Change `Start` to accept optional `uri: Option<String>` and `--ru` flag
+- [ ] Update `Commands` enum and command routing in `run()`
+- [ ] Remove `cmd_restart`, `cmd_dns`, `cmd_load`, `cmd_domain` functions
+- [ ] Preserve `vless::parse_vless_uri`, `vless::apply_to_config`, `vless::create_config` (reused in Task 7)
+- [ ] Keep `dns::sync_to_config`, `dns::init`, `dns::parse_scutil_dns` as internal functions
+- [ ] Delete `src/domain.rs` module and `mod domain;` declaration
+- [ ] Run `cargo clippy` — fix warnings from removed code
+- [ ] Run `cargo fmt`
+- [ ] Run tests — update/remove broken tests, must pass before next task
+
+### Task 2: Dynamic port allocation
+
+**Files:**
+- Modify: `src/config.rs`
+- Create: `src/port.rs`
+- Modify: `src/main.rs`
+- Modify: `src/proxy.rs`
+- Modify: `src/xray.rs`
+- Modify: `src/vless.rs`
+
+- [ ] Create `src/port.rs` with `find_free_port() -> Result<u16>` — randomly pick port in 20000-60000, try bind, retry up to 100 times
+- [ ] Add `mod port;` to main.rs
+- [ ] Keep `socks_port`/`http_port` in Config but change default to 0 (meaning "dynamic, assign at start time")
+- [ ] Collapse dual-port model: single dynamic port for both SOCKS and HTTP
+- [ ] Update `proxy::enable` to take explicit `host: &str, port: u16` parameters instead of reading from Config
+- [ ] Update `proxy::disable` — no port needed (just turns off proxy state)
+- [ ] Update `xray::start` — remove `check_port_available` for config ports (port is dynamic now)
+- [ ] Update `vless::create_config` to accept single `port: u16` parameter
+- [ ] Write tests for `find_free_port` (returns port in range)
+- [ ] Write tests for updated `proxy::enable` signature
+- [ ] Run tests — must pass before next task
+
+### Task 3: Traffic file parsing and routing rules
+
+**Files:**
+- Create: `src/traffic.rs`
+- Modify: `src/main.rs`
+- Modify: `src/vless.rs`
+
+- [ ] Create `src/traffic.rs` module
+- [ ] Add `mod traffic;` to main.rs
+- [ ] Implement `parse_traffic_file(path: &Path) -> Result<Vec<String>>` — read file, split by newline, trim whitespace, skip empty lines
+- [ ] Implement `normalize_entry(entry: &str) -> String` — if entry doesn't start with `domain:` or `regexp:`, prepend `domain:`
+- [ ] Implement `build_routing_rules(ctraffic: &[String], ptraffic: &[String], proxy_tag: &str, ru_direct: bool) -> Vec<serde_json::Value>`:
+  - If ctraffic non-empty: add rule with `"outboundTag": "direct"` and domain list
+  - If ptraffic non-empty: add rule with `"outboundTag": proxy_tag` and domain list
+  - If `ru_direct`: add `{"ruleTag": "ru-tld-direct", "domain": ["regexp:\\.ru$"], "outboundTag": "direct"}`
+- [ ] Update `vless::create_config` to accept routing rules parameter and include them in routing.rules
+- [ ] Write tests for `parse_traffic_file` (normal lines, empty lines, whitespace)
+- [ ] Write tests for `normalize_entry` ("domain:x.com" unchanged, "x.com" → "domain:x.com", "regexp:..." unchanged)
+- [ ] Write tests for `build_routing_rules` (ctraffic only, ptraffic only, both, with/without ru flag)
+- [ ] Run tests — must pass before next task
+
+### Task 4: Auto-install xray via brew
+
+**Files:**
+- Modify: `src/xray.rs`
+
+- [ ] Add `ensure_installed(xray_bin: &str) -> Result<()>` function
+- [ ] Check `which <xray_bin>` — if found, return Ok silently
+- [ ] If not found, run `brew install --quiet xray` — fail with clear error if brew fails
+- [ ] No output on success (spec: "NO print any message")
+- [ ] Write test for the which-check logic
+- [ ] Run tests — must pass before next task
+
+### Task 5: Subscription file download and parsing
+
+**Files:**
+- Create: `src/subscription.rs`
+- Modify: `src/main.rs`
+
+- [ ] Create `src/subscription.rs` module
+- [ ] Add `mod subscription;` to main.rs
+- [ ] Implement `load_free_urls(path: &Path) -> Result<Vec<String>>` — read free.txt, split by newline, trim, skip empty lines
+- [ ] Implement `download_subscription(url: &str) -> Result<String>` — HTTP GET via ureq, return body as string
+- [ ] Implement `decode_subscription(data: &str) -> Result<Vec<String>>` — base64 decode, split by newline, return list of URIs
+- [ ] Implement `filter_grpc_vless(uris: &[String]) -> Vec<String>` — keep only lines starting with `vless://` and containing `type=grpc`
+- [ ] Write tests for `decode_subscription` with sample base64 data
+- [ ] Write tests for `filter_grpc_vless` with mixed URIs (vless grpc, vless tcp, vmess, trojan)
+- [ ] Write tests for `load_free_urls` with temp file
+- [ ] Run tests — must pass before next task
+
+### Task 6a: TCP connectivity check
+
+**Files:**
+- Create: `src/health.rs`
+- Modify: `src/main.rs`
+
+- [ ] Create `src/health.rs` module
+- [ ] Add `mod health;` to main.rs
+- [ ] Implement `check_tcp(host: &str, port: u16, timeout: Duration) -> Result<()>` — TCP connect with timeout using `std::net::TcpStream::connect_timeout`
+- [ ] Write tests for `check_tcp` (valid address format, timeout value)
+- [ ] Run tests — must pass before next task
+
+### Task 6b: Tunnel check with temp xray
+
+**Files:**
+- Modify: `src/health.rs`
+
+- [ ] Implement `generate_temp_config(params: &VlessParams, local_port: u16) -> Result<PathBuf>` — write minimal xray config to `/tmp/xray-check-{local_port}.json`
+- [ ] Implement `check_tunnel(params: &VlessParams, xray_bin: &str) -> Result<Duration>`:
+  - Find a free port via `port::find_free_port()`
+  - Generate temp config with that port
+  - Spawn xray process (track by child process handle, NOT pid file)
+  - Wait 1s for startup
+  - Make HTTP request through `127.0.0.1:{port}` via ureq SOCKS proxy to a test URL
+  - Measure round-trip latency
+  - Kill child process, remove temp config
+  - Return latency duration
+- [ ] Ensure cleanup happens even on error (kill child, remove temp file)
+- [ ] Write tests for `generate_temp_config` (valid JSON output, correct port/address)
+- [ ] Run tests — must pass before next task
+
+### Task 6c: Find alive server orchestration
+
+**Files:**
+- Modify: `src/health.rs`
+
+- [ ] Implement `find_alive_server(uris: &[String], xray_bin: &str) -> Result<String>`:
+  - For each URI: parse with `vless::parse_vless_uri`
+  - Fast pre-filter: `check_tcp` with 5s timeout — skip if unreachable
+  - Full check: `check_tunnel` — skip if latency > 3000ms (DEGRADED)
+  - Return first URI with latency <= 3000ms (READY)
+  - After all checks: kill any remaining test xray processes
+  - Error if no servers are reachable
+- [ ] Write test for `find_alive_server` flow logic
+- [ ] Run tests — must pass before next task
+
+### Task 7: Redesign `start` command
+
+**Files:**
+- Modify: `src/main.rs`
+- Modify: `src/vless.rs`
+- Modify: `src/dns.rs`
+
+- [ ] Implement `cmd_start(config: &Config, uri: Option<&str>, ru_direct: bool)` with two flows:
+- [ ] **Flow A — `start <VLESS_URL>`**:
+  - Parse VLESS URI
+  - Load traffic files (ctraffic.txt, ptraffic.txt) if they exist
+  - Build routing rules from traffic files + `--ru` flag
+  - If config.json missing: create with `vless::create_config` (include routing rules)
+  - If config.json exists: update with `vless::apply_to_config`
+  - If corp-dns.json missing: run `dns::init` (scutil discovery), then `dns::sync_to_config`
+  - If corp-dns.json exists: run `dns::sync_to_config`
+  - Run main algorithm
+- [ ] **Flow B — `start` (no args)**:
+  - If config.json exists: run main algorithm directly
+  - If config.json missing: load free.txt, download subscriptions, filter grpc, find alive server, create config from returned URI (with traffic rules), run main algorithm
+- [ ] **Main algorithm** (shared, correct order):
+  1. Call `xray::ensure_installed`
+  2. Find free port via `port::find_free_port()`
+  3. Write port into xray config.json inbound section
+  4. Start xray (it reads config with the correct port)
+  5. Verify xray is listening
+  6. Enable system proxy on `127.0.0.1:{free_port}`
+- [ ] Write tests for config inbound port update logic
+- [ ] Write tests for traffic rules integration in config creation
+- [ ] Run tests — must pass before next task
+
+### Task 8: Redesign `stop` command
+
+**Files:**
+- Modify: `src/main.rs`
+
+- [ ] Simplify `cmd_stop`: disable proxy, stop xray, print "corvex stopped!"
+- [ ] Remove verbose intermediate output (no "Disabling...", "Stopping..." lines)
+- [ ] Run tests — must pass before next task
+
+### Task 9: Redesign `status` command
+
+**Files:**
+- Modify: `src/main.rs`
+
+- [ ] Redesign `cmd_status` output:
+  - Show started/stopped with PID
+  - Show http/https/socks host:port from networksetup query
+  - Show last 5 lines of logs
+- [ ] Remove port-listening checks via lsof (redundant with proxy info)
+- [ ] Keep network service detection
+- [ ] Write test for status output formatting logic
+- [ ] Run tests — must pass before next task
+
+### Task 10: Verify acceptance criteria
+
+- [ ] `start` (no config, no free.txt) → clear error message
+- [ ] `start` (no config, with free.txt) → downloads, checks, creates config, starts
+- [ ] `start <VLESS_URL>` (no config) → creates config, discovers DNS, starts
+- [ ] `start <VLESS_URL>` (with config) → updates config, syncs DNS, starts
+- [ ] `start` (with config) → starts directly
+- [ ] `start --ru` → adds `.ru` TLD direct rule to config
+- [ ] ctraffic.txt entries appear as direct routing rules in config.json
+- [ ] ptraffic.txt entries appear as proxy routing rules in config.json
+- [ ] `stop` → stops xray, disables proxy, prints "corvex stopped!"
+- [ ] `status` → shows PID/ports/logs correctly
+- [ ] `reload` and `logs` still work
+- [ ] Run full test suite: `cargo test`
+- [ ] Run `cargo clippy`
+- [ ] Run `cargo fmt --check`
+
+### Task 11: Update documentation
+
+- [ ] Update CLAUDE.md with new CLI commands and architecture
+- [ ] Update version in Cargo.toml to 0.2.0
+
+### Task 12: Write README.md
+
+**Files:**
+- Create: `README.md`
+
+- [ ] Write README.md covering:
+  - What corvex does (manage Xray VPN proxy on macOS)
+  - Installation (cargo build, brew install xray)
+  - Quick start (`corvex start`, `corvex start <VLESS_URL>`)
+  - Commands reference (start, stop, status, reload, logs)
+  - Flags (`--ru`, `--config`)
+  - Configuration files (free.txt, ctraffic.txt, ptraffic.txt, corp-dns.json)
+  - XDG config paths
+- [ ] Move plan to `docs/plans/completed/`
+
+## Technical Details
+
+### XDG Base Directory
+All config files use `$XDG_CONFIG_HOME/xray/` (defaults to `~/.config/xray/` if `$XDG_CONFIG_HOME` is unset):
+```
+$XDG_CONFIG_HOME/xray/config.json      — xray config
+$XDG_CONFIG_HOME/xray/xray.pid         — PID file
+$XDG_CONFIG_HOME/xray/corp-dns.json    — corporate DNS mappings
+$XDG_CONFIG_HOME/xray/free.txt        — subscription URLs
+$XDG_CONFIG_HOME/xray/ctraffic.txt     — corporate/direct traffic domains
+$XDG_CONFIG_HOME/xray/ptraffic.txt     — proxy traffic domains
+```
+Log file: `/var/log/xray/xray.log` (not under XDG — system log location).
+
+### Traffic file format (ctraffic.txt / ptraffic.txt)
+One entry per line, newline-separated. Empty lines and whitespace are ignored.
+```
+domain:corp.example.com
+corp-internal.local
+regexp:.*\.corp$
+domain:another.example.com
+```
+Entries without `domain:` or `regexp:` prefix get `domain:` prepended automatically.
+
+### free.txt format
+Plain text, one URL per line:
+```
+https://example.com/subscription1.txt
+https://example.com/subscription2.txt
+```
+
+### Subscription file format
+Base64-encoded text. Decoded content is newline-separated URIs:
+```
+vless://uuid@host:443?encryption=none&type=grpc&security=tls&sni=example.com#Name1
+vmess://base64data
+trojan://password@host:443#Name2
+vless://uuid@host:443?type=tcp&security=tls#Name3
+```
+Filter: keep only lines starting with `vless://` and containing `type=grpc`.
+
+### Server alive check flow
+```
+For each URI:
+  1. Parse URI → VlessParams
+  2. TCP connect to host:port (5s timeout) → skip if unreachable
+  3. Tunnel check:
+     a. find_free_port() → unique local port
+     b. Write temp config to /tmp/xray-check-{port}.json
+     c. Spawn xray with temp config (track by process handle)
+     d. HTTP request through SOCKS proxy → measure latency
+     e. Kill child process, remove temp config
+     f. Latency > 3000ms → DEGRADED (skip)
+     g. Latency <= 3000ms → READY (return this URI)
+  4. Kill any remaining test processes
+  → Error if no servers reachable
+```
+
+### Main algorithm (correct order)
+1. `xray::ensure_installed()` — auto-install if missing
+2. `port::find_free_port()` → e.g. 34567
+3. Write port into xray config.json inbound section
+4. Start xray (reads config with port 34567)
+5. Verify xray is alive
+6. Enable system proxy: `networksetup -set*proxy <service> 127.0.0.1 34567`
+
+### `--ru` flag
+When `--ru` is passed to `start`, adds this routing rule to config.json:
+```json
+{
+  "ruleTag": "ru-tld-direct",
+  "domain": ["regexp:\\.ru$"],
+  "outboundTag": "direct"
+}
+```
+
+### New dependencies
+- `ureq` — blocking HTTP client for subscription downloads and tunnel latency check
+- `base64` — decode subscription data
+- `rand` — random port selection in range 20000-60000
+
+## Post-Completion
+
+**Manual verification:**
+- Test `start` with real VLESS subscription
+- Test `start <URL>` with real VLESS URI
+- Test `start --ru` adds `.ru` routing rule
+- Test with ctraffic.txt and ptraffic.txt files present
+- Verify macOS proxy settings toggled correctly
+- Test server health check with unreachable servers (timeout behavior)
+- Test with no internet connectivity (graceful error)

@@ -1,0 +1,50 @@
+{
+  // Option A: direct proxy URI (VLESS, VMess, Trojan, or Shadowsocks)
+  // "uri": "vless://uuid@host:443?encryption=none&type=grpc&security=tls&sni=host.com#Name",
+
+  // Option B: subscription URLs for auto-discovery
+  "file-url": [
+    "https://example.com/subscription1.txt",
+    "https://example.com/subscription2.txt"
+  ],
+
+  // Corporate DNS: domain -> nameserver IP
+  // Merged with auto-discovered entries from macOS scutil --dns
+  "corporate-dns": {
+    "corp.example.com": "10.0.0.1",
+    "internal.company.local": "10.0.0.2"
+  },
+
+  // Routing rules
+  "routes": {
+    // Route .ru TLD directly (bypass proxy)
+    "direct-ru": true,
+
+    // Domains forced through the proxy
+    "proxy-traffic": [
+      "domain:youtube.com",
+      "domain:google.com",
+      "twitter.com",
+      "openai.com"
+    ],
+
+    // Domains that bypass the proxy (corporate/internal traffic)
+    "corporate-traffic": [
+      "domain:corp.example.com",
+      "internal.company.local",
+      "domain:vpn.office.net"
+    ]
+  },
+
+  // Logging configuration
+  "log": {
+    "xray": {
+      "loglevel": "warning",
+      "access": "/var/log/xray/access.log",
+      "error": "/var/log/xray/error.log"
+    },
+    "corvex": {
+      "debug": false
+    }
+  }
+}

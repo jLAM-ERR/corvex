@@ -1,52 +1,9 @@
-use crate::config::Config;
 use anyhow::{bail, Context, Result};
+use log::debug;
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::IpAddr;
-
-fn read_mappings(config: &Config) -> Result<BTreeMap<String, String>> {
-    if !config.corp_dns.exists() {
-        return Ok(BTreeMap::new());
-    }
-    let content = fs::read_to_string(&config.corp_dns).context("Failed to read corp-dns file")?;
-    let map: BTreeMap<String, String> =
-        serde_json::from_str(&content).context("Failed to parse corp-dns JSON")?;
-    Ok(map)
-}
-
-fn write_mappings(config: &Config, map: &BTreeMap<String, String>) -> Result<()> {
-    if let Some(parent) = config.corp_dns.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let json = serde_json::to_string_pretty(map).context("Failed to serialize DNS mappings")?;
-    fs::write(&config.corp_dns, json).context("Failed to write corp-dns file")?;
-    Ok(())
-}
-
-pub fn list(config: &Config) -> Result<BTreeMap<String, String>> {
-    read_mappings(config)
-}
-
-pub fn add(domain: &str, server: &str, config: &Config) -> Result<bool> {
-    // Validate IP
-    server
-        .parse::<IpAddr>()
-        .map_err(|_| anyhow::anyhow!("Invalid IP address: {server}"))?;
-
-    let mut map = read_mappings(config)?;
-    let was_update = map.contains_key(domain);
-    map.insert(domain.to_string(), server.to_string());
-    write_mappings(config, &map)?;
-    Ok(was_update)
-}
-
-pub fn remove(domain: &str, config: &Config) -> Result<()> {
-    let mut map = read_mappings(config)?;
-    if map.remove(domain).is_none() {
-        bail!("Domain not found: {domain}");
-    }
-    write_mappings(config, &map)
-}
+use std::path::Path;
 
 /// Parse `scutil --dns` output into domain → nameserver mappings.
 /// Extracts resolvers that have a `domain` entry (split-DNS / corp DNS),
@@ -99,21 +56,24 @@ pub fn parse_scutil_dns(output: &str) -> BTreeMap<String, String> {
     result
 }
 
-/// Sync corp-dns.json mappings into xray config.json's dns.servers section.
+/// Sync DNS mappings into xray config.json's dns.servers section.
 /// Each mapping becomes a DNS server entry with a domain matcher.
-pub fn sync_to_config(config: &Config) -> Result<usize> {
-    let mappings = read_mappings(config)?;
+pub fn sync_to_config(
+    xray_config_path: &Path,
+    mappings: &BTreeMap<String, String>,
+) -> Result<usize> {
+    debug!("read {} corp DNS mappings", mappings.len());
     if mappings.is_empty() {
         return Ok(0);
     }
 
-    let content = fs::read_to_string(&config.xray_config).context("Failed to read xray config")?;
+    let content = fs::read_to_string(xray_config_path).context("Failed to read xray config")?;
     let mut xray_config: serde_json::Value =
         serde_json::from_str(&content).context("Failed to parse xray config JSON")?;
 
     // Build DNS servers from corp mappings
     let mut servers: Vec<serde_json::Value> = Vec::new();
-    for (domain, server) in &mappings {
+    for (domain, server) in mappings {
         servers.push(serde_json::json!({
             "address": server,
             "port": 53,
@@ -139,18 +99,22 @@ pub fn sync_to_config(config: &Config) -> Result<usize> {
         }
     }
 
-    xray_config["dns"] = serde_json::json!({ "servers": servers });
+    if xray_config.get("dns").is_none() {
+        xray_config["dns"] = serde_json::json!({});
+    }
+    xray_config["dns"]["servers"] = serde_json::json!(servers);
 
     let pretty =
         serde_json::to_string_pretty(&xray_config).context("Failed to serialize xray config")?;
-    fs::write(&config.xray_config, pretty).context("Failed to write xray config")?;
+    fs::write(xray_config_path, pretty).context("Failed to write xray config")?;
 
     Ok(mappings.len())
 }
 
-/// Discover corp DNS mappings from macOS `scutil --dns` and write to corp-dns.json.
-/// Returns the discovered mappings.
-pub fn init(config: &Config) -> Result<BTreeMap<String, String>> {
+/// Discover corp DNS mappings from macOS `scutil --dns`.
+/// Returns the discovered mappings without writing to any file.
+pub fn init() -> Result<BTreeMap<String, String>> {
+    debug!("running scutil --dns to discover corp DNS");
     let output = std::process::Command::new("scutil")
         .arg("--dns")
         .output()
@@ -162,82 +126,18 @@ pub fn init(config: &Config) -> Result<BTreeMap<String, String>> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let discovered = parse_scutil_dns(&stdout);
+    debug!("discovered {} split-DNS resolvers", discovered.len());
 
     if discovered.is_empty() {
         bail!("No split-DNS resolvers found in scutil --dns output");
     }
 
-    write_mappings(config, &discovered)?;
     Ok(discovered)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn test_config(dir: &std::path::Path) -> Config {
-        let mut config = Config::new(None);
-        config.corp_dns = PathBuf::from(dir).join("corp-dns.json");
-        config
-    }
-
-    #[test]
-    fn add_list_remove_cycle() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-
-        let was_update = add("corp.example.com", "10.0.0.1", &config).unwrap();
-        assert!(!was_update);
-
-        let map = list(&config).unwrap();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["corp.example.com"], "10.0.0.1");
-
-        remove("corp.example.com", &config).unwrap();
-        let map = list(&config).unwrap();
-        assert!(map.is_empty());
-    }
-
-    #[test]
-    fn update_existing_mapping() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-
-        add("corp.example.com", "10.0.0.1", &config).unwrap();
-        let was_update = add("corp.example.com", "10.0.0.2", &config).unwrap();
-        assert!(was_update);
-
-        let map = list(&config).unwrap();
-        assert_eq!(map["corp.example.com"], "10.0.0.2");
-    }
-
-    #[test]
-    fn invalid_ip_rejected() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-
-        let err = add("domain.com", "not-an-ip", &config).unwrap_err();
-        assert!(err.to_string().contains("Invalid IP"));
-    }
-
-    #[test]
-    fn remove_nonexistent_domain() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-
-        let err = remove("nope.com", &config).unwrap_err();
-        assert!(err.to_string().contains("not found"));
-    }
-
-    #[test]
-    fn list_empty_when_file_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-
-        let map = list(&config).unwrap();
-        assert!(map.is_empty());
-    }
 
     #[test]
     fn parse_scutil_dns_with_split_resolvers() {
@@ -297,8 +197,7 @@ resolver #1
     #[test]
     fn sync_to_config_adds_dns_servers() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = test_config(dir.path());
-        config.xray_config = dir.path().join("config.json");
+        let xray_config_path = dir.path().join("config.json");
 
         // Write a minimal xray config
         let xray_cfg = serde_json::json!({
@@ -306,21 +205,21 @@ resolver #1
             "outbounds": [],
         });
         fs::write(
-            &config.xray_config,
+            &xray_config_path,
             serde_json::to_string_pretty(&xray_cfg).unwrap(),
         )
         .unwrap();
 
-        // Add corp DNS mappings
-        add("corp.example.com", "10.0.0.1", &config).unwrap();
-        add("internal.local", "172.16.0.1", &config).unwrap();
+        let mut mappings = BTreeMap::new();
+        mappings.insert("corp.example.com".to_string(), "10.0.0.1".to_string());
+        mappings.insert("internal.local".to_string(), "172.16.0.1".to_string());
 
-        let count = sync_to_config(&config).unwrap();
+        let count = sync_to_config(xray_config_path.as_path(), &mappings).unwrap();
         assert_eq!(count, 2);
 
         // Verify xray config has dns.servers
         let updated: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&config.xray_config).unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(&xray_config_path).unwrap()).unwrap();
         let servers = updated["dns"]["servers"].as_array().unwrap();
         assert_eq!(servers.len(), 2);
 
@@ -334,8 +233,7 @@ resolver #1
     #[test]
     fn sync_to_config_preserves_non_corp_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let mut config = test_config(dir.path());
-        config.xray_config = dir.path().join("config.json");
+        let xray_config_path = dir.path().join("config.json");
 
         // Write xray config with existing DNS
         let xray_cfg = serde_json::json!({
@@ -349,16 +247,18 @@ resolver #1
             },
         });
         fs::write(
-            &config.xray_config,
+            &xray_config_path,
             serde_json::to_string_pretty(&xray_cfg).unwrap(),
         )
         .unwrap();
 
-        add("corp.example.com", "10.0.0.1", &config).unwrap();
-        sync_to_config(&config).unwrap();
+        let mut mappings = BTreeMap::new();
+        mappings.insert("corp.example.com".to_string(), "10.0.0.1".to_string());
+
+        sync_to_config(xray_config_path.as_path(), &mappings).unwrap();
 
         let updated: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&config.xray_config).unwrap()).unwrap();
+            serde_json::from_str(&fs::read_to_string(&xray_config_path).unwrap()).unwrap();
         let servers = updated["dns"]["servers"].as_array().unwrap();
 
         // corp entry + "8.8.8.8" entry + "1.1.1.1" string
@@ -369,15 +269,6 @@ resolver #1
         // Existing non-corp entries preserved (strings before objects in iteration order)
         assert_eq!(servers[1], "1.1.1.1");
         assert_eq!(servers[2]["address"], "8.8.8.8");
-    }
-
-    #[test]
-    fn sync_to_config_no_mappings_returns_zero() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = test_config(dir.path());
-        // No corp-dns.json exists, read_mappings returns empty
-        let count = sync_to_config(&config).unwrap();
-        assert_eq!(count, 0);
     }
 
     #[test]
