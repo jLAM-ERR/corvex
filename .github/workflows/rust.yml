@@ -1,0 +1,204 @@
+# =============================================================================
+# GitHub Actions: macOS Release для Rust CLI
+# =============================================================================
+# Собирает universal binary (x86_64 + aarch64) для macOS,
+# архивирует и публикует как GitHub Release при пуше тега v*.
+# =============================================================================
+
+name: Release macOS
+
+# ---------------------------------------------------------------------------
+# Триггер: запуск только при пуше тега вида v1.0.0, v0.3.2-beta и т.д.
+# ---------------------------------------------------------------------------
+on:
+  push:
+    tags:
+      - "v*"
+
+# ---------------------------------------------------------------------------
+# Минимальные permissions по принципу least privilege.
+# contents: write — нужен для создания GitHub Release и загрузки артефактов.
+# ---------------------------------------------------------------------------
+permissions:
+  contents: write
+
+# ---------------------------------------------------------------------------
+# Переменные, общие для всех jobs.
+# CARGO_TERM_COLOR — цветной вывод в логах CI для удобства чтения.
+# ---------------------------------------------------------------------------
+env:
+  CARGO_TERM_COLOR: always
+  # Имя бинарника — должно совпадать с [[bin]] name в Cargo.toml.
+  # Измени на своё, если отличается.
+  BINARY_NAME: corvex
+
+jobs:
+  # ==========================================================================
+  # Job: build — сборка universal binary для macOS
+  # ==========================================================================
+  build:
+    name: Build macOS universal binary
+    runs-on: macos-14  # Apple Silicon runner (M1); собирает оба таргета
+
+    steps:
+      # ----------------------------------------------------------------------
+      # 1. Checkout репозитория с полной историей тегов.
+      #    fetch-depth: 0 гарантирует, что git describe и tag info доступны.
+      # ----------------------------------------------------------------------
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ----------------------------------------------------------------------
+      # 2. Извлечение версии из тега (v1.2.3 → 1.2.3).
+      #    Сохраняем в $GITHUB_ENV для использования в последующих шагах.
+      # ----------------------------------------------------------------------
+      - name: Extract version from tag
+        run: |
+          # GITHUB_REF = refs/tags/v1.2.3 → VERSION = 1.2.3
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> "$GITHUB_ENV"
+          echo "::notice::Building release ${VERSION}"
+
+      # ----------------------------------------------------------------------
+      # 3. Установка Rust stable toolchain через официальный action.
+      #    Добавляем оба таргета: x86_64 (Intel) и aarch64 (Apple Silicon).
+      # ----------------------------------------------------------------------
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      # ----------------------------------------------------------------------
+      # 4. Кэширование Cargo-артефактов для ускорения повторных сборок.
+      #    Ключ кэша привязан к lockfile — при обновлении зависимостей
+      #    кэш пересоздаётся автоматически.
+      # ----------------------------------------------------------------------
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            macos-cargo-
+
+      # ----------------------------------------------------------------------
+      # 5. Сборка release-бинарников под оба таргета.
+      #    --release включает оптимизации (LTO, strip и т.д. из Cargo.toml).
+      # ----------------------------------------------------------------------
+      - name: Build for x86_64 (Intel)
+        run: cargo build --release --target x86_64-apple-darwin
+
+      - name: Build for aarch64 (Apple Silicon)
+        run: cargo build --release --target aarch64-apple-darwin
+
+      # ----------------------------------------------------------------------
+      # 6. Склейка двух бинарников в universal binary через lipo.
+      #    Один файл работает нативно и на Intel, и на Apple Silicon.
+      # ----------------------------------------------------------------------
+      - name: Create universal binary via lipo
+        run: |
+          mkdir -p dist
+          lipo -create \
+            target/x86_64-apple-darwin/release/${BINARY_NAME} \
+            target/aarch64-apple-darwin/release/${BINARY_NAME} \
+            -output dist/${BINARY_NAME}
+
+          # Проверяем, что universal binary содержит обе архитектуры
+          echo "::group::Verify universal binary"
+          file dist/${BINARY_NAME}
+          lipo -info dist/${BINARY_NAME}
+          echo "::endgroup::"
+
+      # ----------------------------------------------------------------------
+      # 7. Архивирование в .tar.gz с именем на основе версии тега.
+      #    Формат: <binary>-<version>-darwin-universal.tar.gz
+      #    В архив кладём бинарник + README/LICENSE + examples/, если они есть.
+      # ----------------------------------------------------------------------
+      - name: Package release archive
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-${VERSION}-darwin-universal"
+          ARCHIVE_DIR="archive-staging/${ARCHIVE_NAME}"
+          mkdir -p "${ARCHIVE_DIR}"
+
+          # Бинарник
+          cp dist/${BINARY_NAME} "${ARCHIVE_DIR}/"
+          chmod +x "${ARCHIVE_DIR}/${BINARY_NAME}"
+
+          # Документация (копируем, если файлы существуют; не падаем, если нет)
+          for f in README.md README LICENSE LICENSE-MIT LICENSE-APACHE CHANGELOG.md; do
+            [ -f "$f" ] && cp "$f" "${ARCHIVE_DIR}/"
+          done
+
+          # Директория с примерами — копируем целиком, сохраняя структуру.
+          # -a (archive mode) сохраняет permissions и симлинки.
+          if [ -d "examples" ]; then
+            cp -a examples "${ARCHIVE_DIR}/examples"
+            echo "::notice::Included examples/ directory ($(find examples -type f | wc -l | tr -d ' ') files)"
+          else
+            echo "::warning::examples/ directory not found in repository root — skipping"
+          fi
+
+          # Создаём tar.gz из staging-директории
+          tar -czf "${ARCHIVE_NAME}.tar.gz" -C archive-staging "${ARCHIVE_NAME}"
+
+          # SHA256 checksum для верификации скачанного архива
+          shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
+
+      # ----------------------------------------------------------------------
+      # 8. Upload артефактов как build artifact (для отладки / скачивания
+      #    из UI GitHub Actions, даже если release-шаг упадёт).
+      # ----------------------------------------------------------------------
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}.tar.gz
+            ${{ env.ARCHIVE_NAME }}.tar.gz.sha256
+          retention-days: 7
+
+      # ----------------------------------------------------------------------
+      # 9. Создание GitHub Release и загрузка архива + checksum.
+      #    softprops/action-gh-release — де-факто стандарт для этой задачи.
+      #    GITHUB_TOKEN предоставляется автоматически через permissions.
+      #    generate_release_notes: true — GitHub сам соберёт changelog
+      #    из PR-ов и коммитов между тегами.
+      # ----------------------------------------------------------------------
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Release ${{ env.TAG_NAME }}"
+          body: |
+            ## Installation
+
+            ```bash
+            # Download and extract
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ env.TAG_NAME }}/${{ env.ARCHIVE_NAME }}.tar.gz | tar xz
+            # Move to PATH
+            sudo mv ${{ env.ARCHIVE_NAME }}/${{ env.BINARY_NAME }} /usr/local/bin/
+            ```
+
+            **Checksum (SHA-256):**
+            ```
+            $(cat ${{ env.ARCHIVE_NAME }}.tar.gz.sha256)
+            ```
+          files: |
+            ${{ env.ARCHIVE_NAME }}.tar.gz
+            ${{ env.ARCHIVE_NAME }}.tar.gz.sha256
+          # Помечать pre-release, если тег содержит дефис (v1.0.0-beta, v2.0.0-rc.1)
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          # GITHUB_TOKEN наследуется из permissions.contents: write
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
