@@ -34,9 +34,13 @@ permissions:
 # ---------------------------------------------------------------------------
 # Переменные, общие для всех jobs.
 # CARGO_TERM_COLOR — цветной вывод в логах CI для удобства чтения.
+# FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 — принудительный запуск JS-actions
+#   на Node.js 24; необходим для softprops/action-gh-release@v2,
+#   у которого пока нет native Node 24 версии.
 # ---------------------------------------------------------------------------
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # Имя бинарника — должно совпадать с [[bin]] name в Cargo.toml.
   # Измени на своё, если отличается.
   BINARY_NAME: corvex
@@ -55,7 +59,7 @@ jobs:
       #    fetch-depth: 0 гарантирует, что git describe и tag info доступны.
       # ----------------------------------------------------------------------
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
@@ -92,7 +96,7 @@ jobs:
       #    кэш пересоздаётся автоматически.
       # ----------------------------------------------------------------------
       - name: Cache Cargo registry & build artifacts
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/bin/
@@ -174,7 +178,7 @@ jobs:
       #    из UI GitHub Actions, даже если release-шаг упадёт).
       # ----------------------------------------------------------------------
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ env.ARCHIVE_NAME }}
           path: |
