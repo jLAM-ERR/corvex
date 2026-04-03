@@ -183,40 +183,66 @@ jobs:
           retention-days: 7
 
       # ----------------------------------------------------------------------
-      # 9. Создание GitHub Release и загрузка архива + checksum.
-      #    softprops/action-gh-release — де-факто стандарт для этой задачи.
-      #    GITHUB_TOKEN предоставляется автоматически через permissions.
-      #    generate_release_notes: true — GitHub сам соберёт changelog
-      #    из PR-ов и коммитов между тегами.
+      # 9. Формирование тела релиза.
+      #    Если в корне репо есть RELEASE_NOTES.md — его содержимое
+      #    становится основным описанием. Блок Installation и checksum
+      #    добавляются в конец автоматически.
+      #    Если файла нет — только Installation + auto-generated notes.
+      # ----------------------------------------------------------------------
+      - name: Compose release body
+        run: |
+          BODY_FILE="release-body.md"
+
+          # Пользовательские release notes (если есть)
+          if [ -f "RELEASE_NOTES.md" ]; then
+            cat RELEASE_NOTES.md >> "${BODY_FILE}"
+            printf '\n---\n\n' >> "${BODY_FILE}"
+            echo "::notice::Using RELEASE_NOTES.md for release description"
+          else
+            echo "::warning::RELEASE_NOTES.md not found — release will use auto-generated notes only"
+          fi
+
+          # Блок с инструкцией по установке (добавляется всегда)
+          cat >> "${BODY_FILE}" << 'INSTALL_EOF'
+          ## Installation
+
+          ```bash
+          # Download and extract
+          INSTALL_EOF
+
+          # Динамические значения вставляем отдельно (heredoc с подстановкой)
+          cat >> "${BODY_FILE}" << EOF
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/${ARCHIVE_NAME}.tar.gz | tar xz
+          # Move to PATH
+          sudo mv ${ARCHIVE_NAME}/${BINARY_NAME} /usr/local/bin/
+          \`\`\`
+          EOF
+
+          # Checksum
+          printf '\n**Checksum (SHA-256):**\n```\n' >> "${BODY_FILE}"
+          cat "${ARCHIVE_NAME}.tar.gz.sha256" >> "${BODY_FILE}"
+          printf '```\n' >> "${BODY_FILE}"
+
+      # ----------------------------------------------------------------------
+      # 10. Создание GitHub Release и загрузка архива + checksum.
+      #     softprops/action-gh-release — де-факто стандарт для этой задачи.
+      #     GITHUB_TOKEN предоставляется автоматически через permissions.
+      #     generate_release_notes: true — GitHub допишет автосгенерированный
+      #     changelog из PR-ов и коммитов ПОСЛЕ нашего body.
       # ----------------------------------------------------------------------
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          # Явный tag_name обязателен для workflow_dispatch, где GITHUB_REF
-          # указывает на ветку, а не на тег.
           tag_name: ${{ env.TAG_NAME }}
           name: "Release ${{ env.TAG_NAME }}"
-          body: |
-            ## Installation
-
-            ```bash
-            # Download and extract
-            curl -fsSL https://github.com/${{ github.repository }}/releases/download/${{ env.TAG_NAME }}/${{ env.ARCHIVE_NAME }}.tar.gz | tar xz
-            # Move to PATH
-            sudo mv ${{ env.ARCHIVE_NAME }}/${{ env.BINARY_NAME }} /usr/local/bin/
-            ```
-
-            **Checksum (SHA-256):**
-            ```
-            $(cat ${{ env.ARCHIVE_NAME }}.tar.gz.sha256)
-            ```
+          body_path: release-body.md
           files: |
             ${{ env.ARCHIVE_NAME }}.tar.gz
             ${{ env.ARCHIVE_NAME }}.tar.gz.sha256
           # Помечать pre-release, если версия содержит дефис (v1.0.0-beta, v2.0.0-rc.1)
           prerelease: ${{ contains(env.VERSION, '-') }}
+          # Auto-generated changelog дописывается после body_path
           generate_release_notes: true
           fail_on_unmatched_files: true
         env:
-          # GITHUB_TOKEN наследуется из permissions.contents: write
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
