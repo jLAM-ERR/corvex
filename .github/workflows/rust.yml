@@ -8,12 +8,21 @@
 name: Release macOS
 
 # ---------------------------------------------------------------------------
-# Триггер: запуск только при пуше тега вида v1.0.0, v0.3.2-beta и т.д.
+# Триггеры:
+#   1. Автоматический — при пуше тега вида v1.0.0, v0.3.2-beta и т.д.
+#   2. Ручной (workflow_dispatch) — кнопка "Run workflow" в UI GitHub Actions.
+#      При ручном запуске версия задаётся через input-поле.
 # ---------------------------------------------------------------------------
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (например: 1.0.0 или 1.0.0-beta)"
+        required: true
+        type: string
 
 # ---------------------------------------------------------------------------
 # Минимальные permissions по принципу least privilege.
@@ -51,16 +60,22 @@ jobs:
           fetch-depth: 0
 
       # ----------------------------------------------------------------------
-      # 2. Извлечение версии из тега (v1.2.3 → 1.2.3).
-      #    Сохраняем в $GITHUB_ENV для использования в последующих шагах.
+      # 2. Извлечение версии.
+      #    - Tag push:          GITHUB_REF = refs/tags/v1.2.3 → 1.2.3
+      #    - workflow_dispatch:  берём из inputs.version
       # ----------------------------------------------------------------------
-      - name: Extract version from tag
+      - name: Extract version
         run: |
-          # GITHUB_REF = refs/tags/v1.2.3 → VERSION = 1.2.3
-          VERSION="${GITHUB_REF#refs/tags/v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+            TAG_NAME="v${VERSION}"
+          else
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG_NAME#v}"
+          fi
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-          echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> "$GITHUB_ENV"
-          echo "::notice::Building release ${VERSION}"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
+          echo "::notice::Building release ${VERSION} (trigger: ${{ github.event_name }})"
 
       # ----------------------------------------------------------------------
       # 3. Установка Rust stable toolchain через официальный action.
@@ -177,6 +192,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          # Явный tag_name обязателен для workflow_dispatch, где GITHUB_REF
+          # указывает на ветку, а не на тег.
+          tag_name: ${{ env.TAG_NAME }}
           name: "Release ${{ env.TAG_NAME }}"
           body: |
             ## Installation
@@ -195,8 +213,8 @@ jobs:
           files: |
             ${{ env.ARCHIVE_NAME }}.tar.gz
             ${{ env.ARCHIVE_NAME }}.tar.gz.sha256
-          # Помечать pre-release, если тег содержит дефис (v1.0.0-beta, v2.0.0-rc.1)
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          # Помечать pre-release, если версия содержит дефис (v1.0.0-beta, v2.0.0-rc.1)
+          prerelease: ${{ contains(env.VERSION, '-') }}
           generate_release_notes: true
           fail_on_unmatched_files: true
         env:
