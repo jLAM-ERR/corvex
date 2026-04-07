@@ -2,6 +2,9 @@
   // Option A: direct proxy URI (VLESS, VMess, Trojan, or Shadowsocks)
   // "uri": "vless://uuid@host:443?encryption=none&type=grpc&security=tls&sni=host.com#Name",
 
+  // Required: static proxy port
+  "proxy": { "port": 21080 },
+
   // Option B: subscription URLs for auto-discovery
   "file-url": [
     "https://example.com/subscription1.txt",

@@ -36,6 +36,8 @@ pub struct ProxyParams {
 }
 
 /// URI scheme prefixes for all supported protocols.
+/// Schemes that xray's `parse_uri` can handle (used by subscription filter + health checks).
+/// `vpn://` is handled separately via the AWG engine path.
 pub const SUPPORTED_SCHEMES: &[&str] = &["vless://", "vmess://", "trojan://", "ss://"];
 
 /// Parse a proxy URI (VLESS, VMess, Trojan, or Shadowsocks).
@@ -463,10 +465,26 @@ pub struct XrayLogConfig {
 
 impl Default for XrayLogConfig {
     fn default() -> Self {
+        #[cfg(unix)]
+        let (access, error) = (
+            "/var/log/xray/access.log".to_string(),
+            "/var/log/xray/error.log".to_string(),
+        );
+        #[cfg(windows)]
+        let (access, error) = {
+            let state = std::env::var("LOCALAPPDATA")
+                .unwrap_or_else(|_| r"C:\Users\Public\AppData\Local".to_string());
+            let base = std::path::PathBuf::from(state).join("xray");
+            (
+                base.join("access.log").to_string_lossy().to_string(),
+                base.join("error.log").to_string_lossy().to_string(),
+            )
+        };
+
         Self {
             loglevel: "warning".to_string(),
-            access: "/var/log/xray/access.log".to_string(),
-            error: "/var/log/xray/error.log".to_string(),
+            access,
+            error,
         }
     }
 }
@@ -537,9 +555,71 @@ pub fn create_config(
     })
 }
 
+/// Create xray config for AWG mode — proxy outbound uses `freedom` protocol.
+/// Traffic routed to "proxy" tag exits through the OS network stack,
+/// where AWG's routing table sends it through the tunnel.
+pub fn create_config_awg_mode(
+    port: u16,
+    routing_rules: &[serde_json::Value],
+    log_config: &XrayLogConfig,
+) -> serde_json::Value {
+    let rules: Vec<serde_json::Value> = routing_rules.to_vec();
+
+    serde_json::json!({
+        "log": {
+            "loglevel": log_config.loglevel,
+            "access": log_config.access,
+            "error": log_config.error,
+        },
+        "dns": {
+            "servers": ["8.8.8.8"],
+            "tag": "dns_out",
+        },
+        "inbounds": [{
+            "listen": "127.0.0.1",
+            "tag": "socks",
+            "port": port,
+            "protocol": "socks",
+            "settings": {
+                "auth": "noauth",
+                "udp": true,
+            },
+            "sniffing": {
+                "enabled": true,
+                "destOverride": ["http", "tls", "quic"],
+                "routeOnly": true,
+            },
+        }],
+        "outbounds": [
+            {
+                "protocol": "freedom",
+                "tag": "proxy",
+                "settings": {},
+            },
+            {
+                "protocol": "freedom",
+                "tag": "direct",
+            },
+            {
+                "protocol": "blackhole",
+                "tag": "block",
+            },
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": rules,
+        },
+    })
+}
+
 /// Apply proxy parameters to an existing xray config file.
 /// Replaces the first matching (or first proxy) outbound entirely.
-pub fn apply_to_config(params: &ProxyParams, config_path: &Path) -> Result<()> {
+/// Also updates the log section from the provided log config.
+pub fn apply_to_config(
+    params: &ProxyParams,
+    config_path: &Path,
+    log_config: &XrayLogConfig,
+) -> Result<()> {
     let content =
         std::fs::read_to_string(config_path).context("failed to read xray config file")?;
     let mut config: serde_json::Value =
@@ -583,8 +663,16 @@ pub fn apply_to_config(params: &ProxyParams, config_path: &Path) -> Result<()> {
         "streamSettings": stream_settings,
     });
 
+    // Update log section
+    if config.get("log").is_none() {
+        config["log"] = serde_json::json!({});
+    }
+    config["log"]["loglevel"] = serde_json::json!(log_config.loglevel);
+    config["log"]["access"] = serde_json::json!(log_config.access);
+    config["log"]["error"] = serde_json::json!(log_config.error);
+
     let pretty = serde_json::to_string_pretty(&config).context("failed to serialize config")?;
-    std::fs::write(config_path, pretty).context("failed to write config file")?;
+    crate::config::write_restricted(config_path, &pretty)?;
 
     Ok(())
 }
@@ -1078,7 +1166,12 @@ mod tests {
         params.security = "tls".to_string();
         params.sni = "new.host.com".to_string();
 
-        apply_to_config(&params, tmpfile.path()).unwrap();
+        let log_cfg = XrayLogConfig {
+            loglevel: "debug".to_string(),
+            access: "/tmp/access.log".to_string(),
+            error: "/tmp/error.log".to_string(),
+        };
+        apply_to_config(&params, tmpfile.path(), &log_cfg).unwrap();
 
         let updated: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(tmpfile.path()).unwrap()).unwrap();
@@ -1098,6 +1191,10 @@ mod tests {
         assert_eq!(updated["inbounds"][0]["port"], 1080);
         // Freedom outbound untouched
         assert_eq!(updated["outbounds"][1]["protocol"], "freedom");
+        // Log section updated
+        assert_eq!(updated["log"]["loglevel"], "debug");
+        assert_eq!(updated["log"]["access"], "/tmp/access.log");
+        assert_eq!(updated["log"]["error"], "/tmp/error.log");
     }
 
     #[test]
@@ -1127,11 +1224,96 @@ mod tests {
         params.uuid = "new-uuid".to_string();
         // name is empty — should preserve existing tag
 
-        apply_to_config(&params, tmpfile.path()).unwrap();
+        apply_to_config(&params, tmpfile.path(), &XrayLogConfig::default()).unwrap();
 
         let updated: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(tmpfile.path()).unwrap()).unwrap();
         assert_eq!(updated["outbounds"][0]["tag"], "keep-this-tag");
+    }
+
+    #[test]
+    fn apply_to_config_changes_log_level() {
+        let config_json = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [{
+                "protocol": "vless",
+                "tag": "proxy",
+                "settings": {"vnext": [{"address": "h", "port": 1, "users": [{"id": "u"}]}]},
+                "streamSettings": {"network": "tcp", "security": ""}
+            }],
+            "log": {
+                "loglevel": "warning",
+                "access": "/old/access.log",
+                "error": "/old/error.log",
+            }
+        });
+
+        let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmpfile,
+            "{}",
+            serde_json::to_string_pretty(&config_json).unwrap()
+        )
+        .unwrap();
+
+        let mut params = default_params();
+        params.protocol = "vless".to_string();
+        params.host = "host".to_string();
+        params.port = 443;
+        params.uuid = "uuid".to_string();
+
+        let log_cfg = XrayLogConfig {
+            loglevel: "debug".to_string(),
+            access: "/new/access.log".to_string(),
+            error: "/new/error.log".to_string(),
+        };
+        apply_to_config(&params, tmpfile.path(), &log_cfg).unwrap();
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmpfile.path()).unwrap()).unwrap();
+        assert_eq!(updated["log"]["loglevel"], "debug");
+        assert_eq!(updated["log"]["access"], "/new/access.log");
+        assert_eq!(updated["log"]["error"], "/new/error.log");
+    }
+
+    #[test]
+    fn apply_to_config_creates_log_section_if_missing() {
+        let config_json = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [{
+                "protocol": "vless",
+                "tag": "proxy",
+                "settings": {"vnext": [{"address": "h", "port": 1, "users": [{"id": "u"}]}]},
+                "streamSettings": {"network": "tcp", "security": ""}
+            }]
+        });
+
+        let mut tmpfile = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            tmpfile,
+            "{}",
+            serde_json::to_string_pretty(&config_json).unwrap()
+        )
+        .unwrap();
+
+        let mut params = default_params();
+        params.protocol = "vless".to_string();
+        params.host = "host".to_string();
+        params.port = 443;
+        params.uuid = "uuid".to_string();
+
+        let log_cfg = XrayLogConfig {
+            loglevel: "info".to_string(),
+            access: "/var/log/access.log".to_string(),
+            error: "/var/log/error.log".to_string(),
+        };
+        apply_to_config(&params, tmpfile.path(), &log_cfg).unwrap();
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmpfile.path()).unwrap()).unwrap();
+        assert_eq!(updated["log"]["loglevel"], "info");
+        assert_eq!(updated["log"]["access"], "/var/log/access.log");
+        assert_eq!(updated["log"]["error"], "/var/log/error.log");
     }
 
     // --- Routing rules ---
@@ -1163,6 +1345,42 @@ mod tests {
     }
 
     #[test]
+    fn awg_mode_config_has_freedom_outbound() {
+        let rules = crate::traffic::build_routing_rules(&[], &[], "proxy", false);
+        let config = create_config_awg_mode(21080, &rules, &XrayLogConfig::default());
+
+        // Proxy outbound should be freedom
+        assert_eq!(config["outbounds"][0]["protocol"], "freedom");
+        assert_eq!(config["outbounds"][0]["tag"], "proxy");
+        // Direct and block still present
+        assert_eq!(config["outbounds"][1]["protocol"], "freedom");
+        assert_eq!(config["outbounds"][1]["tag"], "direct");
+        assert_eq!(config["outbounds"][2]["protocol"], "blackhole");
+        assert_eq!(config["outbounds"][2]["tag"], "block");
+    }
+
+    #[test]
+    fn awg_mode_config_has_correct_inbound() {
+        let config = create_config_awg_mode(21080, &[], &XrayLogConfig::default());
+        assert_eq!(config["inbounds"][0]["protocol"], "socks");
+        assert_eq!(config["inbounds"][0]["port"], 21080);
+        assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
+    }
+
+    #[test]
+    fn awg_mode_config_applies_routing_rules() {
+        let rules = crate::traffic::build_routing_rules(
+            &["corp.com".to_string()],
+            &["ext.com".to_string()],
+            "proxy",
+            true,
+        );
+        let config = create_config_awg_mode(21080, &rules, &XrayLogConfig::default());
+        let r = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(r.len(), 3);
+    }
+
+    #[test]
     fn create_config_default_log_settings() {
         let mut params = default_params();
         params.protocol = "vless".to_string();
@@ -1172,8 +1390,18 @@ mod tests {
 
         let config = create_config(&params, 1080, &[], &XrayLogConfig::default());
         assert_eq!(config["log"]["loglevel"], "warning");
-        assert_eq!(config["log"]["access"], "/var/log/xray/access.log");
-        assert_eq!(config["log"]["error"], "/var/log/xray/error.log");
+        #[cfg(unix)]
+        {
+            assert_eq!(config["log"]["access"], "/var/log/xray/access.log");
+            assert_eq!(config["log"]["error"], "/var/log/xray/error.log");
+        }
+        #[cfg(windows)]
+        {
+            let access = config["log"]["access"].as_str().unwrap();
+            let error = config["log"]["error"].as_str().unwrap();
+            assert!(access.ends_with("access.log"), "got: {access}");
+            assert!(error.ends_with("error.log"), "got: {error}");
+        }
     }
 
     #[test]
