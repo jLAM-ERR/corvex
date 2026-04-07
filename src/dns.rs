@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use log::debug;
 use std::collections::BTreeMap;
 use std::fs;
@@ -58,6 +58,10 @@ pub fn parse_scutil_dns(output: &str) -> BTreeMap<String, String> {
 
 /// Sync DNS mappings into xray config.json's dns.servers section.
 /// Each mapping becomes a DNS server entry with a domain matcher.
+///
+/// **Call ordering:** This function reads and rewrites `config.json`. In `cmd_start`,
+/// the required order is: write config -> `sync_to_config` -> `update_config_port`.
+/// Changing this order will silently overwrite earlier mutations.
 pub fn sync_to_config(
     xray_config_path: &Path,
     mappings: &BTreeMap<String, String>,
@@ -104,35 +108,49 @@ pub fn sync_to_config(
     }
     xray_config["dns"]["servers"] = serde_json::json!(servers);
 
+    // Add corporate-dns routing rule (port 53) for all mapped domains
+    let mut domains: Vec<String> = mappings.keys().map(|d| format!("domain:{d}")).collect();
+    domains.sort();
+    domains.dedup();
+
+    let corp_dns_rule = serde_json::json!({
+        "ruleTag": "corporate-dns",
+        "port": 53,
+        "domain": domains,
+        "network": ["tcp", "udp"],
+        "outboundTag": "direct",
+    });
+
+    // Ensure routing.rules exists
+    if xray_config.get("routing").is_none() {
+        xray_config["routing"] = serde_json::json!({
+            "domainStrategy": "AsIs",
+            "rules": [],
+        });
+    }
+    if xray_config["routing"].get("rules").is_none() {
+        xray_config["routing"]["rules"] = serde_json::json!([]);
+    }
+
+    let rules = xray_config["routing"]["rules"]
+        .as_array_mut()
+        .context("routing.rules is not an array")?;
+
+    // Replace existing corporate-dns rule, or append
+    if let Some(pos) = rules
+        .iter()
+        .position(|r| r.get("ruleTag").and_then(|t| t.as_str()) == Some("corporate-dns"))
+    {
+        rules[pos] = corp_dns_rule;
+    } else {
+        rules.push(corp_dns_rule);
+    }
+
     let pretty =
         serde_json::to_string_pretty(&xray_config).context("Failed to serialize xray config")?;
-    fs::write(xray_config_path, pretty).context("Failed to write xray config")?;
+    crate::config::write_restricted(xray_config_path, &pretty)?;
 
     Ok(mappings.len())
-}
-
-/// Discover corp DNS mappings from macOS `scutil --dns`.
-/// Returns the discovered mappings without writing to any file.
-pub fn init() -> Result<BTreeMap<String, String>> {
-    debug!("running scutil --dns to discover corp DNS");
-    let output = std::process::Command::new("scutil")
-        .arg("--dns")
-        .output()
-        .context("Failed to run scutil --dns")?;
-
-    if !output.status.success() {
-        bail!("scutil --dns exited with status {}", output.status);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let discovered = parse_scutil_dns(&stdout);
-    debug!("discovered {} split-DNS resolvers", discovered.len());
-
-    if discovered.is_empty() {
-        bail!("No split-DNS resolvers found in scutil --dns output");
-    }
-
-    Ok(discovered)
 }
 
 #[cfg(test)]
@@ -269,6 +287,146 @@ resolver #1
         // Existing non-corp entries preserved (strings before objects in iteration order)
         assert_eq!(servers[1], "1.1.1.1");
         assert_eq!(servers[2]["address"], "8.8.8.8");
+    }
+
+    #[test]
+    fn sync_to_config_adds_routing_rule_with_port_53() {
+        let dir = tempfile::tempdir().unwrap();
+        let xray_config_path = dir.path().join("config.json");
+
+        let xray_cfg = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [],
+            "routing": { "domainStrategy": "AsIs", "rules": [] },
+        });
+        fs::write(
+            &xray_config_path,
+            serde_json::to_string_pretty(&xray_cfg).unwrap(),
+        )
+        .unwrap();
+
+        let mut mappings = BTreeMap::new();
+        mappings.insert("corp.example.com".to_string(), "10.0.0.1".to_string());
+        mappings.insert("internal.local".to_string(), "172.16.0.1".to_string());
+
+        sync_to_config(xray_config_path.as_path(), &mappings).unwrap();
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&xray_config_path).unwrap()).unwrap();
+        let rules = updated["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["ruleTag"], "corporate-dns");
+        assert_eq!(rules[0]["port"], 53);
+        assert_eq!(rules[0]["outboundTag"], "direct");
+
+        let domains = rules[0]["domain"].as_array().unwrap();
+        assert_eq!(domains.len(), 2);
+        assert!(domains.contains(&serde_json::json!("domain:corp.example.com")));
+        assert!(domains.contains(&serde_json::json!("domain:internal.local")));
+
+        let network = rules[0]["network"].as_array().unwrap();
+        assert_eq!(
+            network,
+            &vec![serde_json::json!("tcp"), serde_json::json!("udp")]
+        );
+    }
+
+    #[test]
+    fn sync_to_config_replaces_existing_corporate_dns_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let xray_config_path = dir.path().join("config.json");
+
+        let xray_cfg = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [],
+            "routing": {
+                "domainStrategy": "AsIs",
+                "rules": [
+                    { "ruleTag": "corporate-dns", "port": 53, "domain": ["domain:old.com"], "outboundTag": "direct" },
+                    { "outboundTag": "proxy", "domain": ["domain:ext.com"] },
+                ],
+            },
+        });
+        fs::write(
+            &xray_config_path,
+            serde_json::to_string_pretty(&xray_cfg).unwrap(),
+        )
+        .unwrap();
+
+        let mut mappings = BTreeMap::new();
+        mappings.insert("new.corp.com".to_string(), "10.0.0.1".to_string());
+
+        sync_to_config(xray_config_path.as_path(), &mappings).unwrap();
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&xray_config_path).unwrap()).unwrap();
+        let rules = updated["routing"]["rules"].as_array().unwrap();
+        // Should still be 2 rules (replaced, not duplicated)
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0]["ruleTag"], "corporate-dns");
+        assert_eq!(rules[0]["domain"][0], "domain:new.corp.com");
+        // Other rule preserved
+        assert_eq!(rules[1]["outboundTag"], "proxy");
+    }
+
+    #[test]
+    fn sync_to_config_adds_routing_when_section_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let xray_config_path = dir.path().join("config.json");
+
+        // No routing section at all
+        let xray_cfg = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [],
+        });
+        fs::write(
+            &xray_config_path,
+            serde_json::to_string_pretty(&xray_cfg).unwrap(),
+        )
+        .unwrap();
+
+        let mut mappings = BTreeMap::new();
+        mappings.insert("corp.example.com".to_string(), "10.0.0.1".to_string());
+
+        sync_to_config(xray_config_path.as_path(), &mappings).unwrap();
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&xray_config_path).unwrap()).unwrap();
+        assert_eq!(updated["routing"]["domainStrategy"], "AsIs");
+        let rules = updated["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["ruleTag"], "corporate-dns");
+        assert_eq!(rules[0]["port"], 53);
+    }
+
+    #[test]
+    fn sync_to_config_domains_are_deduplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let xray_config_path = dir.path().join("config.json");
+
+        let xray_cfg = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [],
+        });
+        fs::write(
+            &xray_config_path,
+            serde_json::to_string_pretty(&xray_cfg).unwrap(),
+        )
+        .unwrap();
+
+        // BTreeMap already ensures unique keys, so domains will be unique
+        let mut mappings = BTreeMap::new();
+        mappings.insert("corp.example.com".to_string(), "10.0.0.1".to_string());
+
+        sync_to_config(xray_config_path.as_path(), &mappings).unwrap();
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&xray_config_path).unwrap()).unwrap();
+        let rules = updated["routing"]["rules"].as_array().unwrap();
+        let domains = rules[0]["domain"].as_array().unwrap();
+        // No duplicates
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0], "domain:corp.example.com");
     }
 
     #[test]

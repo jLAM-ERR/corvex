@@ -58,21 +58,21 @@ Final:   Verify + docs + examples (Tasks 14-15)
 
 ## Tasks
 
-- [ ] **Task 1** [B1] Ensure directories exist on start + remove `check_deprecated_files`
-- [ ] **Task 2** [B2] Add corporate-dns routing rule (port 53) in `dns::sync_to_config`
-- [ ] **Task 3** [B3] Propagate log level in `apply_to_config`
-- [ ] **Task 4** [F1] Static proxy port — `proxy.port` required, remove `port.rs`
-- [ ] **Task 5** [F4] Platform trait + move macOS code from proxy.rs/network.rs
-- [ ] **Task 6** [F4] Cfg-gate `nix`/`windows-sys`, xray process mgmt, health.rs fix
-- [ ] **Task 7** [F4] Platform-aware config paths + Windows stubs
-- [ ] **Task 8** [F2] vpn:// URI parser + AWG .conf generator
-- [ ] **Task 9** [F2] AWG tunnel lifecycle (awg-quick up/down, auto-install)
-- [ ] **Task 10** [F2] Xray config for AWG mode (freedom outbound)
-- [ ] **Task 11** [F2] Integrate AWG engine into main.rs
-- [ ] **Task 12** [F3] Windows corporate DNS (GetAdaptersAddresses + NRPT)
-- [ ] **Task 13** [F4] Windows platform full impl (proxy, network, process)
-- [ ] **Task 14** Verify acceptance criteria
-- [ ] **Task 15** Docs, README, RELEASE_NOTES, examples
+- [x] **Task 1** [B1] Ensure directories exist on start + remove `check_deprecated_files`
+- [x] **Task 2** [B2] Add corporate-dns routing rule (port 53) in `dns::sync_to_config`
+- [x] **Task 3** [B3] Propagate log level in `apply_to_config`
+- [x] **Task 4** [F1] Static proxy port — `proxy.port` required, remove `port.rs`
+- [x] **Task 5** [F4] Platform trait + move macOS code from proxy.rs/network.rs
+- [x] **Task 6** [F4] Cfg-gate `nix`/`windows-sys`, xray process mgmt, health.rs fix
+- [x] **Task 7** [F4] Platform-aware config paths + Windows stubs
+- [x] **Task 8** [F2] vpn:// URI parser + AWG .conf generator
+- [x] **Task 9** [F2] AWG tunnel lifecycle (awg-quick up/down, auto-install)
+- [x] **Task 10** [F2] Xray config for AWG mode (freedom outbound)
+- [x] **Task 11** [F2] Integrate AWG engine into main.rs
+- [x] **Task 12** [F3] Windows corporate DNS (GetAdaptersAddresses + NRPT)
+- [x] **Task 13** [F4] Windows platform full impl (proxy, network, process)
+- [x] **Task 14** Verify acceptance criteria
+- [x] **Task 15** Docs, README, examples
 
 ## Breaking Changes
 

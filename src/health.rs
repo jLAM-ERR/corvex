@@ -1,14 +1,26 @@
-use crate::port;
 use crate::protocol::ProxyParams;
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use log::debug;
+use rand::Rng;
 use std::fs;
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const CHECK_URL: &str = "http://www.gstatic.com/generate_204";
+
+/// Find a free port for temporary xray health check instances.
+fn find_free_port() -> Result<u16> {
+    let mut rng = rand::rng();
+    for _ in 1..=100 {
+        let port = rng.random_range(20000..=60000u16);
+        if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return Ok(port);
+        }
+    }
+    bail!("failed to find a free port for health check")
+}
 
 /// Check TCP connectivity to host:port with the given timeout.
 pub fn check_tcp(host: &str, port: u16, timeout: Duration) -> Result<()> {
@@ -53,14 +65,28 @@ pub fn generate_temp_config(params: &ProxyParams, local_port: u16) -> Result<Pat
     let json = serde_json::to_string_pretty(&config).context("failed to serialize temp config")?;
 
     // Create file with restricted permissions from the start to prevent credential leakage
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
+    let mut file = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("failed to create {}", path.display()))?
+        }
+        #[cfg(windows)]
+        {
+            fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .with_context(|| format!("failed to create {}", path.display()))?
+        }
+    };
     std::io::Write::write_all(&mut file, json.as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
 
@@ -84,7 +110,7 @@ impl Drop for TunnelGuard {
 /// Check tunnel connectivity by spawning a temp xray and making an HTTP request through it.
 /// Returns the round-trip latency.
 pub fn check_tunnel(params: &ProxyParams, xray_bin: &str) -> Result<Duration> {
-    let local_port = port::find_free_port()?;
+    let local_port = find_free_port()?;
     let config_path = generate_temp_config(params, local_port)?;
     debug!("tunnel check via temp config {}", config_path.display());
 
@@ -99,6 +125,7 @@ pub fn check_tunnel(params: &ProxyParams, xray_bin: &str) -> Result<Duration> {
     let mut guard = TunnelGuard { child, config_path };
 
     // Poll for xray readiness instead of fixed sleep
+    let mut ready = false;
     for _ in 0..20 {
         // Check if child exited early (crash)
         if let Ok(Some(status)) = guard.child.try_wait() {
@@ -110,9 +137,14 @@ pub fn check_tunnel(params: &ProxyParams, xray_bin: &str) -> Result<Duration> {
         )
         .is_ok()
         {
+            ready = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+
+    if !ready {
+        anyhow::bail!("xray health-check process did not become ready within 1s");
     }
 
     // Make HTTP request through SOCKS proxy

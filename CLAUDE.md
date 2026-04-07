@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Rust CLI tool (`corvex`) that manages the Xray VPN daemon and macOS system proxy settings. Targets macOS only (uses `networksetup`).
+Rust CLI tool (`corvex`) that manages the Xray VPN daemon and macOS/Windows system proxy settings. Supports AmneziaWG as an alternative tunnel engine.
 
 ## Build & Test
 
@@ -20,9 +20,9 @@ cargo run -- --help   # Show CLI help
 
 ```bash
 cargo run -- start                              # Load corvex.json, resolve server, start
-cargo run -- stop                               # Disable system proxy + stop xray
+cargo run -- stop                               # Disable system proxy + stop xray (+ AWG if active)
 cargo run -- reload                             # Validate config, send SIGHUP
-cargo run -- status                             # Show xray process, ports, proxy settings, config paths
+cargo run -- status                             # Show engine type, xray process, ports, proxy settings
 cargo run -- logs                               # Show last 20 log lines
 cargo run -- logs -f                            # Follow log (tail -f)
 cargo run -- --settings /path/to/corvex.json start  # Use custom settings file
@@ -35,8 +35,9 @@ All configuration is in a single JSONC file at `$XDG_CONFIG_HOME/corvex/corvex.j
 
 ```jsonc
 {
-  "uri": "vless://uuid@host:443?...",           // Proxy URI (or use file-url)
+  "uri": "vless://uuid@host:443?...",           // Proxy URI (vless/vmess/trojan/ss/vpn)
   "file-url": ["https://sub1.com/link"],        // Subscription URLs for auto-discovery
+  "proxy": { "port": 21080 },                   // REQUIRED: static proxy port
   "corporate-dns": { "corp.com": "10.0.0.1" },  // Domain -> nameserver mappings
   "routes": {
     "direct-ru": true,                           // Route .ru TLD directly
@@ -54,35 +55,46 @@ All configuration is in a single JSONC file at `$XDG_CONFIG_HOME/corvex/corvex.j
 
 ```
 src/
-├── main.rs          — clap CLI, command routing, start/stop/status/reload/logs
-├── config.rs        — Config struct with XDG paths (config, state, xray)
-├── settings.rs      — CorvexSettings struct, JSONC parser, corvex.json loader
-├── network.rs       — detect active macOS network service (route + networksetup)
-├── xray.rs          — xray process lifecycle (start/stop/reload, PID file, auto-install)
-├── proxy.rs         — macOS system proxy via networksetup
-├── protocol.rs      — multi-protocol URI parser + xray config creator/updater
-├── dns.rs           — corporate DNS discovery (scutil) + xray config sync
-├── port.rs          — dynamic port allocation (20000-60000)
-├── traffic.rs       — routing rule builder from domain lists
-├── subscription.rs  — subscription download, base64 decode, protocol filter
-└── health.rs        — server health checks (TCP pre-filter + tunnel latency)
+├── main.rs              — clap CLI, command routing, engine dispatch
+├── config.rs            — Config paths (platform-aware: XDG on unix, APPDATA on Windows)
+├── settings.rs          — CorvexSettings (+ proxy.port), JSONC parser
+├── protocol.rs          — multi-protocol URI parser + xray config creator/updater
+├── dns.rs               — corporate DNS parsing (scutil) + xray config sync
+├── traffic.rs           — routing rule builder from domain lists
+├── subscription.rs      — subscription download, base64 decode, protocol filter
+├── health.rs            — server health checks (TCP pre-filter + tunnel latency)
+├── xray.rs              — xray process lifecycle (cfg-gated: nix signals on unix, WinAPI on windows)
+├── engine/
+│   ├── mod.rs           — EngineMode enum (Xray | Awg)
+│   └── awg.rs           — vpn:// parser, .conf generator, awg-quick lifecycle
+├── platform/
+│   ├── mod.rs           — Platform trait, PlatformImpl type alias
+│   ├── macos.rs         — proxy, network, DNS via networksetup/scutil
+│   └── windows.rs       — proxy, network, DNS stubs (WinAPI/registry)
 ```
 
 **Design principles:**
 - All parsing functions take `&str` — unit testable without system calls
-- PID-based process tracking with stale PID cleanup via `kill(pid, 0)`
+- PID-based process tracking with stale PID cleanup
 - Config validation before reload (parse JSON before sending SIGHUP)
-- Dynamic port allocation per start (no fixed port)
+- Static proxy port from `proxy.port` in corvex.json (required)
+- EngineMode enum with match dispatch (Xray vs AWG)
+- Platform abstraction via cfg-gated concrete types (no dynamic dispatch)
 
-## Key paths (XDG Base Directory)
+## Key paths
 
+### Unix (XDG Base Directory)
 - corvex.json: `$XDG_CONFIG_HOME/corvex/corvex.json` (default `~/.config/corvex/corvex.json`), overridable via `--settings`
-- Xray config: `$XDG_CONFIG_HOME/xray/config.json` (default `~/.config/xray/config.json`)
+- Xray config: `$XDG_CONFIG_HOME/xray/config.json`
 - PID file: `$XDG_CONFIG_HOME/xray/xray.pid`
-- Corvex log: `$XDG_STATE_HOME/corvex/corvex.log` (default `~/.local/state/corvex/corvex.log`)
-- Xray error log: configurable via corvex.json `log.xray.error`, default `/var/log/xray/error.log`
-- Xray access log: configurable via corvex.json `log.xray.access`, default `/var/log/xray/access.log`
+- Corvex log: `$XDG_STATE_HOME/corvex/corvex.log`
+- Xray logs: configurable via corvex.json `log.xray.*`, default `/var/log/xray/`
+
+### Windows
+- corvex.json: `%APPDATA%\corvex\corvex.json`
+- Xray config: `%APPDATA%\xray\config.json`
+- Logs: `%LOCALAPPDATA%\corvex\corvex.log`
 
 ## Dependencies
 
-clap (CLI), anyhow/thiserror (errors), colored (output), log/env_logger (debug logging), serde/serde_json (config), json_comments (JSONC parsing), nix (signals/PID), url (URI parsing), ureq (HTTP + SOCKS proxy), base64 (subscription decoding), rand (port selection)
+clap (CLI), anyhow/thiserror (errors), colored (output), log/env_logger (debug logging), serde/serde_json (config), json_comments (JSONC parsing), nix (unix signals/PID), windows-sys (Windows API), url (URI parsing), ureq (HTTP + SOCKS proxy), base64 (subscription/vpn decoding), rand (health check port selection)

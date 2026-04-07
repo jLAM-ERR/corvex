@@ -1,7 +1,9 @@
 use crate::config::Config;
 use anyhow::{Context, Result};
 use log::debug;
+#[cfg(unix)]
 use nix::sys::signal::{self, Signal};
+#[cfg(unix)]
 use nix::unistd::Pid;
 use std::fs;
 use std::process::Command;
@@ -23,33 +25,64 @@ pub enum XrayError {
     InvalidConfig(String),
 }
 
-/// Check if xray binary is installed; if not, install via brew.
-/// Returns Ok silently on success.
+/// Check if xray binary is installed; if not, install silently.
+/// On macOS: uses brew. On Windows: checks PATH.
 pub fn ensure_installed(xray_bin: &str) -> Result<()> {
     debug!("checking if '{}' is installed", xray_bin);
-    let which_output = Command::new("which")
-        .arg(xray_bin)
-        .output()
-        .context("Failed to run 'which'")?;
 
-    if which_output.status.success() {
-        debug!("'{}' found in PATH", xray_bin);
-        return Ok(());
+    #[cfg(unix)]
+    {
+        let which_output = Command::new("which")
+            .arg(xray_bin)
+            .output()
+            .context("Failed to run 'which'")?;
+
+        if which_output.status.success() {
+            debug!("'{}' found in PATH", xray_bin);
+            return Ok(());
+        }
+
+        // Not found — try to install via brew
+        debug!("'{}' not found, installing via brew", xray_bin);
+        let brew_output = Command::new("brew")
+            .args(["install", "--quiet", "xray"])
+            .output()
+            .context("Failed to run 'brew install xray' — is Homebrew installed?")?;
+
+        if !brew_output.status.success() {
+            let stderr = String::from_utf8_lossy(&brew_output.stderr);
+            anyhow::bail!("brew install xray failed: {}", stderr.trim());
+        }
+
+        Ok(())
     }
 
-    // Not found — try to install via brew
-    debug!("'{}' not found, installing via brew", xray_bin);
-    let brew_output = Command::new("brew")
-        .args(["install", "--quiet", "xray"])
-        .output()
-        .context("Failed to run 'brew install xray' — is Homebrew installed?")?;
+    #[cfg(windows)]
+    {
+        let where_output = Command::new("where")
+            .arg(xray_bin)
+            .output()
+            .context("Failed to run 'where'")?;
 
-    if !brew_output.status.success() {
-        let stderr = String::from_utf8_lossy(&brew_output.stderr);
-        anyhow::bail!("brew install xray failed: {}", stderr.trim());
+        if where_output.status.success() {
+            debug!("'{}' found in PATH", xray_bin);
+            return Ok(());
+        }
+
+        // Not found — try winget
+        debug!("'{}' not found, installing via winget", xray_bin);
+        let winget_output = Command::new("winget")
+            .args(["install", "--silent", "xray"])
+            .output()
+            .context("Failed to run 'winget install xray'")?;
+
+        if !winget_output.status.success() {
+            let stderr = String::from_utf8_lossy(&winget_output.stderr);
+            anyhow::bail!("winget install xray failed: {}", stderr.trim());
+        }
+
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Reads the PID file and checks if the process is actually running.
@@ -72,39 +105,57 @@ pub fn is_running(config: &Config) -> Option<i32> {
         }
     };
 
-    // Check if process is alive with signal 0
-    match signal::kill(Pid::from_raw(pid), None) {
-        Ok(()) => {
-            debug!("xray process {} is running", pid);
-            Some(pid)
+    // Check if process is alive
+    if is_process_alive(pid) {
+        debug!("xray process {} is running", pid);
+        Some(pid)
+    } else {
+        debug!("stale PID file (process {} dead), removing", pid);
+        let _ = fs::remove_file(&config.xray_pid_file);
+        None
+    }
+}
+
+#[cfg(unix)]
+fn is_process_alive(pid: i32) -> bool {
+    signal::kill(Pid::from_raw(pid), None).is_ok()
+}
+
+#[cfg(windows)]
+fn is_process_alive(pid: i32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    const STILL_ACTIVE: u32 = 259;
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
+        if handle == 0 {
+            return false;
         }
-        Err(_) => {
-            debug!("stale PID file (process {} dead), removing", pid);
-            let _ = fs::remove_file(&config.xray_pid_file);
-            None
-        }
+        let mut exit_code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut exit_code);
+        CloseHandle(handle);
+        ok != 0 && exit_code == STILL_ACTIVE
     }
 }
 
 /// Start the xray process.
-/// Caller must ensure the xray binary is installed (via `ensure_installed`).
 pub fn start(config: &Config) -> Result<i32> {
-    // Check config exists
     if !config.xray_config.exists() {
         return Err(XrayError::ConfigNotFound(config.xray_config.display().to_string()).into());
     }
 
-    // Check not already running
     if let Some(pid) = is_running(config) {
         return Err(XrayError::AlreadyRunning(pid).into());
     }
 
-    // Ensure log directory exists
     if let Some(log_dir) = config.xray_log.parent() {
         let _ = fs::create_dir_all(log_dir);
     }
 
-    // Spawn xray
     debug!("spawning xray with config {}", config.xray_config.display());
     let log_file = fs::OpenOptions::new()
         .create(true)
@@ -123,19 +174,14 @@ pub fn start(config: &Config) -> Result<i32> {
         .spawn()
         .context("Failed to spawn xray process")?;
 
-    let pid: i32 = child
-        .id()
-        .try_into()
-        .context("PID exceeds i32 range")?;
+    let pid: i32 = child.id().try_into().context("PID exceeds i32 range")?;
     debug!("xray spawned with PID {}", pid);
 
-    // Write PID file
     if let Some(pid_dir) = config.xray_pid_file.parent() {
         let _ = fs::create_dir_all(pid_dir);
     }
     fs::write(&config.xray_pid_file, pid.to_string()).context("Failed to write PID file")?;
 
-    // Wait and verify
     debug!("waiting 1s for xray to stabilize");
     thread::sleep(Duration::from_secs(1));
 
@@ -154,16 +200,12 @@ pub fn stop(config: &Config) -> Result<()> {
         None => return Err(XrayError::NotRunning.into()),
     };
 
-    let nix_pid = Pid::from_raw(pid);
+    stop_process(pid);
 
-    // Send SIGTERM
-    debug!("sending SIGTERM to xray (PID {})", pid);
-    let _ = signal::kill(nix_pid, Signal::SIGTERM);
-
-    // Wait up to 2 seconds
+    // Wait up to 2 seconds for process to exit
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(100));
-        if signal::kill(nix_pid, None).is_err() {
+        if !is_process_alive(pid) {
             debug!("xray process {} terminated", pid);
             let _ = fs::remove_file(&config.xray_pid_file);
             return Ok(());
@@ -171,16 +213,53 @@ pub fn stop(config: &Config) -> Result<()> {
     }
 
     // Force kill
-    debug!("SIGTERM timeout, sending SIGKILL to PID {}", pid);
-    let _ = signal::kill(nix_pid, Signal::SIGKILL);
+    force_kill_process(pid);
     thread::sleep(Duration::from_millis(100));
     let _ = fs::remove_file(&config.xray_pid_file);
     Ok(())
 }
 
-/// Validate config and send SIGHUP to reload.
+#[cfg(unix)]
+fn stop_process(pid: i32) {
+    debug!("sending SIGTERM to xray (PID {})", pid);
+    let _ = signal::kill(Pid::from_raw(pid), Signal::SIGTERM);
+}
+
+#[cfg(windows)]
+fn stop_process(pid: i32) {
+    debug!("sending CTRL_C to xray (PID {})", pid);
+    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_C_EVENT};
+
+    unsafe {
+        // Attempt graceful shutdown via CTRL_C first; the caller's wait loop
+        // will fall back to force_kill_process if this doesn't work.
+        GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid as u32);
+    }
+}
+
+#[cfg(unix)]
+fn force_kill_process(pid: i32) {
+    debug!("SIGTERM timeout, sending SIGKILL to PID {}", pid);
+    let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+}
+
+#[cfg(windows)]
+fn force_kill_process(pid: i32) {
+    debug!("force-killing xray (PID {})", pid);
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
+        if handle != 0 {
+            TerminateProcess(handle, 1);
+            CloseHandle(handle);
+        }
+    }
+}
+
+/// Validate config and send SIGHUP to reload (unix) or restart (windows).
 pub fn reload(config: &Config) -> Result<()> {
-    // Validate config JSON
     debug!("validating config {}", config.xray_config.display());
     let content = fs::read_to_string(&config.xray_config).context("Failed to read config file")?;
     let _: serde_json::Value =
@@ -192,8 +271,19 @@ pub fn reload(config: &Config) -> Result<()> {
         None => return Err(XrayError::NotRunning.into()),
     };
 
-    debug!("sending SIGHUP to xray (PID {})", pid);
-    signal::kill(Pid::from_raw(pid), Signal::SIGHUP).context("Failed to send SIGHUP to xray")?;
+    #[cfg(unix)]
+    {
+        debug!("sending SIGHUP to xray (PID {})", pid);
+        signal::kill(Pid::from_raw(pid), Signal::SIGHUP)
+            .context("Failed to send SIGHUP to xray")?;
+    }
+
+    #[cfg(windows)]
+    {
+        debug!("restarting xray for reload (PID {})", pid);
+        stop(config)?;
+        start(config)?;
+    }
 
     Ok(())
 }

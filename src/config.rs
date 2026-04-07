@@ -1,5 +1,30 @@
+use anyhow::{Context, Result};
 use log::debug;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Write content to a file with restricted permissions (0o600 on unix).
+/// Use for files containing credentials (xray config, AWG conf, etc.).
+pub fn write_restricted(path: &Path, content: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        std::io::Write::write_all(&mut file, content.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    #[cfg(windows)]
+    {
+        std::fs::write(path, content)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -13,10 +38,19 @@ pub struct Config {
 }
 
 impl Config {
+    /// Path for the AWG .conf file, derived from the xray config directory.
+    pub fn awg_conf_path(&self) -> Result<PathBuf> {
+        let parent = self
+            .xray_config
+            .parent()
+            .context("xray_config has no parent directory")?;
+        Ok(parent.join("corvex-awg.conf"))
+    }
+
     pub fn new(config_override: Option<&str>) -> Self {
-        let xray_dir = xdg_config_dir();
-        let config_base = xdg_config_base();
-        let state_dir = xdg_state_dir();
+        let xray_dir = xray_config_dir();
+        let config_base = config_base_dir();
+        let state = state_dir();
         debug!("config dir: {}", xray_dir.display());
 
         let xray_config = match config_override {
@@ -30,19 +64,25 @@ impl Config {
         Config {
             xray_bin: "xray".to_string(),
             xray_config,
-            xray_log: PathBuf::from("/var/log/xray/xray.log"),
+            xray_log: default_xray_log(),
             xray_pid_file: xray_dir.join("xray.pid"),
             corvex_settings: config_base.join("corvex/corvex.json"),
-            corvex_log: state_dir.join("corvex/corvex.log"),
+            corvex_log: state.join("corvex/corvex.log"),
         }
     }
 }
 
-fn xdg_config_base() -> PathBuf {
-    xdg_config_base_inner(std::env::var("XDG_CONFIG_HOME").ok())
+fn config_base_dir() -> PathBuf {
+    config_base_dir_inner(
+        #[cfg(unix)]
+        std::env::var("XDG_CONFIG_HOME").ok(),
+        #[cfg(windows)]
+        std::env::var("APPDATA").ok(),
+    )
 }
 
-fn xdg_config_base_inner(xdg_home: Option<String>) -> PathBuf {
+#[cfg(unix)]
+fn config_base_dir_inner(xdg_home: Option<String>) -> PathBuf {
     if let Some(xdg) = xdg_home {
         if !xdg.is_empty() {
             return PathBuf::from(xdg);
@@ -52,19 +92,31 @@ fn xdg_config_base_inner(xdg_home: Option<String>) -> PathBuf {
     PathBuf::from(home).join(".config")
 }
 
-fn xdg_config_dir() -> PathBuf {
-    xdg_config_dir_inner(std::env::var("XDG_CONFIG_HOME").ok())
+#[cfg(windows)]
+fn config_base_dir_inner(appdata: Option<String>) -> PathBuf {
+    if let Some(dir) = appdata {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    PathBuf::from(r"C:\Users\Public\AppData\Roaming")
 }
 
-fn xdg_config_dir_inner(xdg_home: Option<String>) -> PathBuf {
-    xdg_config_base_inner(xdg_home).join("xray")
+fn xray_config_dir() -> PathBuf {
+    config_base_dir().join("xray")
 }
 
-fn xdg_state_dir() -> PathBuf {
-    xdg_state_dir_inner(std::env::var("XDG_STATE_HOME").ok())
+fn state_dir() -> PathBuf {
+    state_dir_inner(
+        #[cfg(unix)]
+        std::env::var("XDG_STATE_HOME").ok(),
+        #[cfg(windows)]
+        std::env::var("LOCALAPPDATA").ok(),
+    )
 }
 
-fn xdg_state_dir_inner(xdg_state: Option<String>) -> PathBuf {
+#[cfg(unix)]
+fn state_dir_inner(xdg_state: Option<String>) -> PathBuf {
     if let Some(xdg) = xdg_state {
         if !xdg.is_empty() {
             return PathBuf::from(xdg);
@@ -72,6 +124,27 @@ fn xdg_state_dir_inner(xdg_state: Option<String>) -> PathBuf {
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     PathBuf::from(home).join(".local/state")
+}
+
+#[cfg(windows)]
+fn state_dir_inner(local_appdata: Option<String>) -> PathBuf {
+    if let Some(dir) = local_appdata {
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
+    PathBuf::from(r"C:\Users\Public\AppData\Local")
+}
+
+fn default_xray_log() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/var/log/xray/xray.log")
+    }
+    #[cfg(windows)]
+    {
+        state_dir().join("xray/xray.log")
+    }
 }
 
 #[cfg(test)]
@@ -94,9 +167,9 @@ mod tests {
     }
 
     #[test]
-    fn xdg_config_home_is_respected() {
-        let dir = xdg_config_dir_inner(Some("/tmp/test-xdg".to_string()));
-        assert_eq!(dir, PathBuf::from("/tmp/test-xdg/xray"));
+    fn config_base_respects_override() {
+        let dir = config_base_dir_inner(Some("/tmp/test-xdg".to_string()));
+        assert_eq!(dir, PathBuf::from("/tmp/test-xdg"));
     }
 
     #[test]
@@ -107,20 +180,22 @@ mod tests {
     }
 
     #[test]
-    fn xdg_state_dir_respects_env_var() {
-        let dir = xdg_state_dir_inner(Some("/tmp/test-state".to_string()));
+    fn state_dir_respects_env_var() {
+        let dir = state_dir_inner(Some("/tmp/test-state".to_string()));
         assert_eq!(dir, PathBuf::from("/tmp/test-state"));
     }
 
     #[test]
-    fn xdg_state_dir_falls_back_to_local_state() {
-        let dir = xdg_state_dir_inner(None);
+    fn state_dir_falls_back_to_default() {
+        let dir = state_dir_inner(None);
+        #[cfg(unix)]
         assert!(dir.ends_with(".local/state"));
     }
 
     #[test]
-    fn xdg_state_dir_ignores_empty_env_var() {
-        let dir = xdg_state_dir_inner(Some(String::new()));
+    fn state_dir_ignores_empty_env_var() {
+        let dir = state_dir_inner(Some(String::new()));
+        #[cfg(unix)]
         assert!(dir.ends_with(".local/state"));
     }
 }

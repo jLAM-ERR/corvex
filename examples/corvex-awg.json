@@ -1,0 +1,25 @@
+{
+  // AmneziaWG tunnel — corvex starts AWG tunnel + xray as routing layer
+  // The vpn:// URI contains base64-encoded AWG configuration
+  "uri": "vpn://<base64-encoded-awg-config>",
+
+  // Required: static proxy port
+  "proxy": { "port": 21080 },
+
+  // Corporate DNS (optional)
+  "corporate-dns": {
+    "corp.example.com": "10.0.0.1"
+  },
+
+  // Routing rules work the same as with xray-only mode
+  "routes": {
+    "direct-ru": true,
+    "proxy-traffic": ["domain:youtube.com"],
+    "corporate-traffic": ["domain:corp.example.com"]
+  },
+
+  "log": {
+    "xray": { "loglevel": "warning" },
+    "corvex": { "debug": false }
+  }
+}

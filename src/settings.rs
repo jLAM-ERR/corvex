@@ -14,6 +14,12 @@ pub struct CorvexSettings {
     pub corporate_dns: Option<BTreeMap<String, String>>,
     pub routes: Option<RoutesSettings>,
     pub log: Option<LogSettings>,
+    pub proxy: Option<ProxySettings>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProxySettings {
+    pub port: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,5 +218,21 @@ mod tests {
     fn xdg_settings_path_ignores_empty_xdg_config_home() {
         let path = xdg_settings_path_inner(Some(String::new()));
         assert!(path.ends_with(".config/corvex/corvex.json"));
+    }
+
+    #[test]
+    fn load_proxy_settings() {
+        let json = r#"{"uri": "vless://x@y:1", "proxy": {"port": 21080}}"#;
+        let (_dir, path) = write_temp(json);
+        let s = load(&path).unwrap();
+        assert_eq!(s.proxy.as_ref().unwrap().port, 21080);
+    }
+
+    #[test]
+    fn load_missing_proxy_returns_none() {
+        let json = r#"{"uri": "vless://x@y:1"}"#;
+        let (_dir, path) = write_temp(json);
+        let s = load(&path).unwrap();
+        assert!(s.proxy.is_none());
     }
 }
