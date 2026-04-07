@@ -42,16 +42,28 @@ pub fn ensure_installed(xray_bin: &str) -> Result<()> {
             return Ok(());
         }
 
-        // Not found — try to install via brew
-        debug!("'{}' not found, installing via brew", xray_bin);
-        let brew_output = Command::new("brew")
-            .args(["install", "--quiet", "xray"])
-            .output()
-            .context("Failed to run 'brew install xray' — is Homebrew installed?")?;
+        #[cfg(target_os = "macos")]
+        {
+            debug!("'{}' not found, installing via brew", xray_bin);
+            let brew_output = Command::new("brew")
+                .args(["install", "--quiet", "xray"])
+                .output()
+                .context("Failed to run 'brew install xray' — is Homebrew installed?")?;
 
-        if !brew_output.status.success() {
-            let stderr = String::from_utf8_lossy(&brew_output.stderr);
-            anyhow::bail!("brew install xray failed: {}", stderr.trim());
+            if !brew_output.status.success() {
+                let stderr = String::from_utf8_lossy(&brew_output.stderr);
+                anyhow::bail!("brew install xray failed: {}", stderr.trim());
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            anyhow::bail!(
+                "'{}' not found in PATH. Install xray-core:\n\
+                 - Snap:   sudo snap install xray\n\
+                 - Manual: https://github.com/XTLS/Xray-core/releases",
+                xray_bin
+            );
         }
 
         Ok(())
@@ -123,6 +135,10 @@ fn is_process_alive(pid: i32) -> bool {
 
 #[cfg(windows)]
 fn is_process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -227,14 +243,12 @@ fn stop_process(pid: i32) {
 
 #[cfg(windows)]
 fn stop_process(pid: i32) {
-    debug!("sending CTRL_C to xray (PID {})", pid);
-    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_C_EVENT};
-
-    unsafe {
-        // Attempt graceful shutdown via CTRL_C first; the caller's wait loop
-        // will fall back to force_kill_process if this doesn't work.
-        GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid as u32);
-    }
+    // GenerateConsoleCtrlEvent takes a process *group* ID, not a PID.
+    // Since xray is spawned without CREATE_NEW_PROCESS_GROUP, the call
+    // would either fail silently or hit the wrong group.  Go straight
+    // to TerminateProcess, which is what happened in practice anyway
+    // (the 2-second timeout always expired).
+    force_kill_process(pid);
 }
 
 #[cfg(unix)]

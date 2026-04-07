@@ -36,7 +36,9 @@ pub struct ProxyParams {
 }
 
 /// URI scheme prefixes for all supported protocols.
-pub const SUPPORTED_SCHEMES: &[&str] = &["vless://", "vmess://", "trojan://", "ss://", "vpn://"];
+/// Schemes that xray's `parse_uri` can handle (used by subscription filter + health checks).
+/// `vpn://` is handled separately via the AWG engine path.
+pub const SUPPORTED_SCHEMES: &[&str] = &["vless://", "vmess://", "trojan://", "ss://"];
 
 /// Parse a proxy URI (VLESS, VMess, Trojan, or Shadowsocks).
 pub fn parse_uri(uri: &str) -> Result<ProxyParams> {

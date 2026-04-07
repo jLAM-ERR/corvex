@@ -17,6 +17,7 @@ rand = "0.9"
 json_comments = "0.2.2"
 log = "0.4"
 env_logger = "0.11"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.29", features = ["signal", "process"] }
@@ -32,7 +33,6 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = "thin"       

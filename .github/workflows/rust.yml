@@ -1,77 +1,100 @@
 # =============================================================================
-# GitHub Actions: macOS Release для Rust CLI
+# GitHub Actions: CI + Release for macOS & Windows
 # =============================================================================
-# Собирает universal binary (x86_64 + aarch64) для macOS,
-# архивирует и публикует как GitHub Release при пуше тега v*.
+# CI:      runs tests, clippy, fmt on macOS and Windows for every push/PR
+# Release: builds platform binaries and publishes GitHub Release on tag push
 # =============================================================================
 
-name: Release macOS
+name: CI & Release
 
-# ---------------------------------------------------------------------------
-# Триггеры:
-#   1. Автоматический — при пуше тега вида v1.0.0, v0.3.2-beta и т.д.
-#   2. Ручной (workflow_dispatch) — кнопка "Run workflow" в UI GitHub Actions.
-#      При ручном запуске версия задаётся через input-поле.
-# ---------------------------------------------------------------------------
 on:
   push:
+    branches: [main, "release/**"]
     tags:
       - "v*"
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (например: 1.0.0 или 1.0.0-beta)"
+        description: "Release version (e.g. 1.0.0 or 1.0.0-beta)"
         required: true
         type: string
 
-# ---------------------------------------------------------------------------
-# Минимальные permissions по принципу least privilege.
-# contents: write — нужен для создания GitHub Release и загрузки артефактов.
-# ---------------------------------------------------------------------------
 permissions:
   contents: write
 
-# ---------------------------------------------------------------------------
-# Переменные, общие для всех jobs.
-# CARGO_TERM_COLOR — цветной вывод в логах CI для удобства чтения.
-# FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 — принудительный запуск JS-actions
-#   на Node.js 24; необходим для softprops/action-gh-release@v2,
-#   у которого пока нет native Node 24 версии.
-# ---------------------------------------------------------------------------
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # Имя бинарника — должно совпадать с [[bin]] name в Cargo.toml.
-  # Измени на своё, если отличается.
   BINARY_NAME: corvex
 
+# =============================================================================
+# CI: test + lint on both platforms
+# =============================================================================
 jobs:
-  # ==========================================================================
-  # Job: build — сборка universal binary для macOS
-  # ==========================================================================
-  build:
-    name: Build macOS universal binary
-    runs-on: macos-14  # Apple Silicon runner (M1); собирает оба таргета
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
 
     steps:
-      # ----------------------------------------------------------------------
-      # 1. Checkout репозитория с полной историей тегов.
-      #    fetch-depth: 0 гарантирует, что git describe и tag info доступны.
-      # ----------------------------------------------------------------------
-      - name: Checkout source
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings -A dead_code
+
+      - name: Format check
+        run: cargo fmt --check
+
+  # ==========================================================================
+  # Release: macOS universal binary
+  # ==========================================================================
+  release-macos:
+    name: Release macOS
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      # ----------------------------------------------------------------------
-      # 2. Извлечение версии.
-      #    - Tag push:          GITHUB_REF = refs/tags/v1.2.3 → 1.2.3
-      #    - workflow_dispatch:  берём из inputs.version
-      # ----------------------------------------------------------------------
       - name: Extract version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
             TAG_NAME="v${VERSION}"
           else
             TAG_NAME="${GITHUB_REF#refs/tags/}"
@@ -79,23 +102,13 @@ jobs:
           fi
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
           echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
-          echo "::notice::Building release ${VERSION} (trigger: ${{ github.event_name }})"
 
-      # ----------------------------------------------------------------------
-      # 3. Установка Rust stable toolchain через официальный action.
-      #    Добавляем оба таргета: x86_64 (Intel) и aarch64 (Apple Silicon).
-      # ----------------------------------------------------------------------
-      - name: Install Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
 
-      # ----------------------------------------------------------------------
-      # 4. Кэширование Cargo-артефактов для ускорения повторных сборок.
-      #    Ключ кэша привязан к lockfile — при обновлении зависимостей
-      #    кэш пересоздаётся автоматически.
-      # ----------------------------------------------------------------------
-      - name: Cache Cargo registry & build artifacts
+      - name: Cache Cargo
         uses: actions/cache@v5
         with:
           path: |
@@ -108,76 +121,38 @@ jobs:
           restore-keys: |
             macos-cargo-
 
-      # ----------------------------------------------------------------------
-      # 5. Сборка release-бинарников под оба таргета.
-      #    --release включает оптимизации (LTO, strip и т.д. из Cargo.toml).
-      # ----------------------------------------------------------------------
-      - name: Build for x86_64 (Intel)
+      - name: Build x86_64
         run: cargo build --release --target x86_64-apple-darwin
 
-      - name: Build for aarch64 (Apple Silicon)
+      - name: Build aarch64
         run: cargo build --release --target aarch64-apple-darwin
 
-      # ----------------------------------------------------------------------
-      # 6. Склейка двух бинарников в universal binary через lipo.
-      #    Один файл работает нативно и на Intel, и на Apple Silicon.
-      # ----------------------------------------------------------------------
-      - name: Create universal binary via lipo
+      - name: Create universal binary
         run: |
           mkdir -p dist
           lipo -create \
             target/x86_64-apple-darwin/release/${BINARY_NAME} \
             target/aarch64-apple-darwin/release/${BINARY_NAME} \
             -output dist/${BINARY_NAME}
-
-          # Проверяем, что universal binary содержит обе архитектуры
-          echo "::group::Verify universal binary"
           file dist/${BINARY_NAME}
           lipo -info dist/${BINARY_NAME}
-          echo "::endgroup::"
 
-      # ----------------------------------------------------------------------
-      # 7. Архивирование в .tar.gz с именем на основе версии тега.
-      #    Формат: <binary>-<version>-darwin-universal.tar.gz
-      #    В архив кладём бинарник + README/LICENSE + examples/, если они есть.
-      # ----------------------------------------------------------------------
-      - name: Package release archive
+      - name: Package
         run: |
           ARCHIVE_NAME="${BINARY_NAME}-${VERSION}-darwin-universal"
           ARCHIVE_DIR="archive-staging/${ARCHIVE_NAME}"
           mkdir -p "${ARCHIVE_DIR}"
-
-          # Бинарник
           cp dist/${BINARY_NAME} "${ARCHIVE_DIR}/"
           chmod +x "${ARCHIVE_DIR}/${BINARY_NAME}"
-
-          # Документация (копируем, если файлы существуют; не падаем, если нет)
-          for f in README.md README LICENSE LICENSE-MIT LICENSE-APACHE CHANGELOG.md; do
+          for f in README.md LICENSE CHANGELOG.md; do
             [ -f "$f" ] && cp "$f" "${ARCHIVE_DIR}/"
           done
-
-          # Директория с примерами — копируем целиком, сохраняя структуру.
-          # -a (archive mode) сохраняет permissions и симлинки.
-          if [ -d "examples" ]; then
-            cp -a examples "${ARCHIVE_DIR}/examples"
-            echo "::notice::Included examples/ directory ($(find examples -type f | wc -l | tr -d ' ') files)"
-          else
-            echo "::warning::examples/ directory not found in repository root — skipping"
-          fi
-
-          # Создаём tar.gz из staging-директории
+          [ -d "examples" ] && cp -a examples "${ARCHIVE_DIR}/examples"
           tar -czf "${ARCHIVE_NAME}.tar.gz" -C archive-staging "${ARCHIVE_NAME}"
-
-          # SHA256 checksum для верификации скачанного архива
           shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
-
           echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
 
-      # ----------------------------------------------------------------------
-      # 8. Upload артефактов как build artifact (для отладки / скачивания
-      #    из UI GitHub Actions, даже если release-шаг упадёт).
-      # ----------------------------------------------------------------------
-      - name: Upload build artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v6
         with:
           name: ${{ env.ARCHIVE_NAME }}
@@ -186,67 +161,143 @@ jobs:
             ${{ env.ARCHIVE_NAME }}.tar.gz.sha256
           retention-days: 7
 
-      # ----------------------------------------------------------------------
-      # 9. Формирование тела релиза.
-      #    Если в корне репо есть RELEASE_NOTES.md — его содержимое
-      #    становится основным описанием. Блок Installation и checksum
-      #    добавляются в конец автоматически.
-      #    Если файла нет — только Installation + auto-generated notes.
-      # ----------------------------------------------------------------------
+  # ==========================================================================
+  # Release: Windows x86_64 binary
+  # ==========================================================================
+  release-windows:
+    name: Release Windows
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Extract version
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+            TAG_NAME="v${VERSION}"
+          else
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG_NAME#v}"
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            windows-cargo-
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: bash
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-${VERSION}-windows-x86_64"
+          mkdir -p "${ARCHIVE_NAME}"
+          cp "target/release/${BINARY_NAME}.exe" "${ARCHIVE_NAME}/"
+          [ -f "README.md" ] && cp README.md "${ARCHIVE_NAME}/"
+          [ -d "examples" ] && cp -r examples "${ARCHIVE_NAME}/examples"
+          7z a "${ARCHIVE_NAME}.zip" "${ARCHIVE_NAME}"
+          sha256sum "${ARCHIVE_NAME}.zip" > "${ARCHIVE_NAME}.zip.sha256"
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}.zip
+            ${{ env.ARCHIVE_NAME }}.zip.sha256
+          retention-days: 7
+
+  # ==========================================================================
+  # Publish GitHub Release (after both platform builds succeed)
+  # ==========================================================================
+  publish-release:
+    name: Publish Release
+    needs: [release-macos, release-windows]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Extract version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+            TAG_NAME="v${VERSION}"
+          else
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG_NAME#v}"
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: release-artifacts
+
+      - name: List artifacts
+        run: find release-artifacts -type f
+
       - name: Compose release body
         run: |
           BODY_FILE="release-body.md"
-
-          # Пользовательские release notes (если есть)
           if [ -f "RELEASE_NOTES.md" ]; then
             cat RELEASE_NOTES.md >> "${BODY_FILE}"
             printf '\n---\n\n' >> "${BODY_FILE}"
-            echo "::notice::Using RELEASE_NOTES.md for release description"
-          else
-            echo "::warning::RELEASE_NOTES.md not found — release will use auto-generated notes only"
           fi
 
-          # Блок с инструкцией по установке (добавляется всегда)
-          cat >> "${BODY_FILE}" << 'INSTALL_EOF'
+          cat >> "${BODY_FILE}" << EOF
           ## Installation
 
-          ```bash
-          # Download and extract
-          INSTALL_EOF
-
-          # Динамические значения вставляем отдельно (heredoc с подстановкой)
-          cat >> "${BODY_FILE}" << EOF
-          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/${ARCHIVE_NAME}.tar.gz | tar xz
-          # Move to PATH
-          sudo mv ${ARCHIVE_NAME}/${BINARY_NAME} /usr/local/bin/
+          ### macOS
+          \`\`\`bash
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/${BINARY_NAME}-${VERSION}-darwin-universal.tar.gz | tar xz
+          sudo mv ${BINARY_NAME}-${VERSION}-darwin-universal/${BINARY_NAME} /usr/local/bin/
           \`\`\`
+
+          ### Windows
+          Download \`${BINARY_NAME}-${VERSION}-windows-x86_64.zip\`, extract, and add to PATH.
           EOF
 
-          # Checksum
-          printf '\n**Checksum (SHA-256):**\n```\n' >> "${BODY_FILE}"
-          cat "${ARCHIVE_NAME}.tar.gz.sha256" >> "${BODY_FILE}"
-          printf '```\n' >> "${BODY_FILE}"
-
-      # ----------------------------------------------------------------------
-      # 10. Создание GitHub Release и загрузка архива + checksum.
-      #     softprops/action-gh-release — де-факто стандарт для этой задачи.
-      #     GITHUB_TOKEN предоставляется автоматически через permissions.
-      #     generate_release_notes: true — GitHub допишет автосгенерированный
-      #     changelog из PR-ов и коммитов ПОСЛЕ нашего body.
-      # ----------------------------------------------------------------------
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.TAG_NAME }}
           name: "Release ${{ env.TAG_NAME }}"
           body_path: release-body.md
-          files: |
-            ${{ env.ARCHIVE_NAME }}.tar.gz
-            ${{ env.ARCHIVE_NAME }}.tar.gz.sha256
-          # Помечать pre-release, если версия содержит дефис (v1.0.0-beta, v2.0.0-rc.1)
+          files: release-artifacts/**/*
           prerelease: ${{ contains(env.VERSION, '-') }}
-          # Auto-generated changelog дописывается после body_path
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

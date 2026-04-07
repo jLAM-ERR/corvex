@@ -19,10 +19,7 @@ use std::io::Write;
 use std::process::{self, Command};
 
 #[derive(Parser)]
-#[command(
-    name = "corvex",
-    about = "Manage Xray VPN proxy and macOS system proxy"
-)]
+#[command(name = "corvex", about = "Manage Xray VPN proxy and system proxy")]
 struct Cli {
     /// Path to corvex.json settings file (overrides default)
     #[arg(long = "settings", global = true)]
@@ -110,11 +107,11 @@ fn run() -> anyhow::Result<()> {
 }
 
 /// Detect engine mode from URI scheme.
-fn detect_engine_mode(uri: &str) -> &str {
+fn detect_engine_mode(uri: &str) -> engine::EngineMode {
     if uri.starts_with("vpn://") {
-        "awg"
+        engine::EngineMode::Awg
     } else {
-        "xray"
+        engine::EngineMode::Xray
     }
 }
 
@@ -157,14 +154,19 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
             "start flow: downloading from {} subscription URLs",
             urls.len()
         );
-        let mut all_uris = Vec::new();
+        let mut xray_uris = Vec::new();
+        let mut vpn_uris = Vec::new();
         for url in urls {
             match subscription::download_subscription(url) {
                 Ok(body) => {
                     if let Ok(uris) = subscription::decode_subscription(&body) {
                         let supported = subscription::filter_supported(&uris);
                         debug!("subscription {}: {} supported URIs", url, supported.len());
-                        all_uris.extend(supported);
+                        xray_uris.extend(supported);
+                        // Collect vpn:// URIs separately (handled by AWG engine)
+                        vpn_uris.extend(
+                            uris.into_iter().filter(|u| u.starts_with("vpn://")),
+                        );
                     }
                 }
                 Err(e) => {
@@ -173,10 +175,22 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
                 }
             }
         }
-        if all_uris.is_empty() {
+        if xray_uris.is_empty() && vpn_uris.is_empty() {
             anyhow::bail!("no supported proxy servers found in subscriptions");
         }
-        health::find_alive_server(&all_uris, &config.xray_bin)?
+        // Try xray-compatible URIs first (with health checks), fall back to vpn://
+        if !xray_uris.is_empty() {
+            match health::find_alive_server(&xray_uris, &config.xray_bin) {
+                Ok(uri) => uri,
+                Err(_) if !vpn_uris.is_empty() => {
+                    debug!("no reachable xray servers, falling back to vpn:// URI");
+                    vpn_uris.swap_remove(0)
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            vpn_uris.swap_remove(0)
+        }
     };
 
     // 4. Extract routing settings (shared between both engine modes)
@@ -195,7 +209,7 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
 
     // 5. Branch on engine mode
     match detect_engine_mode(&resolved_uri) {
-        "awg" => {
+        engine::EngineMode::Awg => {
             debug!("AWG engine mode");
             let awg_config = engine::awg::parse_vpn_uri(&resolved_uri)?;
 
@@ -239,7 +253,7 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
             // Start xray as routing layer and enable proxy
             main_algorithm(config, plat, static_port)
         }
-        _ => {
+        engine::EngineMode::Xray => {
             debug!("Xray engine mode");
             let params = protocol::parse_uri(&resolved_uri)?;
 
@@ -434,15 +448,16 @@ fn cmd_stop(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     debug!("stopping xray process");
     let xray_result = xray::stop(config);
 
-    // Stop AWG tunnel if running
-    let awg_conf_path = config.awg_conf_path()?;
-    let iface = engine::awg::conf_interface_name(&awg_conf_path);
-    if engine::awg::is_tunnel_running(&iface) {
-        debug!("stopping AWG tunnel");
-        if let Err(e) = engine::awg::stop_tunnel(&awg_conf_path) {
-            warn!("failed to stop AWG tunnel: {}", e);
-        } else {
-            println!("{}", "AWG tunnel stopped".green());
+    // Stop AWG tunnel if running (don't let path errors swallow proxy/xray results)
+    if let Ok(awg_conf_path) = config.awg_conf_path() {
+        let iface = engine::awg::conf_interface_name(&awg_conf_path);
+        if engine::awg::is_tunnel_running(&iface) {
+            debug!("stopping AWG tunnel");
+            if let Err(e) = engine::awg::stop_tunnel(&awg_conf_path) {
+                warn!("failed to stop AWG tunnel: {}", e);
+            } else {
+                println!("{}", "AWG tunnel stopped".green());
+            }
         }
     }
 
@@ -471,11 +486,14 @@ fn cmd_status(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     println!("Xray log: {}", config.xray_log.display());
 
     // Engine type and AWG status
-    let awg_conf_path = config.awg_conf_path()?;
-    let awg_iface = engine::awg::conf_interface_name(&awg_conf_path);
-    if engine::awg::is_tunnel_running(&awg_iface) {
-        println!("Engine: {}", "AWG + xray".green());
-        println!("AWG tunnel: {} ({})", "running".green(), awg_iface);
+    if let Ok(awg_conf_path) = config.awg_conf_path() {
+        let awg_iface = engine::awg::conf_interface_name(&awg_conf_path);
+        if engine::awg::is_tunnel_running(&awg_iface) {
+            println!("Engine: {}", "AWG + xray".green());
+            println!("AWG tunnel: {} ({})", "running".green(), awg_iface);
+        } else {
+            println!("Engine: {}", "xray".green());
+        }
     } else {
         println!("Engine: {}", "xray".green());
     }
@@ -878,26 +896,41 @@ mod tests {
 
     #[test]
     fn test_detect_engine_mode_vpn() {
-        assert_eq!(super::detect_engine_mode("vpn://abc123"), "awg");
+        assert_eq!(
+            super::detect_engine_mode("vpn://abc123"),
+            crate::engine::EngineMode::Awg
+        );
     }
 
     #[test]
     fn test_detect_engine_mode_vless() {
-        assert_eq!(super::detect_engine_mode("vless://uuid@host:443"), "xray");
+        assert_eq!(
+            super::detect_engine_mode("vless://uuid@host:443"),
+            crate::engine::EngineMode::Xray
+        );
     }
 
     #[test]
     fn test_detect_engine_mode_vmess() {
-        assert_eq!(super::detect_engine_mode("vmess://abc"), "xray");
+        assert_eq!(
+            super::detect_engine_mode("vmess://abc"),
+            crate::engine::EngineMode::Xray
+        );
     }
 
     #[test]
     fn test_detect_engine_mode_trojan() {
-        assert_eq!(super::detect_engine_mode("trojan://abc"), "xray");
+        assert_eq!(
+            super::detect_engine_mode("trojan://abc"),
+            crate::engine::EngineMode::Xray
+        );
     }
 
     #[test]
     fn test_detect_engine_mode_ss() {
-        assert_eq!(super::detect_engine_mode("ss://abc"), "xray");
+        assert_eq!(
+            super::detect_engine_mode("ss://abc"),
+            crate::engine::EngineMode::Xray
+        );
     }
 }

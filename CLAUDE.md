@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Rust CLI tool (`corvex`) that manages the Xray VPN daemon and macOS/Windows system proxy settings. Supports AmneziaWG as an alternative tunnel engine.
+Rust CLI tool (`corvex`) that manages the Xray VPN daemon and system proxy settings on macOS, Linux, and Windows. Supports AmneziaWG as an alternative tunnel engine.
 
 ## Build & Test
 
@@ -69,6 +69,7 @@ src/
 │   └── awg.rs           — vpn:// parser, .conf generator, awg-quick lifecycle
 ├── platform/
 │   ├── mod.rs           — Platform trait, PlatformImpl type alias
+│   ├── linux.rs         — proxy via env file + DE detection (GNOME/KDE), DNS via resolvectl
 │   ├── macos.rs         — proxy, network, DNS via networksetup/scutil
 │   └── windows.rs       — proxy, network, DNS stubs (WinAPI/registry)
 ```

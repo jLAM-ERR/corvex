@@ -102,9 +102,39 @@ fn str_field(json: &serde_json::Value, field: &str) -> Result<String> {
     }
 }
 
+/// Reject fields that contain newlines — a malicious server could inject
+/// `PostUp = <cmd>` into the .conf file otherwise.
+fn validate_no_newlines(config: &AwgConfig) -> Result<()> {
+    let fields = [
+        ("private_key", &config.private_key),
+        ("address", &config.address),
+        ("dns", &config.dns),
+        ("public_key", &config.public_key),
+        ("endpoint", &config.endpoint),
+        ("allowed_ips", &config.allowed_ips),
+        ("preshared_key", &config.preshared_key),
+        ("jc", &config.jc),
+        ("jmin", &config.jmin),
+        ("jmax", &config.jmax),
+        ("s1", &config.s1),
+        ("s2", &config.s2),
+        ("h1", &config.h1),
+        ("h2", &config.h2),
+        ("h3", &config.h3),
+        ("h4", &config.h4),
+    ];
+    for (name, value) in fields {
+        if value.contains('\n') || value.contains('\r') {
+            bail!("AWG config field '{name}' contains newline (possible injection)");
+        }
+    }
+    Ok(())
+}
+
 /// Generate a WireGuard .conf file content with AmneziaWG extensions.
-pub fn generate_conf(config: &AwgConfig) -> String {
-    format!(
+pub fn generate_conf(config: &AwgConfig) -> Result<String> {
+    validate_no_newlines(config)?;
+    Ok(format!(
         "[Interface]\n\
          PrivateKey = {}\n\
          Address = {}\n\
@@ -141,37 +171,17 @@ pub fn generate_conf(config: &AwgConfig) -> String {
         config.preshared_key,
         config.endpoint,
         config.allowed_ips,
-    )
+    ))
 }
 
 /// Write the AWG .conf file to disk with restricted permissions (0o600 on unix).
 pub fn write_conf(config: &AwgConfig, path: &Path) -> Result<()> {
-    let content = generate_conf(config);
+    let content = generate_conf(config)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create dir {}", parent.display()))?;
     }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("failed to create {}", path.display()))?;
-        std::io::Write::write_all(&mut file, content.as_bytes())
-            .with_context(|| format!("failed to write {}", path.display()))?;
-    }
-    #[cfg(windows)]
-    {
-        std::fs::write(path, content)
-            .with_context(|| format!("failed to write conf to {}", path.display()))?;
-    }
-
-    Ok(())
+    crate::config::write_restricted(path, &content)
 }
 
 /// Ensure awg-quick is installed; auto-install silently if not found.
@@ -190,15 +200,27 @@ pub fn ensure_awg_installed() -> Result<()> {
             return Ok(());
         }
 
-        info!("awg-quick not found, installing amneziawg-tools via brew");
-        let brew = Command::new("brew")
-            .args(["install", "--quiet", "amneziawg-tools"])
-            .output()
-            .context("failed to run 'brew install amneziawg-tools' — is Homebrew installed?")?;
+        #[cfg(target_os = "macos")]
+        {
+            info!("awg-quick not found, installing amneziawg-tools via brew");
+            let brew = Command::new("brew")
+                .args(["install", "--quiet", "amneziawg-tools"])
+                .output()
+                .context("failed to run 'brew install amneziawg-tools' — is Homebrew installed?")?;
 
-        if !brew.status.success() {
-            let stderr = String::from_utf8_lossy(&brew.stderr);
-            anyhow::bail!("brew install amneziawg-tools failed: {}", stderr.trim());
+            if !brew.status.success() {
+                let stderr = String::from_utf8_lossy(&brew.stderr);
+                anyhow::bail!("brew install amneziawg-tools failed: {}", stderr.trim());
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            anyhow::bail!(
+                "awg-quick not found in PATH. Install amneziawg-tools:\n\
+                 - Debian/Ubuntu: sudo apt install amneziawg-tools\n\
+                 - Manual: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module"
+            );
         }
     }
 
@@ -444,7 +466,7 @@ mod tests {
             h4: "4".to_string(),
         };
 
-        let conf = generate_conf(&config);
+        let conf = generate_conf(&config).unwrap();
         assert!(conf.contains("[Interface]"));
         assert!(conf.contains("PrivateKey = priv"));
         assert!(conf.contains("Address = 10.8.1.2/32"));
@@ -501,5 +523,32 @@ mod tests {
     fn conf_interface_name_custom() {
         let path = std::path::PathBuf::from("/tmp/myiface.conf");
         assert_eq!(conf_interface_name(&path), "myiface");
+    }
+
+    #[test]
+    fn generate_conf_rejects_newline_injection() {
+        let mut config = AwgConfig {
+            private_key: "pk".to_string(),
+            address: "10.0.0.1/32".to_string(),
+            dns: "8.8.8.8".to_string(),
+            public_key: "spk".to_string(),
+            endpoint: "h:443".to_string(),
+            allowed_ips: "0.0.0.0/0".to_string(),
+            preshared_key: "psk".to_string(),
+            jc: "1".to_string(),
+            jmin: "2".to_string(),
+            jmax: "3".to_string(),
+            s1: "4".to_string(),
+            s2: "5".to_string(),
+            h1: "6".to_string(),
+            h2: "7".to_string(),
+            h3: "8".to_string(),
+            h4: "9".to_string(),
+        };
+        // Inject newline into client_ip (address field)
+        config.address = "10.0.0.1/32\nPostUp = evil".to_string();
+        let result = generate_conf(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("newline"));
     }
 }

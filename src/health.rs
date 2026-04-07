@@ -2,11 +2,10 @@ use crate::protocol::ProxyParams;
 use anyhow::{bail, Context, Result};
 use log::debug;
 use rand::Rng;
-use std::fs;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use tempfile::NamedTempFile;
 
 const CHECK_URL: &str = "http://www.gstatic.com/generate_204";
 
@@ -40,8 +39,9 @@ pub fn check_tcp(host: &str, port: u16, timeout: Duration) -> Result<()> {
 }
 
 /// Generate a minimal xray config for tunnel checking.
-/// Writes to `/tmp/xray-check-{local_port}.json`.
-pub fn generate_temp_config(params: &ProxyParams, local_port: u16) -> Result<PathBuf> {
+/// Returns a `NamedTempFile` that auto-deletes on drop, preventing credential
+/// leakage if the process is killed before the `TunnelGuard` is constructed.
+pub fn generate_temp_config(params: &ProxyParams, local_port: u16) -> Result<NamedTempFile> {
     let stream_settings = crate::protocol::build_stream_settings(params);
     let outbound_settings = crate::protocol::build_outbound_settings(params);
 
@@ -61,49 +61,27 @@ pub fn generate_temp_config(params: &ProxyParams, local_port: u16) -> Result<Pat
         }],
     });
 
-    let path = std::env::temp_dir().join(format!("xray-check-{local_port}.json"));
     let json = serde_json::to_string_pretty(&config).context("failed to serialize temp config")?;
 
-    // Create file with restricted permissions from the start to prevent credential leakage
-    let mut file = {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-                .with_context(|| format!("failed to create {}", path.display()))?
-        }
-        #[cfg(windows)]
-        {
-            fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&path)
-                .with_context(|| format!("failed to create {}", path.display()))?
-        }
-    };
+    let mut file = NamedTempFile::with_suffix(".json").context("failed to create temp config")?;
     std::io::Write::write_all(&mut file, json.as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))?;
+        .context("failed to write temp config")?;
 
-    Ok(path)
+    Ok(file)
 }
 
 /// Guard to ensure child process is killed and temp file removed on drop.
+/// The `NamedTempFile` auto-deletes when dropped, so credentials never persist.
 struct TunnelGuard {
     child: Child,
-    config_path: PathBuf,
+    _config_file: NamedTempFile,
 }
 
 impl Drop for TunnelGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let _ = fs::remove_file(&self.config_path);
+        // _config_file is auto-deleted by NamedTempFile::drop
     }
 }
 
@@ -111,18 +89,21 @@ impl Drop for TunnelGuard {
 /// Returns the round-trip latency.
 pub fn check_tunnel(params: &ProxyParams, xray_bin: &str) -> Result<Duration> {
     let local_port = find_free_port()?;
-    let config_path = generate_temp_config(params, local_port)?;
-    debug!("tunnel check via temp config {}", config_path.display());
+    let config_file = generate_temp_config(params, local_port)?;
+    debug!("tunnel check via temp config {}", config_file.path().display());
 
     let child = Command::new(xray_bin)
         .args(["run", "-c"])
-        .arg(&config_path)
+        .arg(config_file.path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .context("failed to spawn xray for tunnel check")?;
 
-    let mut guard = TunnelGuard { child, config_path };
+    let mut guard = TunnelGuard {
+        child,
+        _config_file: config_file,
+    };
 
     // Poll for xray readiness instead of fixed sleep
     let mut ready = false;
@@ -232,6 +213,7 @@ pub fn find_alive_server(uris: &[String], xray_bin: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn test_valid_address_format_parsing() {
@@ -269,16 +251,11 @@ mod tests {
     fn test_generate_temp_config_valid_json() {
         let params = sample_params();
         let port = 30000;
-        let path = generate_temp_config(&params, port).unwrap();
+        let file = generate_temp_config(&params, port).unwrap();
 
-        // Verify file exists and is valid JSON
-        let content = fs::read_to_string(&path).unwrap();
+        let content = fs::read_to_string(file.path()).unwrap();
         let config: serde_json::Value = serde_json::from_str(&content).unwrap();
 
-        // Cleanup
-        let _ = fs::remove_file(&path);
-
-        // Verify structure
         assert_eq!(config["log"]["loglevel"], "none");
         assert!(config["inbounds"].is_array());
         assert!(config["outbounds"].is_array());
@@ -288,11 +265,10 @@ mod tests {
     fn test_generate_temp_config_correct_port() {
         let params = sample_params();
         let port = 31234;
-        let path = generate_temp_config(&params, port).unwrap();
+        let file = generate_temp_config(&params, port).unwrap();
 
-        let content = fs::read_to_string(&path).unwrap();
+        let content = fs::read_to_string(file.path()).unwrap();
         let config: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let _ = fs::remove_file(&path);
 
         assert_eq!(config["inbounds"][0]["port"], port);
         assert_eq!(config["inbounds"][0]["listen"], "127.0.0.1");
@@ -303,11 +279,10 @@ mod tests {
     fn test_generate_temp_config_correct_address() {
         let params = sample_params();
         let port = 31235;
-        let path = generate_temp_config(&params, port).unwrap();
+        let file = generate_temp_config(&params, port).unwrap();
 
-        let content = fs::read_to_string(&path).unwrap();
+        let content = fs::read_to_string(file.path()).unwrap();
         let config: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let _ = fs::remove_file(&path);
 
         let vnext = &config["outbounds"][0]["settings"]["vnext"][0];
         assert_eq!(vnext["address"], "server.example.com");
@@ -320,11 +295,10 @@ mod tests {
     fn test_generate_temp_config_stream_settings() {
         let params = sample_params();
         let port = 31236;
-        let path = generate_temp_config(&params, port).unwrap();
+        let file = generate_temp_config(&params, port).unwrap();
 
-        let content = fs::read_to_string(&path).unwrap();
+        let content = fs::read_to_string(file.path()).unwrap();
         let config: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let _ = fs::remove_file(&path);
 
         let stream = &config["outbounds"][0]["streamSettings"];
         assert_eq!(stream["network"], "grpc");
@@ -335,14 +309,14 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_temp_config_file_path() {
+    fn test_generate_temp_config_auto_cleanup() {
         let params = sample_params();
         let port = 31237;
-        let path = generate_temp_config(&params, port).unwrap();
-        let _ = fs::remove_file(&path);
-
-        let expected = std::env::temp_dir().join("xray-check-31237.json");
-        assert_eq!(path, expected);
+        let file = generate_temp_config(&params, port).unwrap();
+        let path = file.path().to_path_buf();
+        assert!(path.exists());
+        drop(file);
+        assert!(!path.exists(), "temp config should be deleted on drop");
     }
 
     #[test]
@@ -380,11 +354,10 @@ mod tests {
     fn test_generate_temp_config_minimal_params() {
         let params = crate::protocol::parse_uri("vless://uuid@host.net:8443").unwrap();
         let port = 31238;
-        let path = generate_temp_config(&params, port).unwrap();
+        let file = generate_temp_config(&params, port).unwrap();
 
-        let content = fs::read_to_string(&path).unwrap();
+        let content = fs::read_to_string(file.path()).unwrap();
         let config: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let _ = fs::remove_file(&path);
 
         // No tlsSettings or grpcSettings
         assert!(config["outbounds"][0]["streamSettings"]["tlsSettings"].is_null());
