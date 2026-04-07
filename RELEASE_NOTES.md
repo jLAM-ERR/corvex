@@ -1,61 +1,50 @@
-# Corvex v0.2.0 Release Notes
+# Corvex v0.3.0 Release Notes
 
 ## Highlights
 
-Major redesign: all configuration consolidated into a single `corvex.json` (JSONC) file, multi-protocol support added, and the CLI simplified to a clean `start`/`stop`/`reload`/`status`/`logs` interface.
+Cross-platform release: corvex now runs on macOS, Linux, and Windows. New AmneziaWG tunnel engine, platform abstraction layer, and hardened security across the board.
 
 ## What's New
 
-### Unified corvex.json Configuration
-All settings are now in one JSONC file at `~/.config/corvex/corvex.json`. The separate text files (`free.txt`, `ctraffic.txt`, `ptraffic.txt`) and `corp-dns.json` are replaced by fields in corvex.json. JSONC format allows comments for documenting your config.
+### Cross-Platform Support
+- **Linux**: proxy via environment file + desktop environment detection (GNOME gsettings, KDE kwriteconfig), DNS via `resolvectl`
+- **Windows**: proxy via registry (Internet Settings), DNS via adapter queries and NRPT registry rules
+- **macOS**: unchanged — `networksetup` and `scutil`
 
-### Multi-Protocol Support
-In addition to VLESS, corvex now supports:
-- **VMess** — `vmess://base64json`
-- **Trojan** — `trojan://password@host:port?params#name`
-- **Shadowsocks** — `ss://base64(method:password)@host:port#name` (SIP002 and legacy)
+### AmneziaWG Engine
+New `vpn://` URI scheme routes traffic through AmneziaWG tunnels:
+- Parses `vpn://base64json` URIs with obfuscation parameters (Jc, Jmin, Jmax, S1, S2, H1-H4)
+- Generates `.conf` files and manages `awg-quick up/down` lifecycle
+- Xray runs as a local routing layer with a `freedom` outbound on top of the AWG tunnel
+- Auto-installs `amneziawg-tools` via brew (macOS) or prompts for manual install (Linux)
 
-Subscription auto-discovery filters and health-checks all supported protocols, not just VLESS gRPC.
+### Subscription vpn:// Handling
+Subscriptions containing `vpn://` URIs are now handled correctly. Xray-compatible URIs are health-checked first; if none are reachable, corvex falls back to the first available `vpn://` URI via the AWG engine.
 
-### Subscription Auto-Discovery with Health Checks
-Configure `"file-url"` in corvex.json with subscription URLs. corvex downloads, base64-decodes, filters for supported protocols, and picks the best server via a two-stage health check:
-1. **TCP reachability** — fast socket connect to filter unreachable servers
-2. **Tunnel latency** — temporary xray instance per candidate measures actual round-trip time
+### Static Proxy Port
+The proxy port is now configured explicitly via `"proxy": {"port": 21080}` in corvex.json (required). This eliminates the TOCTOU race from dynamic port allocation. Health checks retain private ephemeral ports.
 
-### Dynamic Port Allocation
-Each `corvex start` picks a random free port in the 20000-60000 range. No more fixed ports or conflicts on restart.
+### Security Hardening
+- All credential-bearing files (xray config, AWG conf, health-check temp configs) use `0o600` permissions on unix
+- Health-check temp configs use auto-deleting temp files to prevent credential leakage on crash
+- AWG config fields are validated for newline injection before writing `.conf` files
+- Windows process management uses proper null-pointer checks for handle validation
 
-### Traffic-Based Routing via corvex.json
-Define per-domain routing rules directly in corvex.json:
-- `"corporate-traffic"` — domains that bypass the proxy (direct)
-- `"proxy-traffic"` — domains forced through the proxy
-- `"direct-ru"` — route `.ru` TLD directly
+### Engine Mode Type Safety
+Engine dispatch uses a proper `EngineMode` enum instead of string matching, preventing silent fallthrough from typos.
 
-### Corporate DNS
-Configure `"corporate-dns"` in corvex.json for domain-to-nameserver mappings. These are merged with auto-discovered entries from macOS `scutil --dns`.
-
-### Debug Logging
-Enable via `"log": {"corvex": {"debug": true}}` in corvex.json or `CORVEX_DEBUG=1` environment variable. Xray log paths and levels are also configurable in corvex.json.
-
-### Custom Settings Path
-Use `corvex --settings /path/to/corvex.json start` to override the default settings file location.
-
-### Status Command Shows Config Paths
-`corvex status` now displays the paths for corvex.json, xray config, and xray log file.
-
-### XDG Base Directory Support
-Config and state files follow XDG conventions:
-- Settings: `$XDG_CONFIG_HOME/corvex/corvex.json`
-- Xray config: `$XDG_CONFIG_HOME/xray/config.json`
-- Corvex log: `$XDG_STATE_HOME/corvex/corvex.log`
+### CI/CD
+GitHub Actions workflow runs tests, clippy, and fmt on both macOS and Windows. Release builds produce:
+- macOS universal binary (x86_64 + aarch64)
+- Windows x86_64 binary
 
 ## Commands
 
 ```
 corvex start                                    # Load corvex.json, resolve server, start
-corvex stop                                     # Disable system proxy + stop xray
-corvex reload                                   # Validate config and send SIGHUP
-corvex status                                   # Show process, ports, proxy settings, config paths
+corvex stop                                     # Disable system proxy + stop xray (+ AWG if active)
+corvex reload                                   # Validate config, send SIGHUP
+corvex status                                   # Show engine type, process, ports, proxy settings
 corvex logs                                     # Show last 20 log lines
 corvex logs -f                                  # Follow log output
 corvex --settings /path/to/corvex.json start    # Use custom settings file
@@ -64,16 +53,11 @@ CORVEX_DEBUG=1 corvex start                     # Enable debug logging
 
 ## Breaking Changes
 
-- **CLI simplified**: removed positional URI argument, `start free` subcommand, `--ru` and `--config` flags
-- **Config consolidated**: `free.txt`, `ctraffic.txt`, `ptraffic.txt`, and `corp-dns.json` replaced by `corvex.json`
-- **Config location**: corvex settings moved from `~/.config/xray/` to `~/.config/corvex/corvex.json`
-- **Port allocation**: no longer fixed, allocated dynamically each start
+- **`proxy.port` is now required** in corvex.json — dynamic port allocation removed
+- **Config paths on Windows** follow `%APPDATA%` / `%LOCALAPPDATA%` conventions
 
-## Migration from v0.1.0
+## Migration from v0.2.0
 
-1. Create `~/.config/corvex/corvex.json` (see `examples/corvex.json`)
-2. Move subscription URLs from `free.txt` into `"file-url"` array
-3. Move domain lists from `ctraffic.txt`/`ptraffic.txt` into `"routes"`
-4. Move DNS mappings from `corp-dns.json` into `"corporate-dns"`
-5. Replace `--ru` flag usage with `"routes": {"direct-ru": true}`
-6. Remove old files from `~/.config/xray/` (corvex warns if they still exist)
+1. Add `"proxy": {"port": 21080}` to your corvex.json (pick any port >= 1024)
+2. For AWG usage: add a `vpn://` URI to `"uri"` or subscription, and ensure `awg-quick` is installed
+3. No other config changes required — existing corvex.json files are compatible
