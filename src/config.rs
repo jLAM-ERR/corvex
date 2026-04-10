@@ -147,14 +147,14 @@ fn default_xray_log() -> PathBuf {
     }
 }
 
-fn default_xray_pid_file(_xray_dir: &Path, state: &Path) -> PathBuf {
+fn default_xray_pid_file(_xray_dir: &Path, _state: &Path) -> PathBuf {
     #[cfg(unix)]
     {
         _xray_dir.join("xray.pid")
     }
     #[cfg(windows)]
     {
-        state.join("xray").join("xray.pid")
+        _state.join("xray").join("xray.pid")
     }
 }
 
