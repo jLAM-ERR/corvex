@@ -65,9 +65,9 @@ impl Config {
             xray_bin: "xray".to_string(),
             xray_config,
             xray_log: default_xray_log(),
-            xray_pid_file: xray_dir.join("xray.pid"),
-            corvex_settings: config_base.join("corvex/corvex.json"),
-            corvex_log: state.join("corvex/corvex.log"),
+            xray_pid_file: default_xray_pid_file(&xray_dir, &state),
+            corvex_settings: config_base.join("corvex").join("corvex.json"),
+            corvex_log: state.join("corvex").join("corvex.log"),
         }
     }
 }
@@ -143,7 +143,18 @@ fn default_xray_log() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        state_dir().join("xray/xray.log")
+        state_dir().join("xray").join("xray.log")
+    }
+}
+
+fn default_xray_pid_file(_xray_dir: &Path, state: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        _xray_dir.join("xray.pid")
+    }
+    #[cfg(windows)]
+    {
+        state.join("xray").join("xray.pid")
     }
 }
 
