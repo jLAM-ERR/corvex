@@ -6,6 +6,7 @@ use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -19,36 +20,41 @@ pub enum XrayError {
     AlreadyRunning(i32),
     #[error("xray is not running")]
     NotRunning,
-    #[error("xray failed to start — check the log")]
+    #[error("xray failed to start - check the log")]
     StartFailed,
     #[error("invalid config: {0}")]
     InvalidConfig(String),
 }
 
+/// Resolve an xray executable from PATH or common install locations.
+pub fn resolve_binary(xray_bin: &str) -> Option<PathBuf> {
+    let bin_path = PathBuf::from(xray_bin);
+    if bin_path.is_absolute() || bin_path.components().count() > 1 {
+        return bin_path.exists().then_some(bin_path);
+    }
+
+    resolve_from_path(xray_bin).or_else(|| resolve_from_common_locations(xray_bin))
+}
+
 /// Check if xray binary is installed; if not, install silently.
-/// On macOS: uses brew. On Windows: checks PATH.
+/// On macOS: uses brew. On Windows: checks PATH and common install locations.
 pub fn ensure_installed(xray_bin: &str) -> Result<()> {
     debug!("checking if '{}' is installed", xray_bin);
 
+    if let Some(path) = resolve_binary(xray_bin) {
+        debug!("resolved '{}' to {}", xray_bin, path.display());
+        return Ok(());
+    }
+
     #[cfg(unix)]
     {
-        let which_output = Command::new("which")
-            .arg(xray_bin)
-            .output()
-            .context("Failed to run 'which'")?;
-
-        if which_output.status.success() {
-            debug!("'{}' found in PATH", xray_bin);
-            return Ok(());
-        }
-
         #[cfg(target_os = "macos")]
         {
             debug!("'{}' not found, installing via brew", xray_bin);
             let brew_output = Command::new("brew")
                 .args(["install", "--quiet", "xray"])
                 .output()
-                .context("Failed to run 'brew install xray' — is Homebrew installed?")?;
+                .context("Failed to run 'brew install xray' - is Homebrew installed?")?;
 
             if !brew_output.status.success() {
                 let stderr = String::from_utf8_lossy(&brew_output.stderr);
@@ -71,17 +77,6 @@ pub fn ensure_installed(xray_bin: &str) -> Result<()> {
 
     #[cfg(windows)]
     {
-        let where_output = Command::new("where")
-            .arg(xray_bin)
-            .output()
-            .context("Failed to run 'where'")?;
-
-        if where_output.status.success() {
-            debug!("'{}' found in PATH", xray_bin);
-            return Ok(());
-        }
-
-        // Not found — try winget
         debug!("'{}' not found, installing via winget", xray_bin);
         let winget_output = Command::new("winget")
             .args(["install", "--silent", "xray"])
@@ -94,6 +89,137 @@ pub fn ensure_installed(xray_bin: &str) -> Result<()> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn resolve_from_path(bin: &str) -> Option<PathBuf> {
+    let output = Command::new("which").arg(bin).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(windows)]
+fn resolve_from_path(bin: &str) -> Option<PathBuf> {
+    for candidate in windows_binary_candidates(bin) {
+        let output = Command::new("where").arg(&candidate).output().ok()?;
+        if !output.status.success() {
+            continue;
+        }
+
+        if let Some(path) = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+        {
+            return Some(PathBuf::from(path));
+        }
+    }
+
+    None
+}
+
+#[cfg(unix)]
+fn resolve_from_common_locations(_bin: &str) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(windows)]
+fn resolve_from_common_locations(bin: &str) -> Option<PathBuf> {
+    let file_name = windows_exe_name(bin);
+    let mut candidates = Vec::new();
+
+    if let Ok(program_files) = std::env::var("ProgramFiles") {
+        candidates.push(PathBuf::from(&program_files).join("Xray").join(&file_name));
+        candidates.push(PathBuf::from(&program_files).join("xray").join(&file_name));
+        candidates.push(PathBuf::from(&program_files).join("Xray-core").join(&file_name));
+    }
+
+    if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+        candidates.push(
+            PathBuf::from(&local_appdata)
+                .join("Programs")
+                .join("Xray")
+                .join(&file_name),
+        );
+        candidates.push(
+            PathBuf::from(&local_appdata)
+                .join("Programs")
+                .join("xray")
+                .join(&file_name),
+        );
+
+        let winget_packages = PathBuf::from(local_appdata)
+            .join("Microsoft")
+            .join("WinGet")
+            .join("Packages");
+        if let Some(path) = find_file_in_children(&winget_packages, &file_name) {
+            candidates.push(path);
+        }
+    }
+
+    candidates.into_iter().find(|path| path.exists())
+}
+
+#[cfg(windows)]
+fn find_file_in_children(root: &Path, file_name: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.file_name().and_then(|name| name.to_str()) == Some(file_name) {
+            return Some(path);
+        }
+        if !path.is_dir() {
+            continue;
+        }
+
+        let direct = path.join(file_name);
+        if direct.exists() {
+            return Some(direct);
+        }
+
+        let nested_entries = fs::read_dir(&path).ok()?;
+        for nested in nested_entries.flatten() {
+            let nested_path = nested.path();
+            if nested_path.is_file()
+                && nested_path.file_name().and_then(|name| name.to_str()) == Some(file_name)
+            {
+                return Some(nested_path);
+            }
+            if nested_path.is_dir() {
+                let deep = nested_path.join(file_name);
+                if deep.exists() {
+                    return Some(deep);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+#[cfg(windows)]
+fn windows_binary_candidates(bin: &str) -> Vec<String> {
+    let mut candidates = vec![bin.to_string()];
+    if Path::new(bin).extension().is_none() {
+        candidates.push(format!("{bin}.exe"));
+    }
+    candidates
+}
+
+#[cfg(windows)]
+fn windows_exe_name(bin: &str) -> String {
+    if Path::new(bin).extension().is_some() {
+        bin.to_string()
+    } else {
+        format!("{bin}.exe")
     }
 }
 
@@ -117,7 +243,6 @@ pub fn is_running(config: &Config) -> Option<i32> {
         }
     };
 
-    // Check if process is alive
     if is_process_alive(pid) {
         debug!("xray process {} is running", pid);
         Some(pid)
@@ -172,7 +297,13 @@ pub fn start(config: &Config) -> Result<i32> {
         let _ = fs::create_dir_all(log_dir);
     }
 
-    debug!("spawning xray with config {}", config.xray_config.display());
+    let xray_bin = resolve_binary(&config.xray_bin).unwrap_or_else(|| PathBuf::from(&config.xray_bin));
+
+    debug!(
+        "spawning xray via {} with config {}",
+        xray_bin.display(),
+        config.xray_config.display()
+    );
     let log_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -182,13 +313,13 @@ pub fn start(config: &Config) -> Result<i32> {
         .try_clone()
         .context("Failed to clone log file handle")?;
 
-    let child = Command::new(&config.xray_bin)
+    let child = Command::new(&xray_bin)
         .args(["run", "-c"])
         .arg(&config.xray_config)
         .stdout(log_file)
         .stderr(log_stderr)
         .spawn()
-        .context("Failed to spawn xray process")?;
+        .with_context(|| format!("Failed to spawn xray process via {}", xray_bin.display()))?;
 
     let pid: i32 = child.id().try_into().context("PID exceeds i32 range")?;
     debug!("xray spawned with PID {}", pid);
@@ -218,7 +349,6 @@ pub fn stop(config: &Config) -> Result<()> {
 
     stop_process(pid);
 
-    // Wait up to 2 seconds for process to exit
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(100));
         if !is_process_alive(pid) {
@@ -228,7 +358,6 @@ pub fn stop(config: &Config) -> Result<()> {
         }
     }
 
-    // Force kill
     force_kill_process(pid);
     thread::sleep(Duration::from_millis(100));
     let _ = fs::remove_file(&config.xray_pid_file);
@@ -243,11 +372,7 @@ fn stop_process(pid: i32) {
 
 #[cfg(windows)]
 fn stop_process(pid: i32) {
-    // GenerateConsoleCtrlEvent takes a process *group* ID, not a PID.
-    // Since xray is spawned without CREATE_NEW_PROCESS_GROUP, the call
-    // would either fail silently or hit the wrong group.  Go straight
-    // to TerminateProcess, which is what happened in practice anyway
-    // (the 2-second timeout always expired).
+    // Xray is spawned without CREATE_NEW_PROCESS_GROUP, so terminate directly.
     force_kill_process(pid);
 }
 
@@ -307,16 +432,15 @@ mod tests {
     use super::*;
 
     fn is_binary_in_path(bin: &str) -> bool {
-        Command::new("which")
-            .arg(bin)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        resolve_from_path(bin).is_some()
     }
 
     #[test]
     fn test_known_binary_found() {
+        #[cfg(unix)]
         assert!(is_binary_in_path("ls"));
+        #[cfg(windows)]
+        assert!(is_binary_in_path("cmd"));
     }
 
     #[test]
@@ -326,7 +450,10 @@ mod tests {
 
     #[test]
     fn test_ensure_installed_known_binary() {
+        #[cfg(unix)]
         let result = ensure_installed("ls");
+        #[cfg(windows)]
+        let result = ensure_installed("cmd");
         assert!(result.is_ok());
     }
 }
