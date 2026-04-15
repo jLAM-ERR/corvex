@@ -2,12 +2,14 @@ use anyhow::{Context, Result};
 use log::debug;
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(any(test, target_os = "macos"))]
 use std::net::IpAddr;
 use std::path::Path;
 
 /// Parse `scutil --dns` output into domain → nameserver mappings.
 /// Extracts resolvers that have a `domain` entry (split-DNS / corp DNS),
 /// mapping each domain to its first nameserver.
+#[cfg(any(test, target_os = "macos"))]
 pub fn parse_scutil_dns(output: &str) -> BTreeMap<String, String> {
     let mut result = BTreeMap::new();
     let mut current_domain: Option<String> = None;

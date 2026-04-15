@@ -204,6 +204,8 @@ mod tests {
         let dir = state_dir_inner(None);
         #[cfg(unix)]
         assert!(dir.ends_with(".local/state"));
+        #[cfg(windows)]
+        assert_eq!(dir, PathBuf::from(r"C:\Users\Public\AppData\Local"));
     }
 
     #[test]
@@ -211,5 +213,7 @@ mod tests {
         let dir = state_dir_inner(Some(String::new()));
         #[cfg(unix)]
         assert!(dir.ends_with(".local/state"));
+        #[cfg(windows)]
+        assert_eq!(dir, PathBuf::from(r"C:\Users\Public\AppData\Local"));
     }
 }

@@ -6,7 +6,9 @@ use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -139,7 +141,11 @@ fn resolve_from_common_locations(bin: &str) -> Option<PathBuf> {
     if let Ok(program_files) = std::env::var("ProgramFiles") {
         candidates.push(PathBuf::from(&program_files).join("Xray").join(&file_name));
         candidates.push(PathBuf::from(&program_files).join("xray").join(&file_name));
-        candidates.push(PathBuf::from(&program_files).join("Xray-core").join(&file_name));
+        candidates.push(
+            PathBuf::from(&program_files)
+                .join("Xray-core")
+                .join(&file_name),
+        );
     }
 
     if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
@@ -297,7 +303,8 @@ pub fn start(config: &Config) -> Result<i32> {
         let _ = fs::create_dir_all(log_dir);
     }
 
-    let xray_bin = resolve_binary(&config.xray_bin).unwrap_or_else(|| PathBuf::from(&config.xray_bin));
+    let xray_bin =
+        resolve_binary(&config.xray_bin).unwrap_or_else(|| PathBuf::from(&config.xray_bin));
 
     debug!(
         "spawning xray via {} with config {}",
