@@ -125,6 +125,8 @@ regexp:.*\.corp$           # Regex pattern
 full:exact.host.com        # Exact match only
 ```
 
+Loopback (`127.0.0.0/8`, `::1`) and RFC1918 private networks (`10/8`, `172.16/12`, `192.168/16`) are always routed `direct`, ahead of every other rule. This is unconditional and cannot be disabled — tunneling localhost or private IPs through a public VPN exit never works.
+
 ## Supported protocols
 
 - **VLESS** — `vless://uuid@host:port?params#name`

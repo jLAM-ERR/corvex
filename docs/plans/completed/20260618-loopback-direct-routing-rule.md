@@ -84,7 +84,7 @@ All of these currently assert `rules.len()` and indices into `rules[0]`, `rules[
 **Files:**
 - Modify: `src/traffic.rs`
 
-- [ ] In `build_routing_rules`, prepend a single rule before any other emission. Use:
+- [x] In `build_routing_rules`, prepend a single rule before any other emission. Use:
   ```rust
   rules.push(serde_json::json!({
       "ruleTag": "loopback-and-private-direct",
@@ -93,21 +93,21 @@ All of these currently assert `rules.len()` and indices into `rules[0]`, `rules[
   }));
   ```
   This MUST be the first `push`, so it lands at index 0 regardless of which other branches fire.
-- [ ] Verify with `cargo build` that the function still compiles and `routing.rules` shape matches xray's expected schema (IP rule with `outboundTag` and optional `ruleTag`).
-- [ ] Run existing tests — expect failures on index assertions (`rules[0]`, `rules.len()`). Do NOT proceed until next step.
-- [ ] Update existing tests in `src/traffic.rs` to account for the leading rule:
+- [x] Verify with `cargo build` that the function still compiles and `routing.rules` shape matches xray's expected schema (IP rule with `outboundTag` and optional `ruleTag`).
+- [x] Run existing tests — expect failures on index assertions (`rules[0]`, `rules.len()`). Do NOT proceed until next step.
+- [x] Update existing tests in `src/traffic.rs` to account for the leading rule:
   - `test_build_routing_rules_ctraffic_only`: `rules.len()` becomes `2`, ctraffic rule moves from `rules[0]` to `rules[1]`.
   - `test_build_routing_rules_ptraffic_only`: `rules.len()` becomes `2`, ptraffic at `rules[1]`.
   - `test_build_routing_rules_both`: `rules.len()` becomes `3`, ctraffic at `rules[1]`, ptraffic at `rules[2]`.
   - `test_build_routing_rules_with_ru_flag`: `rules.len()` becomes `2`, ru rule at `rules[1]`.
   - `test_build_routing_rules_both_with_ru`: `rules.len()` becomes `4`, ru at `rules[3]`.
   - In each test, also assert that `rules[0]["ruleTag"] == "loopback-and-private-direct"` and `rules[0]["outboundTag"] == "direct"`. This pins the order and prevents future regressions where someone "cleans up" the rule emission and accidentally moves it.
-- [ ] Update existing tests in `src/protocol.rs` (full-config builders) the same way: every `r.len() == 3` assertion becomes `r.len() == 4`, every index in `r[0..2]` shifts to `r[1..3]`, and a new `assert_eq!(r[0]["ruleTag"], "loopback-and-private-direct")` is added at the top of each test body. Tests to touch: `create_config_with_routing_rules`, `awg_mode_config_applies_routing_rules`.
-- [ ] Update existing tests in `src/main.rs` the same way. Tests to touch: `test_traffic_rules_in_create_config`, `test_uri_flow_creates_config`, `test_routing_rules_from_settings_values`. Same shift-by-one pattern; same loopback-rule assertion added.
-- [ ] Add new dedicated tests:
+- [x] Update existing tests in `src/protocol.rs` (full-config builders) the same way: every `r.len() == 3` assertion becomes `r.len() == 4`, every index in `r[0..2]` shifts to `r[1..3]`, and a new `assert_eq!(r[0]["ruleTag"], "loopback-and-private-direct")` is added at the top of each test body. Tests to touch: `create_config_with_routing_rules`, `awg_mode_config_applies_routing_rules`.
+- [x] Update existing tests in `src/main.rs` the same way. Tests to touch: `test_traffic_rules_in_create_config`, `test_uri_flow_creates_config`, `test_routing_rules_from_settings_values`. Same shift-by-one pattern; same loopback-rule assertion added.
+- [x] Add new dedicated tests:
   - `test_build_routing_rules_always_emits_loopback_rule_first`: call with all-empty inputs and `ru_direct=false`. Assert `rules.len() == 1`, `rules[0]["ruleTag"] == "loopback-and-private-direct"`, `rules[0]["outboundTag"] == "direct"`, and that `rules[0]["ip"]` is an array containing exactly `["127.0.0.0/8", "::1/128", "geoip:private"]` (use `as_array()` + `.iter().map(|v| v.as_str().unwrap()).collect::<Vec<_>>()`).
   - `test_build_routing_rules_loopback_rule_uses_ip_field_not_domain`: assert `rules[0].get("domain").is_none()` (clearer than `Value::Null` indexing — robust to future key additions) and `rules[0]["ip"]` is an array. Pins the schema — `ip` is what xray reads for CIDR matches; `domain` would silently no-op for `127.0.0.0/8`.
-- [ ] Run `cargo fmt && cargo clippy -- -D warnings && cargo test` — all green before next task.
+- [x] Run `cargo fmt && cargo clippy -- -D warnings && cargo test` — all green before next task.
 
 ### Task 2: Verify downstream call sites and pin the final ordering
 
@@ -134,38 +134,39 @@ Expected final ordering of `routing.rules` after a full `corvex start` (on eithe
 
 Indices 1..3 are conditional. Index 0 and the corporate-dns tail are unconditional in their respective branches.
 
-- [ ] Broaden the grep beyond Task 1's narrow patterns: `grep -nE 'routing.*rules|as_array_mut|build_routing_rules' src/` and read every hit. Confirm every site that mutates `routing.rules` matches one of items 1–4 above. If anything else turns up (e.g., a sort, a dedupe, a partition), fix it so the loopback rule stays at index 0.
-- [ ] Confirm `src/engine/awg.rs` does NOT emit or mutate xray routing rules (it should not — AWG uses its own .conf, not xray's routing). Quick check: `grep -n 'routing\|rules' src/engine/awg.rs` — expect zero matches.
-- [ ] Add (or extend) one test that builds a **full** xray config via `protocol::create_config(...)` AND runs `dns::sync_to_config(...)` against it with a non-empty `corporate-dns` map, then asserts:
+- [x] Broaden the grep beyond Task 1's narrow patterns: `grep -nE 'routing.*rules|as_array_mut|build_routing_rules' src/` and read every hit. Confirm every site that mutates `routing.rules` matches one of items 1–4 above. If anything else turns up (e.g., a sort, a dedupe, a partition), fix it so the loopback rule stays at index 0.
+- [x] Confirm `src/engine/awg.rs` does NOT emit or mutate xray routing rules (it should not — AWG uses its own .conf, not xray's routing). Quick check: `grep -n 'routing\|rules' src/engine/awg.rs` — expect zero matches.
+- [x] Add (or extend) one test that builds a **full** xray config via `protocol::create_config(...)` AND runs `dns::sync_to_config(...)` against it with a non-empty `corporate-dns` map, then asserts:
   - `routing.rules[0]["ruleTag"] == "loopback-and-private-direct"`
   - The last rule has `ruleTag == "corporate-dns"` (or equivalent — match what dns.rs actually emits).
   - This pins the end-to-end ordering across the two mutators.
-- [ ] If no unexpected reordering is found (expected), record this finding inline in this task (e.g., "✅ confirmed: only protocol.rs:create_config, main.rs:update_routing_rules, and dns.rs:sync_to_config mutate routing.rules; none reorder").
-- [ ] Run `cargo test` — all green.
+- [x] If no unexpected reordering is found (expected), record this finding inline in this task (e.g., "✅ confirmed: only protocol.rs:create_config, main.rs:update_routing_rules, and dns.rs:sync_to_config mutate routing.rules; none reorder").
+  - ✅ confirmed: only `protocol.rs::create_config` (writes vec as-is), `main.rs::update_routing_rules` (wholesale replaces), and `dns.rs::sync_to_config` (appends/in-place corporate-dns) mutate routing.rules; none reorder. `engine/awg.rs` has zero `routing`/`rules` matches.
+- [x] Run `cargo test` — all green.
 
 ### Task 3: Document the rule in CLAUDE.md
 
 **Files:**
 - Modify: `CLAUDE.md`
 
-- [ ] In the **Architecture** section, under the description of `traffic.rs`, add a one-line note:
+- [x] In the **Architecture** section, under the description of `traffic.rs`, add a one-line note:
   > Always emits a leading rule that routes `127.0.0.0/8`, `::1/128`, and `geoip:private` to the `direct` outbound. This rule is unconditional and cannot be disabled via corvex.json — tunneling loopback or RFC1918 through a public VPN exit never works.
-- [ ] Also add a short bullet under **Design principles**:
+- [x] Also add a short bullet under **Design principles**:
   > Loopback and RFC1918 are short-circuited to `direct` at the top of `routing.rules` (see `traffic.rs::build_routing_rules`).
-- [ ] No code change here; just docs. Run `cargo test` once more as a final sanity check.
+- [x] No code change here; just docs. Run `cargo test` once more as a final sanity check.
 
 ### Task 4: Verify acceptance criteria
 
-- [ ] All requirements from **Overview** implemented: rule emitted, always-on, scope covers `127.0.0.0/8 + ::1/128 + geoip:private`, ordered at `routing.rules[0]`, no corvex.json knob added.
-- [ ] Edge cases checked: empty ctraffic + empty ptraffic + `ru_direct=false` still yields a 1-element vec with the loopback rule.
-- [ ] Run full test suite: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`.
-- [ ] Verify all `[ ]` boxes above are `[x]`.
+- [x] All requirements from **Overview** implemented: rule emitted, always-on, scope covers `127.0.0.0/8 + ::1/128 + geoip:private`, ordered at `routing.rules[0]`, no corvex.json knob added.
+- [x] Edge cases checked: empty ctraffic + empty ptraffic + `ru_direct=false` still yields a 1-element vec with the loopback rule.
+- [x] Run full test suite: `cargo fmt --check && cargo clippy -- -D warnings && cargo test`.
+- [x] Verify all `[ ]` boxes above are `[x]`.
 
 ### Task 5: [Final] Close the plan
 
-- [ ] Update README.md only if the corvex.json schema section there mentions routing semantics (likely not).
-- [ ] Move this plan: `mkdir -p docs/plans/completed && git mv docs/plans/20260618-loopback-direct-routing-rule.md docs/plans/completed/`.
-- [ ] Commit message suggestion: `fix(traffic): unconditional loopback + RFC1918 direct routing rule`.
+- [x] Update README.md only if the corvex.json schema section there mentions routing semantics (likely not).
+- [x] Move this plan: `mkdir -p docs/plans/completed && git mv docs/plans/20260618-loopback-direct-routing-rule.md docs/plans/completed/`.
+- [x] Commit message suggestion: `fix(traffic): unconditional loopback + RFC1918 direct routing rule`.
 
 ## Technical Details
 
