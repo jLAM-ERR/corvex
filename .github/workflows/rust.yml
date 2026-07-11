@@ -74,11 +74,59 @@ jobs:
         run: cargo fmt --check
 
   # ==========================================================================
+  # Release guard: fail fast before spending build minutes.
+  # This repo has immutable releases enabled — a published release can never
+  # receive assets, and its tag name is permanently reserved. Releases must be
+  # created by this workflow (tag push), never manually via `gh release create`.
+  # ==========================================================================
+  release-guard:
+    name: Release Preconditions
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Extract version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+            TAG_NAME="v${VERSION}"
+          else
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG_NAME#v}"
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Fail if release already published
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          is_draft="$(gh release view "${TAG_NAME}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq '.isDraft' 2>/dev/null || echo 'not-found')"
+          if [ "$is_draft" = "false" ]; then
+            echo "::error::Release ${TAG_NAME} already exists and is published. Immutable releases cannot receive assets after publishing, so this workflow cannot attach binaries to it. Do not create releases manually with 'gh release create' — push the tag and let this workflow create the release."
+            exit 1
+          fi
+
+      - name: Fail if RELEASE_NOTES.md does not match version
+        run: |
+          first_line="$(head -1 RELEASE_NOTES.md)"
+          if ! printf '%s' "$first_line" | grep -qF "v${VERSION}"; then
+            echo "::error::RELEASE_NOTES.md header '${first_line}' does not mention v${VERSION}. Update RELEASE_NOTES.md before releasing — it becomes the release body."
+            exit 1
+          fi
+
+  # ==========================================================================
   # Release: macOS universal binary
   # ==========================================================================
   release-macos:
     name: Release macOS
-    needs: test
+    needs: [test, release-guard]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: macos-14
 
@@ -166,7 +214,7 @@ jobs:
   # ==========================================================================
   release-windows:
     name: Release Windows
-    needs: test
+    needs: [test, release-guard]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
 
