@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-vertical-dark.svg">
+    <img src="assets/logo-vertical-light.svg" alt="Corvex" width="240">
+  </picture>
+</p>
+
 # corvex
 
 Manage Xray VPN proxy and system proxy from the command line.
