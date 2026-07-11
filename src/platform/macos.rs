@@ -20,7 +20,39 @@ fn run_networksetup(args: &[&str]) -> Result<String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_admin_required_error(&stderr) {
+            debug!(
+                "admin required for networksetup {}, escalating via osascript",
+                args.join(" ")
+            );
+            return run_networksetup_elevated(args);
+        }
         anyhow::bail!("networksetup {} failed: {}", args.join(" "), stderr);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn run_networksetup_elevated(args: &[&str]) -> Result<String> {
+    let script = build_osascript_command(args);
+    let output = Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .context("Failed to run osascript for privilege escalation")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if is_user_cancel_error(&stderr) {
+            anyhow::bail!("Authorization denied — proxy settings were not changed");
+        }
+        if is_no_gui_error(&stderr) {
+            anyhow::bail!("No GUI session available — run with sudo instead");
+        }
+        anyhow::bail!(
+            "networksetup {} failed (elevated): {}",
+            args.join(" "),
+            stderr
+        );
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -170,6 +202,54 @@ pub fn parse_proxy_info(output: &str) -> ProxyInfo {
     }
 }
 
+fn shell_escape(arg: &str) -> String {
+    let mut escaped = String::with_capacity(arg.len() + 2);
+    escaped.push('\'');
+    for ch in arg.chars() {
+        if ch == '\'' {
+            escaped.push_str("'\\''");
+        } else {
+            escaped.push(ch);
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
+fn applescript_escape(s: &str) -> String {
+    let mut escaped = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn is_admin_required_error(stderr: &str) -> bool {
+    stderr.contains("requires admin privileges")
+}
+
+fn is_user_cancel_error(stderr: &str) -> bool {
+    stderr.contains("User canceled")
+}
+
+fn is_no_gui_error(stderr: &str) -> bool {
+    stderr.contains("connection is invalid")
+}
+
+fn build_osascript_command(args: &[&str]) -> String {
+    let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
+    let shell_cmd = format!("/usr/sbin/networksetup {}", escaped_args.join(" "));
+    let as_escaped = applescript_escape(&shell_cmd);
+    format!(
+        "do shell script \"{}\" with administrator privileges",
+        as_escaped
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +309,113 @@ mod tests {
     fn parse_service_not_found() {
         let output = "Hardware Port: Wi-Fi\nDevice: en0\n";
         assert_eq!(parse_service_for_interface(output, "en7"), None);
+    }
+
+    // shell_escape tests
+    #[test]
+    fn shell_escape_plain() {
+        assert_eq!(shell_escape("hello"), "'hello'");
+    }
+
+    #[test]
+    fn shell_escape_with_spaces() {
+        assert_eq!(shell_escape("Wi-Fi Network"), "'Wi-Fi Network'");
+    }
+
+    #[test]
+    fn shell_escape_with_single_quotes() {
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_escape_with_double_quotes() {
+        assert_eq!(shell_escape("say \"hi\""), "'say \"hi\"'");
+    }
+
+    // applescript_escape tests
+    #[test]
+    fn applescript_escape_plain() {
+        assert_eq!(applescript_escape("hello"), "hello");
+    }
+
+    #[test]
+    fn applescript_escape_double_quotes() {
+        assert_eq!(applescript_escape("say \"hi\""), "say \\\"hi\\\"");
+    }
+
+    #[test]
+    fn applescript_escape_backslashes() {
+        assert_eq!(applescript_escape("path\\to\\file"), "path\\\\to\\\\file");
+    }
+
+    // error detection tests
+    #[test]
+    fn admin_required_positive() {
+        assert!(is_admin_required_error(
+            "** Error: requires admin privileges."
+        ));
+    }
+
+    #[test]
+    fn admin_required_negative() {
+        assert!(!is_admin_required_error("some other error"));
+    }
+
+    #[test]
+    fn user_cancel_positive() {
+        assert!(is_user_cancel_error(
+            "execution error: User canceled. (-128)"
+        ));
+    }
+
+    #[test]
+    fn user_cancel_negative() {
+        assert!(!is_user_cancel_error("some other error"));
+    }
+
+    #[test]
+    fn no_gui_positive() {
+        assert!(is_no_gui_error(
+            "execution error: connection is invalid (-609)"
+        ));
+    }
+
+    #[test]
+    fn no_gui_negative() {
+        assert!(!is_no_gui_error("some other error"));
+    }
+
+    // build_osascript_command tests
+    #[test]
+    fn osascript_single_arg() {
+        let cmd = build_osascript_command(&["-getwebproxy"]);
+        assert_eq!(
+            cmd,
+            "do shell script \"/usr/sbin/networksetup '-getwebproxy'\" with administrator privileges"
+        );
+    }
+
+    #[test]
+    fn osascript_multiple_args() {
+        let cmd =
+            build_osascript_command(&["-setsocksfirewallproxy", "Wi-Fi", "127.0.0.1", "1080"]);
+        assert_eq!(
+            cmd,
+            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxy' 'Wi-Fi' '127.0.0.1' '1080'\" with administrator privileges"
+        );
+    }
+
+    #[test]
+    fn osascript_args_with_special_chars() {
+        let cmd = build_osascript_command(&[
+            "-setsocksfirewallproxy",
+            "Thunderbolt \"Pro\" Bridge",
+            "127.0.0.1",
+            "1080",
+        ]);
+        assert_eq!(
+            cmd,
+            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxy' 'Thunderbolt \\\"Pro\\\" Bridge' '127.0.0.1' '1080'\" with administrator privileges"
+        );
     }
 }

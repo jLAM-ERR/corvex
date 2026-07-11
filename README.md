@@ -163,9 +163,18 @@ AWG mode requires `awg-quick` to be installed (auto-installed via brew on macOS)
 6. **Start**: launches xray (and AWG tunnel if applicable) with the config
 7. **Proxy**: enables system proxy (HTTP, HTTPS, SOCKS) on the configured port
 
+## macOS privilege escalation
+
+Setting system proxy on macOS requires admin privileges. When running without `sudo`, corvex automatically shows a native macOS authorization dialog (Touch ID or password) via `osascript`. The system caches authorization for ~5 minutes, so only one dialog appears per session even though multiple `networksetup` calls are made.
+
+- `corvex start` / `corvex stop` — triggers auth dialog if not running as root
+- `sudo corvex start` — bypasses the dialog entirely
+- SSH (no GUI) — falls back to a clear error message suggesting `sudo`
+- Canceling the dialog — reports "Authorization denied" without partial changes
+
 ## Requirements
 
-- macOS or Windows
+- macOS, Linux, or Windows
 - Rust toolchain (for building)
 - Homebrew (macOS, for auto-installing xray/amneziawg-tools)
 - `proxy.port` must be set in corvex.json
