@@ -447,4 +447,45 @@ resolver #2
         assert_eq!(map.len(), 1);
         assert_eq!(map["corp.example.com"], "10.0.0.1");
     }
+
+    // Pins the end-to-end ordering across both mutators of routing.rules:
+    // traffic::build_routing_rules (loopback rule at index 0) feeds
+    // protocol::create_config, then dns::sync_to_config appends corporate-dns
+    // at the tail without reordering. Loopback stays first, corporate-dns last.
+    #[test]
+    fn full_config_keeps_loopback_first_and_corp_dns_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let xray_config_path = dir.path().join("config.json");
+
+        let uri =
+            "vless://uuid@host.com:443?encryption=none&type=grpc&security=tls&sni=host.com#proxy";
+        let params = crate::protocol::parse_uri(uri).unwrap();
+        let rules = crate::traffic::build_routing_rules(
+            &["corp.com".to_string()],
+            &["ext.com".to_string()],
+            "proxy",
+            true,
+        );
+        let config = crate::protocol::create_config(
+            &params,
+            30000,
+            &rules,
+            &crate::protocol::XrayLogConfig::default(),
+        );
+        fs::write(
+            &xray_config_path,
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let mut mappings = BTreeMap::new();
+        mappings.insert("corp.example.com".to_string(), "10.0.0.1".to_string());
+        sync_to_config(xray_config_path.as_path(), &mappings).unwrap();
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&xray_config_path).unwrap()).unwrap();
+        let rules = updated["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["ruleTag"], "loopback-and-private-direct");
+        assert_eq!(rules.last().unwrap()["ruleTag"], "corporate-dns");
+    }
 }

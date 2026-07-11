@@ -60,7 +60,7 @@ src/
 ├── settings.rs          — CorvexSettings (+ proxy.port), JSONC parser
 ├── protocol.rs          — multi-protocol URI parser + xray config creator/updater
 ├── dns.rs               — corporate DNS parsing (scutil) + xray config sync
-├── traffic.rs           — routing rule builder from domain lists
+├── traffic.rs           — routing rule builder from domain lists. Always emits a leading rule that routes `127.0.0.0/8`, `::1/128`, and `geoip:private` to the `direct` outbound. This rule is unconditional and cannot be disabled via corvex.json — tunneling loopback or RFC1918 through a public VPN exit never works.
 ├── subscription.rs      — subscription download, base64 decode, protocol filter
 ├── health.rs            — server health checks (TCP pre-filter + tunnel latency)
 ├── xray.rs              — xray process lifecycle (cfg-gated: nix signals on unix, WinAPI on windows)
@@ -81,6 +81,7 @@ src/
 - Static proxy port from `proxy.port` in corvex.json (required)
 - EngineMode enum with match dispatch (Xray vs AWG)
 - Platform abstraction via cfg-gated concrete types (no dynamic dispatch)
+- Loopback and RFC1918 are short-circuited to `direct` at the top of `routing.rules` (see `traffic.rs::build_routing_rules`)
 
 ## Key paths
 

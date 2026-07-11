@@ -649,12 +649,13 @@ mod tests {
         );
 
         let r = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(r.len(), 3);
-        assert_eq!(r[0]["outboundTag"], "direct");
-        assert_eq!(r[0]["domain"][0], "domain:corp.com");
-        assert_eq!(r[1]["outboundTag"], "proxy");
-        assert_eq!(r[1]["domain"][0], "domain:ext.com");
-        assert_eq!(r[2]["ruleTag"], "ru-tld-direct");
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[0]["ruleTag"], "loopback-and-private-direct");
+        assert_eq!(r[1]["outboundTag"], "direct");
+        assert_eq!(r[1]["domain"][0], "domain:corp.com");
+        assert_eq!(r[2]["outboundTag"], "proxy");
+        assert_eq!(r[2]["domain"][0], "domain:ext.com");
+        assert_eq!(r[3]["ruleTag"], "ru-tld-direct");
     }
 
     #[test]
@@ -728,7 +729,8 @@ mod tests {
         assert_eq!(config["outbounds"][0]["protocol"], "vless");
         assert_eq!(config["log"]["loglevel"], "warning");
         let r = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(r.len(), 3);
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[0]["ruleTag"], "loopback-and-private-direct");
     }
 
     #[test]
@@ -736,10 +738,11 @@ mod tests {
         let corporate = vec!["corp.internal".to_string(), "dev.corp".to_string()];
         let proxy = vec!["example.com".to_string()];
         let rules = crate::traffic::build_routing_rules(&corporate, &proxy, "proxy", true);
-        assert_eq!(rules.len(), 3);
-        assert_eq!(rules[0]["outboundTag"], "direct");
-        assert_eq!(rules[1]["outboundTag"], "proxy");
-        assert_eq!(rules[2]["ruleTag"], "ru-tld-direct");
+        assert_eq!(rules.len(), 4);
+        assert_eq!(rules[0]["ruleTag"], "loopback-and-private-direct");
+        assert_eq!(rules[1]["outboundTag"], "direct");
+        assert_eq!(rules[2]["outboundTag"], "proxy");
+        assert_eq!(rules[3]["ruleTag"], "ru-tld-direct");
     }
 
     #[test]

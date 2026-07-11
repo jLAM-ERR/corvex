@@ -1336,12 +1336,13 @@ mod tests {
         let config = create_config(&params, 30000, &rules, &XrayLogConfig::default());
 
         let r = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(r.len(), 3);
-        assert_eq!(r[0]["outboundTag"], "direct");
-        assert_eq!(r[0]["domain"][0], "domain:corp.com");
-        assert_eq!(r[1]["outboundTag"], "proxy");
-        assert_eq!(r[1]["domain"][0], "domain:ext.com");
-        assert_eq!(r[2]["ruleTag"], "ru-tld-direct");
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[0]["ruleTag"], "loopback-and-private-direct");
+        assert_eq!(r[1]["outboundTag"], "direct");
+        assert_eq!(r[1]["domain"][0], "domain:corp.com");
+        assert_eq!(r[2]["outboundTag"], "proxy");
+        assert_eq!(r[2]["domain"][0], "domain:ext.com");
+        assert_eq!(r[3]["ruleTag"], "ru-tld-direct");
     }
 
     #[test]
@@ -1377,7 +1378,8 @@ mod tests {
         );
         let config = create_config_awg_mode(21080, &rules, &XrayLogConfig::default());
         let r = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(r.len(), 3);
+        assert_eq!(r.len(), 4);
+        assert_eq!(r[0]["ruleTag"], "loopback-and-private-direct");
     }
 
     #[test]
