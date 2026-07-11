@@ -65,9 +65,9 @@ impl Config {
             xray_bin: "xray".to_string(),
             xray_config,
             xray_log: default_xray_log(),
-            xray_pid_file: xray_dir.join("xray.pid"),
-            corvex_settings: config_base.join("corvex/corvex.json"),
-            corvex_log: state.join("corvex/corvex.log"),
+            xray_pid_file: default_xray_pid_file(&xray_dir, &state),
+            corvex_settings: config_base.join("corvex").join("corvex.json"),
+            corvex_log: state.join("corvex").join("corvex.log"),
         }
     }
 }
@@ -143,7 +143,18 @@ fn default_xray_log() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        state_dir().join("xray/xray.log")
+        state_dir().join("xray").join("xray.log")
+    }
+}
+
+fn default_xray_pid_file(_xray_dir: &Path, _state: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        _xray_dir.join("xray.pid")
+    }
+    #[cfg(windows)]
+    {
+        _state.join("xray").join("xray.pid")
     }
 }
 
@@ -193,6 +204,8 @@ mod tests {
         let dir = state_dir_inner(None);
         #[cfg(unix)]
         assert!(dir.ends_with(".local/state"));
+        #[cfg(windows)]
+        assert_eq!(dir, PathBuf::from(r"C:\Users\Public\AppData\Local"));
     }
 
     #[test]
@@ -200,5 +213,7 @@ mod tests {
         let dir = state_dir_inner(Some(String::new()));
         #[cfg(unix)]
         assert!(dir.ends_with(".local/state"));
+        #[cfg(windows)]
+        assert_eq!(dir, PathBuf::from(r"C:\Users\Public\AppData\Local"));
     }
 }
