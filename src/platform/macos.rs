@@ -203,7 +203,7 @@ pub fn parse_proxy_info(output: &str) -> ProxyInfo {
 }
 
 fn shell_escape(arg: &str) -> String {
-    let mut escaped = String::with_capacity(arg.len() + 2);
+    let mut escaped = String::new();
     escaped.push('\'');
     for ch in arg.chars() {
         if ch == '\'' {
@@ -217,7 +217,7 @@ fn shell_escape(arg: &str) -> String {
 }
 
 fn applescript_escape(s: &str) -> String {
-    let mut escaped = String::with_capacity(s.len());
+    let mut escaped = String::new();
     for ch in s.chars() {
         match ch {
             '\\' => escaped.push_str("\\\\"),
