@@ -103,18 +103,19 @@ Docs must highlight everywhere: **xray is the default engine; AmneziaWG is an op
 **Files:**
 - Modify: `src/engine/awg.rs`
 
-- [ ] rewrite `ensure_awg_installed()`: keep PATH check (`which`/`where`); on miss, `bail!` with message constant (amneziawg-tools, manual, package manager, NO direct link); delete brew/winget invocations
-- [ ] change `use log::{debug, info};` (`src/engine/awg.rs:2`) to `use log::debug;` — `info!` only lives in the deleted blocks and the unused import fails `clippy -D warnings`
-- [ ] update the doc comment (`/// Ensure awg-quick is installed; auto-install silently if not found.`)
-- [ ] verify `ensure_awg_installed` is called only from the AWG engine branch (per design: AWG checked ONLY when engine is awg)
-- [ ] write test: missing-binary error message mentions manual install of `amneziawg-tools` and contains no URL
-- [ ] run tests — must pass before task 4
+- [x] rewrite `ensure_awg_installed()`: keep PATH check (`which`/`where`); on miss, `bail!` with message constant (amneziawg-tools, manual, package manager, NO direct link); delete brew/winget invocations
+- [x] change `use log::{debug, info};` (`src/engine/awg.rs:2`) to `use log::debug;` — `info!` only lives in the deleted blocks and the unused import fails `clippy -D warnings`
+- [x] update the doc comment (`/// Ensure awg-quick is installed; auto-install silently if not found.`)
+- [x] verify `ensure_awg_installed` is called only from the AWG engine branch (per design: AWG checked ONLY when engine is awg)
+- [x] write test: missing-binary error message mentions manual install of `amneziawg-tools` and contains no URL
+- [x] run tests — must pass before task 4
 
 ### Task 4: Add `restart` command and close the AWG pre-stop gap
 
 **Files:**
 - Modify: `src/main.rs`
 
+- [ ] ➕ (discovered in Task 2 review, pre-existing) call `xray::ensure_installed` early in `cmd_start` — before the subscription health checks (`main.rs:181` spawns the xray binary via `health::find_alive_server` before the current `ensure_installed` call sites) — so a missing xray yields `XRAY_NOT_INSTALLED_MSG` instead of a raw spawn error
 - [ ] add `Restart` variant to `Commands` enum with help text "Restart xray and re-apply system proxy (full stop + start)"
 - [ ] dispatch `Commands::Restart => cmd_start(&config, &plat)` in `run()`
 - [ ] extract the AWG-tunnel stop block from `cmd_stop` (`main.rs:449-460`) into `fn stop_awg_if_running(config: &Config)` and call it from `cmd_stop`
