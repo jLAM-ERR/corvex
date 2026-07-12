@@ -80,7 +80,7 @@ corvex status   # Show engine type, process state, ports, proxy settings
 |---------|-------------|
 | `start` | Load `corvex.json`, resolve server, start xray (+ AWG tunnel if vpn://), enable system proxy |
 | `stop` | Disable system proxy, stop xray, stop AWG tunnel if running |
-| `restart` | Full stop + start: re-reads config, re-resolves server, restarts xray, re-applies system proxy |
+| `restart` | Same flow as `start`: stops the running xray (and stale AWG tunnel), re-reads config, re-resolves server, re-applies system proxy |
 | `reload` | Validate config and send SIGHUP to xray |
 | `status` | Show engine type (xray / AWG+xray), process state, ports, proxy settings |
 | `logs` | Show last 20 log lines |
@@ -185,7 +185,7 @@ AmneziaWG is an optional alternative engine. corvex never installs it — instal
 2. **Resolve server**: uses the `uri` directly, or downloads subscriptions, decodes base64, filters supported protocols, and health-checks candidates
 3. **Engine dispatch**: detects engine mode from URI scheme (`vpn://` → AWG, others → Xray)
 4. **Generate xray config**: creates xray `config.json` with proxy settings, routing rules, DNS, and corporate-dns routing rule (port 53)
-5. **Verify**: checks the xray binary is present (installed by install.sh)
+5. **Verify**: checks the xray binary is present (installed by install.sh); in AWG mode also checks `awg-quick`
 6. **Start**: launches xray (and AWG tunnel if applicable) with the config
 7. **Proxy**: enables system proxy (HTTP, HTTPS, SOCKS) on the configured port
 
@@ -202,5 +202,5 @@ Setting system proxy on macOS requires admin privileges. When running without `s
 
 - macOS, Linux, or Windows
 - Rust toolchain (for building from source)
-- `curl` and `unzip` (for `install.sh`)
+- `curl` and `tar` (for `install.sh`); `unzip` only when it needs to install xray
 - `proxy.port` must be set in corvex.json
