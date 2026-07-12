@@ -46,7 +46,7 @@ All configuration is in a single JSONC file at `$XDG_CONFIG_HOME/corvex/corvex.j
     "direct-ru": true,                           // Route .ru TLD directly
     "proxy-traffic": ["domain:ext.com"],         // Force through proxy
     "corporate-traffic": ["domain:corp.com"],    // Bypass proxy (direct)
-    "merge-subs": false                          // Merge Happ subscription's direct rules into routing; default off, security-sensitive (see README)
+    "merge-subs": false                          // Merge the subscription's direct rules into routing; default off, security-sensitive (see README)
   },
   "log": {
     "xray": { "loglevel": "warning", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log" },
@@ -67,7 +67,7 @@ src/
 ├── dns.rs               — corporate DNS parsing (scutil) + xray config sync
 ├── traffic.rs           — routing rule builder from domain lists, plus optional subs-provided direct domains/ips (routes.merge-subs). Always emits a leading rule that routes `127.0.0.0/8`, `::1/128`, and `geoip:private` to the `direct` outbound. This rule is unconditional and cannot be disabled via corvex.json — tunneling loopback or RFC1918 through a public VPN exit never works.
 ├── subscription.rs      — subscription download (with configurable User-Agent + extra headers via subs-user-agent/subs-headers, default UA "v2rayNG/1.10.2"), base64 decode, protocol filter
-├── happ.rs              — Happ-format subscription parser (JSON array of xray configs) + direct-rule harvesting for routes.merge-subs
+├── jsonsubs.rs          — JSON-array subscription parser (JSON array of complete xray configs, one per server; the format panels serve to clients such as Happ) + direct-rule harvesting for routes.merge-subs
 ├── health.rs            — server health checks (TCP pre-filter + tunnel latency)
 ├── xray.rs              — xray process lifecycle (cfg-gated: nix signals on unix, WinAPI on windows); presence check only, no auto-install — missing binary is a hard error pointing to install.sh; sets XRAY_LOCATION_ASSET to the install.sh-managed geo data dir only when the env var is unset and that dir exists
 ├── engine/

@@ -2,18 +2,20 @@ use crate::protocol::{params_from_outbound, ProxyParams};
 use log::debug;
 use serde_json::Value;
 
-/// A single server candidate extracted from a Happ-format subscription entry.
-pub struct HappEntry {
+/// This format is a JSON array of complete xray configs, one per server. It is
+/// served by some subscription panels to certain clients instead of base64
+/// (Happ is one example client that expects it).
+pub struct ServerEntry {
     pub params: ProxyParams,
     pub direct_domains: Vec<String>,
     pub direct_ips: Vec<String>,
 }
 
-/// Detect and parse a Happ-format subscription body: a JSON array of complete
+/// Detect and parse a JSON-array subscription body: a JSON array of complete
 /// xray configs, one per server. Returns `None` when the body does not match
 /// this format (base64, a JSON object, or an array whose entries lack
 /// `outbounds`), so callers can fall through to the plain base64 path.
-pub fn parse_happ_subscription(body: &str) -> Option<Vec<HappEntry>> {
+pub fn parse_json_subscription(body: &str) -> Option<Vec<ServerEntry>> {
     let value: Value = serde_json::from_str(body).ok()?;
     let array = value.as_array()?;
 
@@ -39,7 +41,7 @@ pub fn parse_happ_subscription(body: &str) -> Option<Vec<HappEntry>> {
         {
             Some(ob) => ob,
             None => {
-                debug!("happ entry has no outbounds[0], skipping");
+                debug!("json subscription entry has no outbounds[0], skipping");
                 continue;
             }
         };
@@ -47,13 +49,13 @@ pub fn parse_happ_subscription(body: &str) -> Option<Vec<HappEntry>> {
         let params = match params_from_outbound(outbound, name) {
             Ok(p) => p,
             Err(e) => {
-                debug!("happ entry outbound could not be parsed, skipping: {e}");
+                debug!("json subscription entry outbound could not be parsed, skipping: {e}");
                 continue;
             }
         };
 
         let (direct_domains, direct_ips) = harvest_direct_rules(entry);
-        entries.push(HappEntry {
+        entries.push(ServerEntry {
             params,
             direct_domains,
             direct_ips,
@@ -104,9 +106,9 @@ fn harvest_direct_rules(entry: &Value) -> (Vec<String>, Vec<String>) {
 mod tests {
     use super::*;
 
-    // Sanitized fixture mirroring a real Happ panel response shape: an array
+    // Sanitized fixture mirroring a real panel response shape: an array
     // of complete xray configs, one per server. Placeholder uuids/hosts only.
-    const HAPP_FIXTURE: &str = r#"[
+    const JSON_SUBS_FIXTURE: &str = r#"[
       {
         "remarks": "Server One",
         "dns": {},
@@ -171,13 +173,13 @@ mod tests {
 
     #[test]
     fn fixture_parses_to_two_entries() {
-        let entries = parse_happ_subscription(HAPP_FIXTURE).unwrap();
+        let entries = parse_json_subscription(JSON_SUBS_FIXTURE).unwrap();
         assert_eq!(entries.len(), 2);
     }
 
     #[test]
     fn fixture_params_match_first_entry() {
-        let entries = parse_happ_subscription(HAPP_FIXTURE).unwrap();
+        let entries = parse_json_subscription(JSON_SUBS_FIXTURE).unwrap();
         let p = &entries[0].params;
         assert_eq!(p.protocol, "vless");
         assert_eq!(p.host, "example.com");
@@ -188,7 +190,7 @@ mod tests {
 
     #[test]
     fn fixture_params_match_second_entry() {
-        let entries = parse_happ_subscription(HAPP_FIXTURE).unwrap();
+        let entries = parse_json_subscription(JSON_SUBS_FIXTURE).unwrap();
         let p = &entries[1].params;
         assert_eq!(p.protocol, "vless");
         assert_eq!(p.host, "example.org");
@@ -199,7 +201,7 @@ mod tests {
 
     #[test]
     fn direct_domains_exclude_proxy_rule() {
-        let entries = parse_happ_subscription(HAPP_FIXTURE).unwrap();
+        let entries = parse_json_subscription(JSON_SUBS_FIXTURE).unwrap();
         assert_eq!(
             entries[0].direct_domains,
             vec!["geosite:category-ru", "domain:ru", "domain:yandex.com"]
@@ -212,13 +214,13 @@ mod tests {
 
     #[test]
     fn direct_ips_from_direct_rules_only() {
-        let entries = parse_happ_subscription(HAPP_FIXTURE).unwrap();
+        let entries = parse_json_subscription(JSON_SUBS_FIXTURE).unwrap();
         assert_eq!(entries[0].direct_ips, vec!["geoip:private", "geoip:ru"]);
     }
 
     #[test]
     fn second_entry_has_no_direct_rules() {
-        let entries = parse_happ_subscription(HAPP_FIXTURE).unwrap();
+        let entries = parse_json_subscription(JSON_SUBS_FIXTURE).unwrap();
         assert!(entries[1].direct_domains.is_empty());
         assert!(entries[1].direct_ips.is_empty());
     }
@@ -237,26 +239,26 @@ mod tests {
                 { "type": "field", "protocol": ["bittorrent"], "domain": ["bt.example.com"], "outboundTag": "direct" }
             ] }
         }]"#;
-        let entries = parse_happ_subscription(body).unwrap();
+        let entries = parse_json_subscription(body).unwrap();
         assert!(entries[0].direct_domains.is_empty());
     }
 
     #[test]
     fn base64_body_returns_none() {
         let body = "dmxlc3M6Ly9leGFtcGxl";
-        assert!(parse_happ_subscription(body).is_none());
+        assert!(parse_json_subscription(body).is_none());
     }
 
     #[test]
     fn json_object_returns_none() {
         let body = r#"{"outbounds": []}"#;
-        assert!(parse_happ_subscription(body).is_none());
+        assert!(parse_json_subscription(body).is_none());
     }
 
     #[test]
     fn array_without_outbounds_key_returns_none() {
         let body = r#"[{"remarks": "Server", "routing": {"rules": []}}]"#;
-        assert!(parse_happ_subscription(body).is_none());
+        assert!(parse_json_subscription(body).is_none());
     }
 
     #[test]
@@ -270,7 +272,7 @@ mod tests {
                 "streamSettings": { "network": "tcp", "security": "" }
             }] }
         ]"#;
-        let entries = parse_happ_subscription(body).unwrap();
+        let entries = parse_json_subscription(body).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].params.name, "Good");
     }
@@ -281,18 +283,18 @@ mod tests {
             { "remarks": "Good", "outbounds": [{ "protocol": "vless" }] },
             { "remarks": "NoOutbounds" }
         ]"#;
-        assert!(parse_happ_subscription(body).is_none());
+        assert!(parse_json_subscription(body).is_none());
     }
 
     #[test]
     fn outbounds_non_array_returns_none() {
         let body = r#"[{"remarks": "Server", "outbounds": 5}]"#;
-        assert!(parse_happ_subscription(body).is_none());
+        assert!(parse_json_subscription(body).is_none());
     }
 
     #[test]
     fn empty_top_level_array_returns_some_empty() {
-        let entries = parse_happ_subscription("[]").unwrap();
+        let entries = parse_json_subscription("[]").unwrap();
         assert!(entries.is_empty());
     }
 
@@ -310,7 +312,7 @@ mod tests {
                 { "type": "field", "domain": ["domain:ru", 42], "outboundTag": "direct" }
             ] }
         }]"#;
-        let entries = parse_happ_subscription(body).unwrap();
+        let entries = parse_json_subscription(body).unwrap();
         assert_eq!(entries[0].direct_domains, vec!["domain:ru"]);
         assert_eq!(entries[0].params.name, "");
     }
@@ -326,7 +328,7 @@ mod tests {
                 "streamSettings": { "network": "tcp", "security": "" }
             }] }
         ]"#;
-        let entries = parse_happ_subscription(body).unwrap();
+        let entries = parse_json_subscription(body).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].params.name, "Good");
     }

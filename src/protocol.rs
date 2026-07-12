@@ -468,8 +468,8 @@ fn extract_port(v: &serde_json::Value) -> Result<u16> {
     }
 }
 
-/// Extract ProxyParams from an xray outbound JSON object (as found in Happ-format
-/// subscription entries). The read-side inverse of `build_outbound_settings` +
+/// Extract ProxyParams from an xray outbound JSON object (as found in
+/// JSON-array subscription entries). The read-side inverse of `build_outbound_settings` +
 /// `build_stream_settings`; some writer output is lossy and cannot be recovered
 /// exactly (see the grpc `multiMode` and tcp `header.type == "http"` handling below).
 pub fn params_from_outbound(outbound: &serde_json::Value, name: &str) -> Result<ProxyParams> {

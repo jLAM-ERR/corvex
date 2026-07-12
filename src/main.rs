@@ -1,8 +1,8 @@
 mod config;
 mod dns;
 mod engine;
-mod happ;
 mod health;
+mod jsonsubs;
 mod platform;
 mod protocol;
 mod settings;
@@ -120,19 +120,19 @@ fn detect_engine_mode(uri: &str) -> engine::EngineMode {
 }
 
 /// Which source cmd_start should use to resolve a server, given what the
-/// subscription download loop found. Happ candidates are preferred over plain
-/// URIs whenever any were parsed; the caller falls back to the URI flow at
-/// runtime if no Happ candidate is reachable.
+/// subscription download loop found. JSON subscription candidates are
+/// preferred over plain URIs whenever any were parsed; the caller falls back
+/// to the URI flow at runtime if no JSON subscription candidate is reachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceDecision {
-    Happ,
+    JsonSubs,
     Uri,
     NoneFound,
 }
 
-fn choose_source(has_happ: bool, has_xray_uris: bool, has_vpn_uris: bool) -> SourceDecision {
-    if has_happ {
-        SourceDecision::Happ
+fn choose_source(has_json_subs: bool, has_xray_uris: bool, has_vpn_uris: bool) -> SourceDecision {
+    if has_json_subs {
+        SourceDecision::JsonSubs
     } else if has_xray_uris || has_vpn_uris {
         SourceDecision::Uri
     } else {
@@ -141,14 +141,14 @@ fn choose_source(has_happ: bool, has_xray_uris: bool, has_vpn_uris: bool) -> Sou
 }
 
 /// The resolved start source: either a URI (direct or from subscriptions,
-/// dispatched to Xray or AWG by scheme) or a Happ subscription entry (always Xray).
+/// dispatched to Xray or AWG by scheme) or a JSON subscription entry (always Xray).
 enum StartSource {
     Uri(String),
-    Happ(Box<happ::HappEntry>),
+    Entry(Box<jsonsubs::ServerEntry>),
 }
 
 /// Routing/log settings shared by both the direct-URI/subs-URI path and the
-/// Happ subscription path.
+/// JSON subscription path.
 struct RoutingContext<'a> {
     corporate_traffic: &'a [String],
     proxy_traffic: &'a [String],
@@ -177,10 +177,11 @@ fn resolve_uri_flow(
     }
 }
 
-/// Security-critical gate: a Happ entry's direct-rule domains/ips only widen
-/// DIRECT routing when the user opted in via `routes.merge-subs`. Returns
-/// empty slices otherwise, regardless of what the entry carries.
-fn subs_direct_slices(merge_subs: bool, entry: &happ::HappEntry) -> (&[String], &[String]) {
+/// Security-critical gate: a JSON subscription entry's direct-rule
+/// domains/ips only widen DIRECT routing when the user opted in via
+/// `routes.merge-subs`. Returns empty slices otherwise, regardless of what
+/// the entry carries.
+fn subs_direct_slices(merge_subs: bool, entry: &jsonsubs::ServerEntry) -> (&[String], &[String]) {
     if merge_subs {
         (&entry.direct_domains, &entry.direct_ips)
     } else {
@@ -190,9 +191,9 @@ fn subs_direct_slices(merge_subs: bool, entry: &happ::HappEntry) -> (&[String], 
 
 /// Build routing rules, write/update xray config.json, sync corporate DNS, then
 /// start xray and enable the system proxy. Shared tail for both the
-/// direct-URI/subs-URI path and the Happ subscription path — the only
-/// difference between callers is `params` and `subs_direct` (Happ direct-rule
-/// merge, gated by `routes.merge-subs`).
+/// direct-URI/subs-URI path and the JSON subscription path — the only
+/// difference between callers is `params` and `subs_direct` (JSON
+/// subscription direct-rule merge, gated by `routes.merge-subs`).
 fn start_xray_engine(
     config: &Config,
     plat: &impl Platform,
@@ -277,13 +278,13 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     xray::ensure_installed(&config.xray_bin)?;
 
     // 3. Resolve start source: direct URI, or from subscriptions (base64 URIs
-    // or Happ-format entries — Happ candidates are preferred when present)
+    // or JSON-array subscription entries — those are preferred when present)
     let source = if let Some(ref uri) = s.uri {
         debug!("start flow: using URI from corvex.json");
         StartSource::Uri(uri.clone())
     } else {
         // subs-url flow: download, detect format per subscription, decode/filter
-        // base64 or harvest Happ entries, then find an alive candidate
+        // base64 or harvest JSON subscription entries, then find an alive candidate
         let urls = s
             .subs_url
             .as_ref()
@@ -294,20 +295,20 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         );
         let mut xray_uris = Vec::new();
         let mut vpn_uris = Vec::new();
-        let mut happ_entries: Vec<happ::HappEntry> = Vec::new();
+        let mut json_entries: Vec<jsonsubs::ServerEntry> = Vec::new();
         let user_agent = subscription::resolve_user_agent(s.subs_user_agent.as_deref());
         let empty_headers = std::collections::BTreeMap::new();
         let extra_headers = s.subs_headers.as_ref().unwrap_or(&empty_headers);
         for url in urls {
             match subscription::download_subscription(url, user_agent, extra_headers) {
                 Ok(body) => {
-                    if let Some(entries) = happ::parse_happ_subscription(&body) {
+                    if let Some(entries) = jsonsubs::parse_json_subscription(&body) {
                         debug!(
-                            "subscription {}: Happ format, {} entries",
+                            "subscription {}: JSON subscription format, {} entries",
                             url,
                             entries.len()
                         );
-                        happ_entries.extend(entries);
+                        json_entries.extend(entries);
                     } else if let Ok(uris) = subscription::decode_subscription(&body) {
                         let supported = subscription::filter_supported(&uris);
                         debug!("subscription {}: {} supported URIs", url, supported.len());
@@ -324,20 +325,22 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         }
 
         match choose_source(
-            !happ_entries.is_empty(),
+            !json_entries.is_empty(),
             !xray_uris.is_empty(),
             !vpn_uris.is_empty(),
         ) {
             SourceDecision::NoneFound => {
                 anyhow::bail!("no supported proxy servers found in subscriptions")
             }
-            SourceDecision::Happ => {
+            SourceDecision::JsonSubs => {
                 let candidate_params: Vec<protocol::ProxyParams> =
-                    happ_entries.iter().map(|e| e.params.clone()).collect();
+                    json_entries.iter().map(|e| e.params.clone()).collect();
                 match health::find_alive_params(&candidate_params, &config.xray_bin) {
-                    Ok(idx) => StartSource::Happ(Box::new(happ_entries.swap_remove(idx))),
+                    Ok(idx) => StartSource::Entry(Box::new(json_entries.swap_remove(idx))),
                     Err(e) if !xray_uris.is_empty() || !vpn_uris.is_empty() => {
-                        debug!("no reachable Happ servers, falling back to URI flow: {e}");
+                        debug!(
+                            "no reachable JSON subscription servers, falling back to URI flow: {e}"
+                        );
                         StartSource::Uri(resolve_uri_flow(
                             &xray_uris,
                             &mut vpn_uris,
@@ -442,8 +445,8 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
                 )
             }
         },
-        StartSource::Happ(entry) => {
-            debug!("using Happ subscription entry: {}", entry.params.name);
+        StartSource::Entry(entry) => {
+            debug!("using JSON subscription entry: {}", entry.params.name);
             let (subs_domains, subs_ips) = subs_direct_slices(merge_subs, &entry);
             if merge_subs && (!subs_domains.is_empty() || !subs_ips.is_empty()) {
                 info!(
@@ -1156,39 +1159,39 @@ mod tests {
     }
 
     #[test]
-    fn test_choose_source_happ_only_is_happ() {
+    fn test_choose_source_json_subs_only_is_json_subs() {
         assert_eq!(
             super::choose_source(true, false, false),
-            super::SourceDecision::Happ
+            super::SourceDecision::JsonSubs
         );
     }
 
     #[test]
-    fn test_choose_source_happ_and_xray_uris_prefers_happ() {
+    fn test_choose_source_json_subs_and_xray_uris_prefers_json_subs() {
         assert_eq!(
             super::choose_source(true, true, false),
-            super::SourceDecision::Happ
+            super::SourceDecision::JsonSubs
         );
     }
 
     #[test]
-    fn test_choose_source_happ_and_vpn_uris_prefers_happ() {
+    fn test_choose_source_json_subs_and_vpn_uris_prefers_json_subs() {
         assert_eq!(
             super::choose_source(true, false, true),
-            super::SourceDecision::Happ
+            super::SourceDecision::JsonSubs
         );
     }
 
     #[test]
-    fn test_choose_source_happ_and_both_uri_kinds_prefers_happ() {
+    fn test_choose_source_json_subs_and_both_uri_kinds_prefers_json_subs() {
         assert_eq!(
             super::choose_source(true, true, true),
-            super::SourceDecision::Happ
+            super::SourceDecision::JsonSubs
         );
     }
 
-    fn happ_entry_with_direct_rules() -> crate::happ::HappEntry {
-        crate::happ::HappEntry {
+    fn json_entry_with_direct_rules() -> crate::jsonsubs::ServerEntry {
+        crate::jsonsubs::ServerEntry {
             params: crate::protocol::parse_uri("vless://uuid@host.com:443?encryption=none")
                 .unwrap(),
             direct_domains: vec!["corp.example.com".to_string()],
@@ -1198,7 +1201,7 @@ mod tests {
 
     #[test]
     fn test_subs_direct_slices_merge_on_returns_entry_lists() {
-        let entry = happ_entry_with_direct_rules();
+        let entry = json_entry_with_direct_rules();
         let (domains, ips) = super::subs_direct_slices(true, &entry);
         assert_eq!(domains, entry.direct_domains.as_slice());
         assert_eq!(ips, entry.direct_ips.as_slice());
@@ -1206,7 +1209,7 @@ mod tests {
 
     #[test]
     fn test_subs_direct_slices_merge_off_returns_empty_despite_entry_contents() {
-        let entry = happ_entry_with_direct_rules();
+        let entry = json_entry_with_direct_rules();
         assert!(!entry.direct_domains.is_empty());
         assert!(!entry.direct_ips.is_empty());
         let (domains, ips) = super::subs_direct_slices(false, &entry);

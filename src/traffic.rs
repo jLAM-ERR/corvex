@@ -62,8 +62,7 @@ fn dedup_subs_direct_ips(subs_direct_ips: &[String]) -> Vec<serde_json::Value> {
 }
 
 /// Build xray routing rules from corporate-traffic and proxy-traffic domain lists,
-/// merging in any subscription-provided direct domain/ip entries (Task 6 of the
-/// happ-subs-direct-merge plan).
+/// merging in any subscription-provided direct domain/ip entries.
 pub fn build_routing_rules(
     ctraffic: &[String],
     ptraffic: &[String],

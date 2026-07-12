@@ -150,13 +150,13 @@ Provide either `uri` (connect to a specific server) or `subs-url` (auto-discover
 
 Subscription panels commonly content-negotiate on the `User-Agent` header: an unknown or missing UA (plain `curl`, or corvex without this setting) can get a filtered or broken response instead of the real subscription. `subs-user-agent` sets the UA corvex sends when downloading `subs-url`/`file-url`; it defaults to `"v2rayNG/1.10.2"`, which reliably yields a plain base64 response from most panels. `subs-headers` adds extra request headers some panels require (e.g. `X-Hwid`, `X-Device-Os`, `X-Ver-Os`, `X-Device-Model`). A `User-Agent` key inside `subs-headers` (case-insensitive) wins over `subs-user-agent`.
 
-### Happ-format subscriptions
+### JSON-array subscription format
 
-Some panels serve a Happ-compatible response instead of base64: a JSON array of complete xray configs, one per server (there are no URIs to parse in this format). corvex auto-detects it and extracts server candidates directly from the JSON — health-checked the same way as URI-based candidates. No extra configuration is needed beyond `subs-user-agent`/`subs-headers` (the panel decides which format to serve based on those).
+Some panels serve a JSON-array response instead of base64: a JSON array of complete xray configs, one per server (there are no URIs to parse in this format). This is the format panels serve to mobile clients such as Happ. corvex auto-detects it and extracts server candidates directly from the JSON — health-checked the same way as URI-based candidates. No extra configuration is needed beyond `subs-user-agent`/`subs-headers` (the panel decides which format to serve based on those).
 
 ### Merging subscription routing rules (`routes.merge-subs`)
 
-Happ-format subscriptions can carry their own routing rules, including domains/IPs the panel routes `direct` (bypassing the tunnel). When `routes.merge-subs: true`, corvex merges the chosen subscription entry's direct-routing domains and IPs into its own routing. Default is `false`.
+JSON-array subscriptions can carry their own routing rules, including domains/IPs the panel routes `direct` (bypassing the tunnel). When `routes.merge-subs: true`, corvex merges the chosen subscription entry's direct-routing domains and IPs into its own routing. Default is `false`.
 
 **Security warning:** turning this on means whoever controls the subscription can route the domains/IPs it lists OUTSIDE the tunnel — only enable it for a subscription provider you trust with that decision. Local `proxy-traffic` entries always win over subscription domains (so you can force a domain back through the tunnel regardless of what the subscription says), and the loopback/RFC1918 direct rule can never be displaced by a merge.
 
