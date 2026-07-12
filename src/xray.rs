@@ -252,11 +252,12 @@ fn is_process_alive(pid: i32) -> bool {
 const INSTALLED_ASSET_DIR: &str = "/usr/local/share/xray";
 
 /// Decide whether to override XRAY_LOCATION_ASSET for the spawned xray process.
-/// Only applies when the env var is unset AND the installer-managed asset dir
-/// exists, so brew/manual installs that already manage their own geo assets
-/// are left untouched.
-fn asset_dir_override(env_set: bool, dir_exists: bool) -> Option<&'static str> {
-    if !env_set && dir_exists {
+/// Only applies when the env var is unset AND both geoip.dat and geosite.dat
+/// are present in the installer-managed asset dir, so brew/manual installs
+/// that already manage their own geo assets are left untouched, and a
+/// partially-populated dir doesn't get pointed to.
+fn asset_dir_override(env_set: bool, both_dat_files_exist: bool) -> Option<&'static str> {
+    if !env_set && both_dat_files_exist {
         Some(INSTALLED_ASSET_DIR)
     } else {
         None
@@ -300,9 +301,11 @@ pub fn start(config: &Config) -> Result<i32> {
         .stdout(log_file)
         .stderr(log_stderr);
 
+    let both_dat_files_exist = Path::new(INSTALLED_ASSET_DIR).join("geoip.dat").is_file()
+        && Path::new(INSTALLED_ASSET_DIR).join("geosite.dat").is_file();
     if let Some(dir) = asset_dir_override(
         std::env::var_os("XRAY_LOCATION_ASSET").is_some(),
-        Path::new(INSTALLED_ASSET_DIR).is_dir(),
+        both_dat_files_exist,
     ) {
         debug!("setting XRAY_LOCATION_ASSET={}", dir);
         cmd.env("XRAY_LOCATION_ASSET", dir);
@@ -461,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn test_asset_dir_override_env_unset_dir_exists() {
+    fn test_asset_dir_override_env_unset_both_dat_files_exist() {
         assert_eq!(
             asset_dir_override(false, true),
             Some("/usr/local/share/xray")
@@ -469,17 +472,17 @@ mod tests {
     }
 
     #[test]
-    fn test_asset_dir_override_env_unset_dir_missing() {
+    fn test_asset_dir_override_env_unset_dat_files_missing() {
         assert_eq!(asset_dir_override(false, false), None);
     }
 
     #[test]
-    fn test_asset_dir_override_env_set_dir_exists() {
+    fn test_asset_dir_override_env_set_both_dat_files_exist() {
         assert_eq!(asset_dir_override(true, true), None);
     }
 
     #[test]
-    fn test_asset_dir_override_env_set_dir_missing() {
+    fn test_asset_dir_override_env_set_dat_files_missing() {
         assert_eq!(asset_dir_override(true, false), None);
     }
 }

@@ -68,7 +68,7 @@ src/
 ├── subscription.rs      — subscription download (with configurable User-Agent + extra headers via subs-user-agent/subs-headers, default UA "v2rayNG/1.10.2"), base64 decode, protocol filter
 ├── jsonsubs.rs          — JSON-array subscription parser (JSON array of complete xray configs, one per server; the format panels serve to clients such as Happ) + direct-rule harvesting for routes.merge-subs
 ├── health.rs            — server health checks (TCP pre-filter + tunnel latency)
-├── xray.rs              — xray process lifecycle (cfg-gated: nix signals on unix, WinAPI on windows); presence check only, no auto-install — missing binary is a hard error pointing to install.sh; sets XRAY_LOCATION_ASSET to the install.sh-managed geo data dir only when the env var is unset and that dir exists
+├── xray.rs              — xray process lifecycle (cfg-gated: nix signals on unix, WinAPI on windows); presence check only, no auto-install — missing binary is a hard error pointing to install.sh; sets XRAY_LOCATION_ASSET to the install.sh-managed geo data dir only when the env var is unset and both geoip.dat and geosite.dat exist there
 ├── engine/
 │   ├── mod.rs           — EngineMode enum (Xray | Awg)
 │   └── awg.rs           — vpn:// parser, .conf generator, awg-quick lifecycle; presence check only, no auto-install — missing awg-quick is a hard error pointing to manual amneziawg-tools install
