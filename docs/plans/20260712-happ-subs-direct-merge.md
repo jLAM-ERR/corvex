@@ -117,11 +117,11 @@ Plus a prerequisite fix: `install.sh` installs only the xray binary, but `geosit
 - Create: `src/happ.rs`
 - Modify: `src/main.rs` (module declaration)
 
-- [ ] `pub struct HappEntry { pub params: ProxyParams, pub direct_domains: Vec<String>, pub direct_ips: Vec<String> }`
-- [ ] `pub fn parse_happ_subscription(body: &str) -> Option<Vec<HappEntry>>` — Some only for a JSON array of objects with `outbounds`; per entry: `params_from_outbound(outbounds[0], remarks)`; harvest routing.rules with `type=="field" && outboundTag=="direct"`: `domain[]` → direct_domains, `ip[]` → direct_ips, skip rules carrying `protocol`; entries whose outbound fails to parse are skipped with a debug log (not fatal)
-- [ ] sanitized inline fixture mirroring the real panel response (2 entries, 5 rules incl. bittorrent-protocol rule, geoip:private, 46→3 sample direct domains, geoip:ru, geosite:meta→proxy) with placeholder uuid/host
-- [ ] write tests: fixture parses to 2 entries with correct params/name; direct_domains exclude proxy-rule domains; direct_ips == [geoip:private, geoip:ru]; protocol rule ignored; base64 body → None; JSON object (not array) → None; array entry without outbounds → None
-- [ ] run tests — must pass before task 5
+- [x] `pub struct HappEntry { pub params: ProxyParams, pub direct_domains: Vec<String>, pub direct_ips: Vec<String> }`
+- [x] `pub fn parse_happ_subscription(body: &str) -> Option<Vec<HappEntry>>` — Some only for a JSON array of objects with `outbounds`; per entry: `params_from_outbound(outbounds[0], remarks)`; harvest routing.rules with `type=="field" && outboundTag=="direct"`: `domain[]` → direct_domains, `ip[]` → direct_ips, skip rules carrying `protocol`; entries whose outbound fails to parse are skipped with a debug log (not fatal)
+- [x] sanitized inline fixture mirroring the real panel response (2 entries, 5 rules incl. bittorrent-protocol rule, geoip:private, 46→3 sample direct domains, geoip:ru, geosite:meta→proxy) with placeholder uuid/host
+- [x] write tests: fixture parses to 2 entries with correct params/name; direct_domains exclude proxy-rule domains; direct_ips == [geoip:private, geoip:ru]; protocol rule ignored; base64 body → None; JSON object (not array) → None; array entry without outbounds → None
+- [x] run tests — must pass before task 5
 
 ### Task 5: Health selection over ProxyParams
 

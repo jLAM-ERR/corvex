@@ -1,6 +1,7 @@
 mod config;
 mod dns;
 mod engine;
+mod happ;
 mod health;
 mod platform;
 mod protocol;
