@@ -17,12 +17,17 @@ pub fn parse_happ_subscription(body: &str) -> Option<Vec<HappEntry>> {
     let value: Value = serde_json::from_str(body).ok()?;
     let array = value.as_array()?;
 
-    // Structural check: every element must be an object carrying "outbounds".
-    // `Value::get` returns None for non-object values, so this also rejects
-    // arrays of non-objects.
-    if !array.iter().all(|entry| entry.get("outbounds").is_some()) {
+    // Structural check: every element must be an object carrying an
+    // "outbounds" array. `Value::get` returns None for non-object values, so
+    // this also rejects arrays of non-objects and non-array "outbounds".
+    if !array
+        .iter()
+        .all(|entry| entry.get("outbounds").and_then(|o| o.as_array()).is_some())
+    {
         return None;
     }
+    // Empty top-level array matches the format vacuously and yields Some(vec![]);
+    // the caller (Task 7) treats an all-sources-empty result as "no servers found".
 
     let mut entries = Vec::new();
     for entry in array {
@@ -252,6 +257,62 @@ mod tests {
     fn array_without_outbounds_key_returns_none() {
         let body = r#"[{"remarks": "Server", "routing": {"rules": []}}]"#;
         assert!(parse_happ_subscription(body).is_none());
+    }
+
+    #[test]
+    fn empty_outbounds_array_entry_is_skipped() {
+        let body = r#"[
+            { "remarks": "Empty", "outbounds": [] },
+            { "remarks": "Good", "outbounds": [{
+                "protocol": "vless",
+                "settings": { "vnext": [{ "address": "example.com", "port": 443,
+                    "users": [{ "id": "00000000-0000-0000-0000-000000000000", "encryption": "none" }] }] },
+                "streamSettings": { "network": "tcp", "security": "" }
+            }] }
+        ]"#;
+        let entries = parse_happ_subscription(body).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].params.name, "Good");
+    }
+
+    #[test]
+    fn mixed_array_one_entry_missing_outbounds_returns_none() {
+        let body = r#"[
+            { "remarks": "Good", "outbounds": [{ "protocol": "vless" }] },
+            { "remarks": "NoOutbounds" }
+        ]"#;
+        assert!(parse_happ_subscription(body).is_none());
+    }
+
+    #[test]
+    fn outbounds_non_array_returns_none() {
+        let body = r#"[{"remarks": "Server", "outbounds": 5}]"#;
+        assert!(parse_happ_subscription(body).is_none());
+    }
+
+    #[test]
+    fn empty_top_level_array_returns_some_empty() {
+        let entries = parse_happ_subscription("[]").unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn non_string_domain_entries_dropped_non_string_remarks_falls_back() {
+        let body = r#"[{
+            "remarks": 123,
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": { "vnext": [{ "address": "example.com", "port": 443,
+                    "users": [{ "id": "00000000-0000-0000-0000-000000000000", "encryption": "none" }] }] },
+                "streamSettings": { "network": "tcp", "security": "" }
+            }],
+            "routing": { "rules": [
+                { "type": "field", "domain": ["domain:ru", 42], "outboundTag": "direct" }
+            ] }
+        }]"#;
+        let entries = parse_happ_subscription(body).unwrap();
+        assert_eq!(entries[0].direct_domains, vec!["domain:ru"]);
+        assert_eq!(entries[0].params.name, "");
     }
 
     #[test]
