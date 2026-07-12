@@ -25,7 +25,7 @@ Or, from a checkout:
 
 This installs the `corvex` binary and, as a dependency, the `xray` engine binary (only when `xray` isn't already installed). Re-running the script always upgrades `corvex` to the latest release; an existing `xray` install is left untouched.
 
-When it installs `xray`, install.sh also installs xray's `geoip.dat`/`geosite.dat` to `/usr/local/share/xray` (needed for `geosite:`/`geoip:` routing rules, including corvex's own loopback/RFC1918 direct rule). A failure to install these files is a warning, not fatal — set `XRAY_LOCATION_ASSET` yourself (e.g. a brew-managed `xray` already provides its own geo data).
+When it installs `xray`, install.sh also installs xray's `geoip.dat`/`geosite.dat` to `/usr/local/share/xray` (needed for `geosite:`/`geoip:` routing rules, including corvex's own loopback/RFC1918 direct rule). A failure to install these files is a warning, not fatal: point `XRAY_LOCATION_ASSET` at a directory containing the `.dat` files yourself, or use a package-manager xray (a brew-managed `xray` already ships its own geo data).
 
 Supported platforms: macOS (arm64, x86_64) and Linux (x86_64). On Windows, download the release zip from [Releases](https://github.com/jLAM-ERR/corvex/releases) manually.
 
