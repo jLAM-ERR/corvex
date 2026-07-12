@@ -175,10 +175,10 @@ Plus a prerequisite fix: `install.sh` installs only the xray binary, but `geosit
 
 ### Task 9: Verify acceptance criteria
 
-- [ ] full suite: `cargo test`; `cargo clippy -- -D warnings -A dead_code`; `cargo fmt --check`; `shellcheck install.sh`
-- [ ] fixture round-trip: Happ fixture → chosen entry → generated xray config contains merged direct domains when merge-subs on, and does NOT when off
-- [ ] plain base64 subscription path byte-identical behavior (regression: existing tests untouched/passing)
-- [ ] grep: no reference to `~/work/tmp/subs.txt` or real panel hostnames/uuids anywhere in the repo
+- [x] full suite: `cargo test`; `cargo clippy -- -D warnings -A dead_code`; `cargo fmt --check`; `shellcheck install.sh`
+- [x] fixture round-trip: Happ fixture → chosen entry → generated xray config contains merged direct domains when merge-subs on, and does NOT when off
+- [x] plain base64 subscription path byte-identical behavior (regression: existing tests untouched/passing)
+- [x] grep: no reference to `~/work/tmp/subs.txt` or real panel hostnames/uuids anywhere in the repo
 
 ### Task 10: Update documentation
 
