@@ -465,6 +465,8 @@ resolver #2
             &["ext.com".to_string()],
             "proxy",
             true,
+            &[],
+            &[],
         );
         let config = crate::protocol::create_config(
             &params,

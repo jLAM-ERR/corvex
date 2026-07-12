@@ -139,12 +139,12 @@ Plus a prerequisite fix: `install.sh` installs only the xray binary, but `geosit
 **Files:**
 - Modify: `src/traffic.rs`
 
-- [ ] extend `build_routing_rules(ctraffic, ptraffic, proxy_tag, ru_direct, subs_direct_domains: &[String], subs_direct_ips: &[String])`
-- [ ] direct domain rule = normalized(ctraffic) ∪ normalized(subs_direct_domains), deduped, minus any entry whose normalized form appears in normalized(ptraffic) — local proxy wins
-- [ ] subs_direct_ips (deduped, minus `geoip:private` which rule 0 already covers) → one additional `{"type": "field", "ip": [...], "outboundTag": "direct"}` rule placed immediately after rule 0
-- [ ] all existing call sites pass `&[], &[]` (no behavior change) — 2 production: `main.rs:233` (AWG branch, stays empty), `main.rs:273` (Xray branch, Task 7 later feeds real slices); 14 tests: `main.rs:652,746,766`, `dns.rs:463`, `protocol.rs:1330,1350,1373`, `traffic.rs:105,115,126,135,147,157,172` (compiler-enforced via E0061, list for completeness)
-- [ ] write tests: merge dedup; proxy-traffic exclusion; geoip:private filtered from ip rule; empty slices produce identical output to pre-change snapshots; loopback rule still index 0
-- [ ] run tests — must pass before task 7
+- [x] extend `build_routing_rules(ctraffic, ptraffic, proxy_tag, ru_direct, subs_direct_domains: &[String], subs_direct_ips: &[String])`
+- [x] direct domain rule = normalized(ctraffic) ∪ normalized(subs_direct_domains), deduped, minus any entry whose normalized form appears in normalized(ptraffic) — local proxy wins
+- [x] subs_direct_ips (deduped, minus `geoip:private` which rule 0 already covers) → one additional `{"type": "field", "ip": [...], "outboundTag": "direct"}` rule placed immediately after rule 0
+- [x] all existing call sites pass `&[], &[]` (no behavior change) — 2 production: `main.rs:233` (AWG branch, stays empty), `main.rs:273` (Xray branch, Task 7 later feeds real slices); 14 tests: `main.rs:652,746,766`, `dns.rs:463`, `protocol.rs:1330,1350,1373`, `traffic.rs:105,115,126,135,147,157,172` (compiler-enforced via E0061, list for completeness)
+- [x] write tests: merge dedup; proxy-traffic exclusion; geoip:private filtered from ip rule; empty slices produce identical output to pre-change snapshots; loopback rule still index 0
+- [x] run tests — must pass before task 7
 
 ### Task 7: Wire Happ flow into cmd_start
 

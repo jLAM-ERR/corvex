@@ -239,6 +239,8 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
                 &proxy_traffic,
                 "proxy",
                 direct_ru,
+                &[],
+                &[],
             );
             debug!("built {} routing rules", rules.len());
 
@@ -279,6 +281,8 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
                 &proxy_traffic,
                 proxy_tag,
                 direct_ru,
+                &[],
+                &[],
             );
             debug!("built {} routing rules", rules.len());
 
@@ -658,6 +662,8 @@ mod tests {
             &["ext.com".to_string()],
             "proxy",
             true,
+            &[],
+            &[],
         );
         let config = crate::protocol::create_config(
             &params,
@@ -752,6 +758,8 @@ mod tests {
             &["ext.com".to_string()],
             "proxy",
             true,
+            &[],
+            &[],
         );
         let log_config = crate::protocol::XrayLogConfig::default();
         let config = crate::protocol::create_config(&params, 30000, &rules, &log_config);
@@ -767,7 +775,8 @@ mod tests {
     fn test_routing_rules_from_settings_values() {
         let corporate = vec!["corp.internal".to_string(), "dev.corp".to_string()];
         let proxy = vec!["example.com".to_string()];
-        let rules = crate::traffic::build_routing_rules(&corporate, &proxy, "proxy", true);
+        let rules =
+            crate::traffic::build_routing_rules(&corporate, &proxy, "proxy", true, &[], &[]);
         assert_eq!(rules.len(), 4);
         assert_eq!(rules[0]["ruleTag"], "loopback-and-private-direct");
         assert_eq!(rules[1]["outboundTag"], "direct");

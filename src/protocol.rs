@@ -1619,6 +1619,8 @@ mod tests {
             &["ext.com".to_string()],
             "proxy",
             true,
+            &[],
+            &[],
         );
         let config = create_config(&params, 30000, &rules, &XrayLogConfig::default());
 
@@ -1634,7 +1636,7 @@ mod tests {
 
     #[test]
     fn awg_mode_config_has_freedom_outbound() {
-        let rules = crate::traffic::build_routing_rules(&[], &[], "proxy", false);
+        let rules = crate::traffic::build_routing_rules(&[], &[], "proxy", false, &[], &[]);
         let config = create_config_awg_mode(21080, &rules, &XrayLogConfig::default());
 
         // Proxy outbound should be freedom
@@ -1662,6 +1664,8 @@ mod tests {
             &["ext.com".to_string()],
             "proxy",
             true,
+            &[],
+            &[],
         );
         let config = create_config_awg_mode(21080, &rules, &XrayLogConfig::default());
         let r = config["routing"]["rules"].as_array().unwrap();
