@@ -81,10 +81,10 @@ Plus a prerequisite fix: `install.sh` installs only the xray binary, but `geosit
 **Files:**
 - Modify: `src/settings.rs`
 
-- [ ] add `subs_user_agent: Option<String>` (`rename = "subs-user-agent"`) and `subs_headers: Option<BTreeMap<String, String>>` (`rename = "subs-headers"`) to `CorvexSettings`
-- [ ] add `merge_subs: Option<bool>` (`rename = "merge-subs"`) to `RoutesSettings`
-- [ ] write tests: config with all three new keys parses; config without them parses (all None); merge-subs defaults absent
-- [ ] run tests — must pass before task 2
+- [x] add `subs_user_agent: Option<String>` (`rename = "subs-user-agent"`) and `subs_headers: Option<BTreeMap<String, String>>` (`rename = "subs-headers"`) to `CorvexSettings`
+- [x] add `merge_subs: Option<bool>` (`rename = "merge-subs"`) to `RoutesSettings`
+- [x] write tests: config with all three new keys parses; config without them parses (all None); merge-subs defaults absent
+- [x] run tests — must pass before task 2
 
 ### Task 2: Send User-Agent and extra headers on subscription downloads
 

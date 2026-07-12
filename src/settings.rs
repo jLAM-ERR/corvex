@@ -15,6 +15,10 @@ pub struct CorvexSettings {
     pub routes: Option<RoutesSettings>,
     pub log: Option<LogSettings>,
     pub proxy: Option<ProxySettings>,
+    #[serde(rename = "subs-user-agent")]
+    pub subs_user_agent: Option<String>,
+    #[serde(rename = "subs-headers")]
+    pub subs_headers: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +34,8 @@ pub struct RoutesSettings {
     pub proxy_traffic: Option<Vec<String>>,
     #[serde(rename = "corporate-traffic")]
     pub corporate_traffic: Option<Vec<String>>,
+    #[serde(rename = "merge-subs")]
+    pub merge_subs: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -105,7 +111,8 @@ mod tests {
             "routes": {
                 "direct-ru": true,
                 "proxy-traffic": ["example.com", "github.com"],
-                "corporate-traffic": ["corp.internal", "dev.corp"]
+                "corporate-traffic": ["corp.internal", "dev.corp"],
+                "merge-subs": true
             },
             "log": {
                 "xray": {
@@ -117,6 +124,11 @@ mod tests {
                     "path": "/var/log/corvex.log",
                     "debug": true
                 }
+            },
+            "subs-user-agent": "Happ/3.13.0",
+            "subs-headers": {
+                "X-Hwid": "abc",
+                "X-Device-Os": "Android"
             }
         }"#;
         let (_dir, path) = write_temp(json);
@@ -142,6 +154,7 @@ mod tests {
             routes.corporate_traffic.as_ref().unwrap()[0],
             "corp.internal"
         );
+        assert_eq!(routes.merge_subs, Some(true));
 
         let log = s.log.unwrap();
         let xray_log = log.xray.unwrap();
@@ -152,6 +165,14 @@ mod tests {
         let corvex_log = log.corvex.unwrap();
         assert_eq!(corvex_log.path.as_deref(), Some("/var/log/corvex.log"));
         assert_eq!(corvex_log.debug, Some(true));
+
+        assert_eq!(s.subs_user_agent.as_deref(), Some("Happ/3.13.0"));
+        let headers = s.subs_headers.unwrap();
+        assert_eq!(headers.get("X-Hwid").map(|s| s.as_str()), Some("abc"));
+        assert_eq!(
+            headers.get("X-Device-Os").map(|s| s.as_str()),
+            Some("Android")
+        );
     }
 
     #[test]
@@ -204,6 +225,16 @@ mod tests {
         assert!(s.corporate_dns.is_none());
         assert!(s.routes.is_none());
         assert!(s.log.is_none());
+        assert!(s.subs_user_agent.is_none());
+        assert!(s.subs_headers.is_none());
+    }
+
+    #[test]
+    fn load_merge_subs_absent_defaults_to_none() {
+        let json = r#"{"routes": {"direct-ru": true}}"#;
+        let (_dir, path) = write_temp(json);
+        let s = load(&path).unwrap();
+        assert_eq!(s.routes.unwrap().merge_subs, None);
     }
 
     #[test]
