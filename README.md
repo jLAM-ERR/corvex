@@ -9,16 +9,30 @@
 
 Manage Xray VPN proxy and system proxy from the command line.
 
-corvex starts/stops the [Xray](https://github.com/XTLS/Xray-core) daemon, configures it from a single `corvex.json` settings file, supports multiple proxy protocols (VLESS, VMess, Trojan, Shadowsocks), and toggles system proxy settings automatically. It also supports [AmneziaWG](https://amnezia.org/) as an alternative tunnel engine.
+corvex starts/stops the [Xray](https://github.com/XTLS/Xray-core) daemon (the default engine), configures it from a single `corvex.json` settings file, supports multiple proxy protocols (VLESS, VMess, Trojan, Shadowsocks), and toggles system proxy settings automatically. It also supports [AmneziaWG](https://amnezia.org/) as an optional alternative tunnel engine.
 
 ## Installation
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corvex/main/install.sh | sh
+```
+
+Or, from a checkout:
+
+```bash
+./install.sh
+```
+
+This installs the `corvex` binary and, as a dependency, the `xray` engine binary (only when `xray` isn't already installed). Re-running the script always upgrades `corvex` to the latest release; an existing `xray` install is left untouched.
+
+Supported platforms: macOS (arm64, x86_64) and Linux (x86_64). On Windows, download the release zip from [Releases](https://github.com/jLAM-ERR/corvex/releases) manually.
+
+### Installation from source
 
 ```bash
 cargo build --release
 cp target/release/corvex /usr/local/bin/
 ```
-
-Xray is auto-installed via Homebrew (macOS) or winget (Windows) on first `corvex start` if not already present.
 
 ## Quick start
 
@@ -38,7 +52,7 @@ Or use subscription-based auto-discovery:
 ```jsonc
 {
   // Subscription URLs — corvex downloads, decodes, health-checks, and picks the best server
-  "file-url": ["https://example.com/subscription.txt"],
+  "subs-url": ["https://example.com/subscription.txt"],
   "proxy": { "port": 21080 }
 }
 ```
@@ -66,6 +80,7 @@ corvex status   # Show engine type, process state, ports, proxy settings
 |---------|-------------|
 | `start` | Load `corvex.json`, resolve server, start xray (+ AWG tunnel if vpn://), enable system proxy |
 | `stop` | Disable system proxy, stop xray, stop AWG tunnel if running |
+| `restart` | Full stop + start: re-reads config, re-resolves server, restarts xray, re-applies system proxy |
 | `reload` | Validate config and send SIGHUP to xray |
 | `status` | Show engine type (xray / AWG+xray), process state, ports, proxy settings |
 | `logs` | Show last 20 log lines |
@@ -89,7 +104,7 @@ All settings live in a single JSONC file (comments allowed) at `$XDG_CONFIG_HOME
   "uri": "vless://uuid@host:443?encryption=none&type=grpc&security=tls&sni=host.com#Name",
 
   // Option B: subscription URLs for auto-discovery (picks fastest healthy server)
-  "file-url": ["https://example.com/sub1.txt", "https://example.com/sub2.txt"],
+  "subs-url": ["https://example.com/sub1.txt", "https://example.com/sub2.txt"],
 
   // Required: static proxy port
   "proxy": { "port": 21080 },
@@ -119,7 +134,9 @@ All settings live in a single JSONC file (comments allowed) at `$XDG_CONFIG_HOME
 }
 ```
 
-Provide either `uri` (connect to a specific server) or `file-url` (auto-discover from subscriptions). If both are present, `uri` takes precedence.
+Provide either `uri` (connect to a specific server) or `subs-url` (auto-discover from subscriptions). If both are present, `uri` takes precedence.
+
+`file-url` is a deprecated alias for `subs-url` and still works.
 
 ### Routing entries format
 
@@ -150,7 +167,7 @@ When using a `vpn://` URI, corvex runs in AWG mode:
 3. Starts xray as a local routing layer with a `freedom` outbound (traffic exits through the AWG tunnel)
 4. Enables system proxy pointing to xray's SOCKS port
 
-AWG mode requires `awg-quick` to be installed (auto-installed via brew on macOS).
+AmneziaWG is an optional alternative engine. corvex never installs it — install `amneziawg-tools` manually with your package manager.
 
 ## Key paths
 
@@ -168,7 +185,7 @@ AWG mode requires `awg-quick` to be installed (auto-installed via brew on macOS)
 2. **Resolve server**: uses the `uri` directly, or downloads subscriptions, decodes base64, filters supported protocols, and health-checks candidates
 3. **Engine dispatch**: detects engine mode from URI scheme (`vpn://` → AWG, others → Xray)
 4. **Generate xray config**: creates xray `config.json` with proxy settings, routing rules, DNS, and corporate-dns routing rule (port 53)
-5. **Auto-install**: ensures xray (and awg-quick for AWG mode) are available
+5. **Verify**: checks the xray binary is present (installed by install.sh)
 6. **Start**: launches xray (and AWG tunnel if applicable) with the config
 7. **Proxy**: enables system proxy (HTTP, HTTPS, SOCKS) on the configured port
 
@@ -184,6 +201,6 @@ Setting system proxy on macOS requires admin privileges. When running without `s
 ## Requirements
 
 - macOS, Linux, or Windows
-- Rust toolchain (for building)
-- Homebrew (macOS, for auto-installing xray/amneziawg-tools)
+- Rust toolchain (for building from source)
+- `curl` and `unzip` (for `install.sh`)
 - `proxy.port` must be set in corvex.json

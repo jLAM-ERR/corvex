@@ -21,6 +21,7 @@ cargo run -- --help   # Show CLI help
 ```bash
 cargo run -- start                              # Load corvex.json, resolve server, start
 cargo run -- stop                               # Disable system proxy + stop xray (+ AWG if active)
+cargo run -- restart                            # Full stop + start: restarts xray, re-applies system proxy
 cargo run -- reload                             # Validate config, send SIGHUP
 cargo run -- status                             # Show engine type, xray process, ports, proxy settings
 cargo run -- logs                               # Show last 20 log lines
@@ -36,7 +37,7 @@ All configuration is in a single JSONC file at `$XDG_CONFIG_HOME/corvex/corvex.j
 ```jsonc
 {
   "uri": "vless://uuid@host:443?...",           // Proxy URI (vless/vmess/trojan/ss/vpn)
-  "file-url": ["https://sub1.com/link"],        // Subscription URLs for auto-discovery
+  "subs-url": ["https://sub1.com/link"],        // Subscription URLs for auto-discovery (legacy alias: file-url)
   "proxy": { "port": 21080 },                   // REQUIRED: static proxy port
   "corporate-dns": { "corp.com": "10.0.0.1" },  // Domain -> nameserver mappings
   "routes": {
@@ -54,6 +55,7 @@ All configuration is in a single JSONC file at `$XDG_CONFIG_HOME/corvex/corvex.j
 ## Architecture
 
 ```
+install.sh                — installs the corvex binary + xray dependency (macOS/Linux); see README
 src/
 ├── main.rs              — clap CLI, command routing, engine dispatch
 ├── config.rs            — Config paths (platform-aware: XDG on unix, APPDATA on Windows)
@@ -63,10 +65,10 @@ src/
 ├── traffic.rs           — routing rule builder from domain lists. Always emits a leading rule that routes `127.0.0.0/8`, `::1/128`, and `geoip:private` to the `direct` outbound. This rule is unconditional and cannot be disabled via corvex.json — tunneling loopback or RFC1918 through a public VPN exit never works.
 ├── subscription.rs      — subscription download, base64 decode, protocol filter
 ├── health.rs            — server health checks (TCP pre-filter + tunnel latency)
-├── xray.rs              — xray process lifecycle (cfg-gated: nix signals on unix, WinAPI on windows)
+├── xray.rs              — xray process lifecycle (cfg-gated: nix signals on unix, WinAPI on windows); presence check only, no auto-install — missing binary is a hard error pointing to install.sh
 ├── engine/
 │   ├── mod.rs           — EngineMode enum (Xray | Awg)
-│   └── awg.rs           — vpn:// parser, .conf generator, awg-quick lifecycle
+│   └── awg.rs           — vpn:// parser, .conf generator, awg-quick lifecycle; presence check only, no auto-install — missing awg-quick is a hard error pointing to manual amneziawg-tools install
 ├── platform/
 │   ├── mod.rs           — Platform trait, PlatformImpl type alias
 │   ├── linux.rs         — proxy via env file + DE detection (GNOME/KDE), DNS via resolvectl

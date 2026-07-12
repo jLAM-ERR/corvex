@@ -161,11 +161,11 @@ Docs must highlight everywhere: **xray is the default engine; AmneziaWG is an op
 
 ### Task 8: Update documentation
 
-- [ ] README.md: new "Installation" section with `curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corvex/main/install.sh | sh`, noting it installs corvex + the xray engine (dependency), re-runs upgrade corvex and skip existing xray; rename current build section (line 14) to "Installation from source" and delete the auto-install claim (line 21)
-- [ ] README.md: state xray is the DEFAULT engine in the intro (line 12); AmneziaWG section (line 145-153): "AmneziaWG is an optional alternative engine. corvex never installs it — install amneziawg-tools manually with your package manager."; drop Requirements Homebrew-for-auto-install line (line 188); "How it works" step 5 (line 171) → "Verify: checks the xray binary is present (installed by install.sh)"
-- [ ] README.md: add `restart` row to Commands table; switch all `file-url` examples/mentions to `subs-url` (incl. line 122), note `file-url` as deprecated alias
-- [ ] CLAUDE.md: same corrections (usage, corvex.json example, architecture notes) + document `install.sh` in the repo layout
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README.md: new "Installation" section with `curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corvex/main/install.sh | sh`, noting it installs corvex + the xray engine (dependency), re-runs upgrade corvex and skip existing xray; rename current build section (line 14) to "Installation from source" and delete the auto-install claim (line 21)
+- [x] README.md: state xray is the DEFAULT engine in the intro (line 12); AmneziaWG section (line 145-153): "AmneziaWG is an optional alternative engine. corvex never installs it — install amneziawg-tools manually with your package manager."; drop Requirements Homebrew-for-auto-install line (line 188); "How it works" step 5 (line 171) → "Verify: checks the xray binary is present (installed by install.sh)"
+- [x] README.md: add `restart` row to Commands table; switch all `file-url` examples/mentions to `subs-url` (incl. line 122), note `file-url` as deprecated alias
+- [x] CLAUDE.md: same corrections (usage, corvex.json example, architecture notes) + document `install.sh` in the repo layout
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
