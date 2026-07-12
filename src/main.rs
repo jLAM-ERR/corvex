@@ -177,6 +177,17 @@ fn resolve_uri_flow(
     }
 }
 
+/// Security-critical gate: a Happ entry's direct-rule domains/ips only widen
+/// DIRECT routing when the user opted in via `routes.merge-subs`. Returns
+/// empty slices otherwise, regardless of what the entry carries.
+fn subs_direct_slices(merge_subs: bool, entry: &happ::HappEntry) -> (&[String], &[String]) {
+    if merge_subs {
+        (&entry.direct_domains, &entry.direct_ips)
+    } else {
+        (&[], &[])
+    }
+}
+
 /// Build routing rules, write/update xray config.json, sync corporate DNS, then
 /// start xray and enable the system proxy. Shared tail for both the
 /// direct-URI/subs-URI path and the Happ subscription path — the only
@@ -191,7 +202,7 @@ fn start_xray_engine(
     subs_direct: (&[String], &[String]),
     corporate_dns: std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
-    debug!("Xray engine mode");
+    debug!("starting xray engine");
     let proxy_tag = if params.name.is_empty() {
         "proxy"
     } else {
@@ -433,11 +444,7 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         },
         StartSource::Happ(entry) => {
             debug!("using Happ subscription entry: {}", entry.params.name);
-            let (subs_domains, subs_ips): (&[String], &[String]) = if merge_subs {
-                (&entry.direct_domains, &entry.direct_ips)
-            } else {
-                (&[], &[])
-            };
+            let (subs_domains, subs_ips) = subs_direct_slices(merge_subs, &entry);
             if merge_subs && (!subs_domains.is_empty() || !subs_ips.is_empty()) {
                 info!(
                     "merged {} direct domains + {} direct ip entries from subscription",
@@ -1178,5 +1185,32 @@ mod tests {
             super::choose_source(true, true, true),
             super::SourceDecision::Happ
         );
+    }
+
+    fn happ_entry_with_direct_rules() -> crate::happ::HappEntry {
+        crate::happ::HappEntry {
+            params: crate::protocol::parse_uri("vless://uuid@host.com:443?encryption=none")
+                .unwrap(),
+            direct_domains: vec!["corp.example.com".to_string()],
+            direct_ips: vec!["geoip:ru".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_subs_direct_slices_merge_on_returns_entry_lists() {
+        let entry = happ_entry_with_direct_rules();
+        let (domains, ips) = super::subs_direct_slices(true, &entry);
+        assert_eq!(domains, entry.direct_domains.as_slice());
+        assert_eq!(ips, entry.direct_ips.as_slice());
+    }
+
+    #[test]
+    fn test_subs_direct_slices_merge_off_returns_empty_despite_entry_contents() {
+        let entry = happ_entry_with_direct_rules();
+        assert!(!entry.direct_domains.is_empty());
+        assert!(!entry.direct_ips.is_empty());
+        let (domains, ips) = super::subs_direct_slices(false, &entry);
+        assert!(domains.is_empty());
+        assert!(ips.is_empty());
     }
 }
