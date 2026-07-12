@@ -92,11 +92,11 @@ Docs must highlight everywhere: **xray is the default engine; AmneziaWG is an op
 **Files:**
 - Modify: `src/xray.rs`
 
-- [ ] rewrite `ensure_installed()`: keep `resolve_binary()` check; on miss, `bail!` with a message constant `'xray' is not installed — run the corvex installer (install.sh) or see README`; delete all brew/winget `Command` invocations and platform `cfg` blocks
-- [ ] update the doc comment (both lines `src/xray.rs:41-42` → check-only semantics)
-- [ ] write test: missing-binary error message mentions `install.sh` (message constant asserted directly, environment-independent)
-- [ ] keep/verify existing found-binary tests (`src/xray.rs:459+`)
-- [ ] run tests — must pass before task 3
+- [x] rewrite `ensure_installed()`: keep `resolve_binary()` check; on miss, `bail!` with a message constant `'xray' is not installed — run the corvex installer (install.sh) or see README`; delete all brew/winget `Command` invocations and platform `cfg` blocks
+- [x] update the doc comment (both lines `src/xray.rs:41-42` → check-only semantics)
+- [x] write test: missing-binary error message mentions `install.sh` (message constant asserted directly, environment-independent)
+- [x] keep/verify existing found-binary tests (`src/xray.rs:459+`)
+- [x] run tests — must pass before task 3
 
 ### Task 3: Simplify AWG presence check (manual install only)
 

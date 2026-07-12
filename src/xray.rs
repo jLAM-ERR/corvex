@@ -38,8 +38,11 @@ pub fn resolve_binary(xray_bin: &str) -> Option<PathBuf> {
     resolve_from_path(xray_bin).or_else(|| resolve_from_common_locations(xray_bin))
 }
 
-/// Check if xray binary is installed; if not, install silently.
-/// On macOS: uses brew. On Windows: checks PATH and common install locations.
+/// Message shown when the xray binary cannot be found on the system.
+pub const XRAY_NOT_INSTALLED_MSG: &str =
+    "'xray' is not installed — run the corvex installer (install.sh) or see README";
+
+/// Check if the xray binary is installed; no side effects.
 pub fn ensure_installed(xray_bin: &str) -> Result<()> {
     debug!("checking if '{}' is installed", xray_bin);
 
@@ -48,50 +51,7 @@ pub fn ensure_installed(xray_bin: &str) -> Result<()> {
         return Ok(());
     }
 
-    #[cfg(unix)]
-    {
-        #[cfg(target_os = "macos")]
-        {
-            debug!("'{}' not found, installing via brew", xray_bin);
-            let brew_output = Command::new("brew")
-                .args(["install", "--quiet", "xray"])
-                .output()
-                .context("Failed to run 'brew install xray' - is Homebrew installed?")?;
-
-            if !brew_output.status.success() {
-                let stderr = String::from_utf8_lossy(&brew_output.stderr);
-                anyhow::bail!("brew install xray failed: {}", stderr.trim());
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            anyhow::bail!(
-                "'{}' not found in PATH. Install xray-core:\n\
-                 - Snap:   sudo snap install xray\n\
-                 - Manual: https://github.com/XTLS/Xray-core/releases",
-                xray_bin
-            );
-        }
-
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    {
-        debug!("'{}' not found, installing via winget", xray_bin);
-        let winget_output = Command::new("winget")
-            .args(["install", "--silent", "xray"])
-            .output()
-            .context("Failed to run 'winget install xray'")?;
-
-        if !winget_output.status.success() {
-            let stderr = String::from_utf8_lossy(&winget_output.stderr);
-            anyhow::bail!("winget install xray failed: {}", stderr.trim());
-        }
-
-        Ok(())
-    }
+    anyhow::bail!(XRAY_NOT_INSTALLED_MSG)
 }
 
 #[cfg(unix)]
@@ -462,5 +422,17 @@ mod tests {
         #[cfg(windows)]
         let result = ensure_installed("cmd");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ensure_installed_missing_binary_message() {
+        let result = ensure_installed("nonexistent_binary_xyz_999");
+        let err = result.expect_err("missing binary must error");
+        assert_eq!(err.to_string(), XRAY_NOT_INSTALLED_MSG);
+    }
+
+    #[test]
+    fn test_xray_not_installed_msg_mentions_install_sh() {
+        assert!(XRAY_NOT_INSTALLED_MSG.contains("install.sh"));
     }
 }
