@@ -38,12 +38,14 @@ All configuration is in a single JSONC file at `$XDG_CONFIG_HOME/corvex/corvex.j
 {
   "uri": "vless://uuid@host:443?...",           // Proxy URI (vless/vmess/trojan/ss/vpn)
   "subs-url": ["https://sub1.com/link"],        // Subscription URLs for auto-discovery (legacy alias: file-url)
+  "subs-user-agent": "Happ/3.13.0",             // UA for subs-url downloads; default "v2rayNG/1.10.2"
+  "subs-headers": { "X-Hwid": "abc" },          // Extra headers for subs-url downloads; a "User-Agent" key here wins over subs-user-agent
   "proxy": { "port": 21080 },                   // REQUIRED: static proxy port
   "corporate-dns": { "corp.com": "10.0.0.1" },  // Domain -> nameserver mappings
   "routes": {
-    "direct-ru": true,                           // Route .ru TLD directly
     "proxy-traffic": ["domain:ext.com"],         // Force through proxy
-    "corporate-traffic": ["domain:corp.com"]     // Bypass proxy (direct)
+    "corporate-traffic": ["domain:corp.com"],    // Bypass proxy (direct)
+    "merge-subs": false                          // Merge the subscription's direct rules into routing; transitional (default off, security-sensitive; see README) — expected to become the default and be removed in a future release
   },
   "log": {
     "xray": { "loglevel": "warning", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log" },
@@ -62,10 +64,11 @@ src/
 ├── settings.rs          — CorvexSettings (+ proxy.port), JSONC parser
 ├── protocol.rs          — multi-protocol URI parser + xray config creator/updater
 ├── dns.rs               — corporate DNS parsing (scutil) + xray config sync
-├── traffic.rs           — routing rule builder from domain lists. Always emits a leading rule that routes `127.0.0.0/8`, `::1/128`, and `geoip:private` to the `direct` outbound. This rule is unconditional and cannot be disabled via corvex.json — tunneling loopback or RFC1918 through a public VPN exit never works.
-├── subscription.rs      — subscription download, base64 decode, protocol filter
+├── traffic.rs           — routing rule builder from domain lists, plus optional subs-provided direct domains/ips (routes.merge-subs). Always emits a leading rule that routes `127.0.0.0/8`, `::1/128`, and `geoip:private` to the `direct` outbound. This rule is unconditional and cannot be disabled via corvex.json — tunneling loopback or RFC1918 through a public VPN exit never works.
+├── subscription.rs      — subscription download (with configurable User-Agent + extra headers via subs-user-agent/subs-headers, default UA "v2rayNG/1.10.2"), base64 decode, protocol filter
+├── jsonsubs.rs          — JSON-array subscription parser (JSON array of complete xray configs, one per server; the format panels serve to clients such as Happ) + direct-rule harvesting for routes.merge-subs
 ├── health.rs            — server health checks (TCP pre-filter + tunnel latency)
-├── xray.rs              — xray process lifecycle (cfg-gated: nix signals on unix, WinAPI on windows); presence check only, no auto-install — missing binary is a hard error pointing to install.sh
+├── xray.rs              — xray process lifecycle (cfg-gated: nix signals on unix, WinAPI on windows); presence check only, no auto-install — missing binary is a hard error pointing to install.sh; sets XRAY_LOCATION_ASSET to the install.sh-managed geo data dir only when the env var is unset and both geoip.dat and geosite.dat exist there
 ├── engine/
 │   ├── mod.rs           — EngineMode enum (Xray | Awg)
 │   └── awg.rs           — vpn:// parser, .conf generator, awg-quick lifecycle; presence check only, no auto-install — missing awg-quick is a hard error pointing to manual amneziawg-tools install

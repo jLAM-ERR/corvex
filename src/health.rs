@@ -155,61 +155,86 @@ pub fn check_tunnel(params: &ProxyParams, xray_bin: &str) -> Result<Duration> {
 const TCP_TIMEOUT: Duration = Duration::from_secs(5);
 const DEGRADED_THRESHOLD: Duration = Duration::from_millis(3000);
 
-/// Find the first alive server from a list of VLESS URIs.
-/// Performs TCP pre-filter then tunnel check; returns the first URI with acceptable latency.
-pub fn find_alive_server(uris: &[String], xray_bin: &str) -> Result<String> {
-    debug!("searching for alive server among {} candidates", uris.len());
-    for (i, uri) in uris.iter().enumerate() {
-        let params = match crate::protocol::parse_uri(uri) {
-            Ok(p) => p,
-            Err(_) => {
-                debug!("[{}/{}] skipping unparseable URI", i + 1, uris.len());
-                continue;
-            }
-        };
-
+/// Find the first alive candidate from a list of parsed proxy params.
+/// Performs TCP pre-filter then tunnel check; returns the index of the first candidate with acceptable latency.
+pub fn find_alive_params(candidates: &[ProxyParams], xray_bin: &str) -> Result<usize> {
+    debug!(
+        "searching for alive server among {} candidates",
+        candidates.len()
+    );
+    for (i, params) in candidates.iter().enumerate() {
         eprintln!(
             "  testing server {}/{}: {}:{}",
             i + 1,
-            uris.len(),
+            candidates.len(),
             params.host,
             params.port
         );
 
         // Fast pre-filter: TCP connect
         if check_tcp(&params.host, params.port, TCP_TIMEOUT).is_err() {
-            debug!("[{}/{}] TCP check failed, skipping", i + 1, uris.len());
+            debug!(
+                "[{}/{}] TCP check failed, skipping",
+                i + 1,
+                candidates.len()
+            );
             continue;
         }
 
         // Full check: tunnel latency
-        match check_tunnel(&params, xray_bin) {
+        match check_tunnel(params, xray_bin) {
             Ok(latency) if latency <= DEGRADED_THRESHOLD => {
                 debug!(
                     "[{}/{}] server alive (latency: {:?})",
                     i + 1,
-                    uris.len(),
+                    candidates.len(),
                     latency
                 );
-                return Ok(uri.clone());
+                return Ok(i);
             }
             Ok(latency) => {
                 debug!(
                     "[{}/{}] server too slow (latency: {:?})",
                     i + 1,
-                    uris.len(),
+                    candidates.len(),
                     latency
                 );
                 continue;
             }
             Err(e) => {
-                debug!("[{}/{}] tunnel check failed: {}", i + 1, uris.len(), e);
+                debug!(
+                    "[{}/{}] tunnel check failed: {}",
+                    i + 1,
+                    candidates.len(),
+                    e
+                );
                 continue;
             }
         }
     }
 
     anyhow::bail!("no reachable servers found")
+}
+
+/// Find the first alive server from a list of VLESS URIs.
+/// Parses each URI to `ProxyParams`, skipping unparseable ones, then delegates
+/// selection to `find_alive_params`.
+pub fn find_alive_server(uris: &[String], xray_bin: &str) -> Result<String> {
+    let parsed: Vec<(&String, ProxyParams)> = uris
+        .iter()
+        .enumerate()
+        .filter_map(|(i, uri)| match crate::protocol::parse_uri(uri) {
+            Ok(params) => Some((uri, params)),
+            Err(_) => {
+                debug!("[{}/{}] skipping unparseable URI", i + 1, uris.len());
+                None
+            }
+        })
+        .collect();
+
+    let candidates: Vec<ProxyParams> = parsed.iter().map(|(_, p)| p.clone()).collect();
+    let idx = find_alive_params(&candidates, xray_bin)?;
+    Ok(parsed[idx].0.clone())
 }
 
 #[cfg(test)]
@@ -350,6 +375,16 @@ mod tests {
     fn test_find_alive_server_empty_list() {
         let result = find_alive_server(&[], "xray");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_alive_params_empty_list() {
+        let result = find_alive_params(&[], "xray");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("no reachable"),
+            "expected 'no reachable servers' error"
+        );
     }
 
     #[test]
