@@ -157,6 +157,8 @@ Some panels serve a JSON-array response instead of base64: a JSON array of compl
 
 JSON-array subscriptions can carry their own routing rules, including domains/IPs the panel routes `direct` (bypassing the tunnel). When `routes.merge-subs: true`, corvex merges the chosen subscription entry's direct-routing domains and IPs into its own routing. Default is `false`.
 
+**This setting is transitional.** Merging is expected to become the default behavior in a future release, at which point `routes.merge-subs` will be removed. For now it stays opt-in (default off) — see the security warning below.
+
 **Security warning:** turning this on means whoever controls the subscription can route the domains/IPs it lists OUTSIDE the tunnel — only enable it for a subscription provider you trust with that decision. Local `proxy-traffic` entries always win over subscription domains (so you can force a domain back through the tunnel regardless of what the subscription says), and the loopback/RFC1918 direct rule can never be displaced by a merge.
 
 Merged rules are baked into `config.json` at `start`/`restart` time, when corvex re-downloads and re-resolves the subscription. `reload` only re-validates the existing `config.json` and sends SIGHUP — it does not re-download subscriptions, so a change in the subscription's rules takes effect on the next `start`/`restart`, not on `reload`.

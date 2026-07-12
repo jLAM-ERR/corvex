@@ -45,7 +45,7 @@ All configuration is in a single JSONC file at `$XDG_CONFIG_HOME/corvex/corvex.j
   "routes": {
     "proxy-traffic": ["domain:ext.com"],         // Force through proxy
     "corporate-traffic": ["domain:corp.com"],    // Bypass proxy (direct)
-    "merge-subs": false                          // Merge the subscription's direct rules into routing; default off, security-sensitive (see README)
+    "merge-subs": false                          // Merge the subscription's direct rules into routing; transitional (default off, security-sensitive; see README) — expected to become the default and be removed in a future release
   },
   "log": {
     "xray": { "loglevel": "warning", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log" },
