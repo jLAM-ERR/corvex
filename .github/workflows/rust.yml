@@ -1,7 +1,7 @@
 # =============================================================================
 # GitHub Actions: CI + Release for macOS, Linux & Windows
 # =============================================================================
-# CI:      runs tests, clippy, fmt on macOS and Windows for every push/PR
+# CI:      runs tests, clippy, fmt on macOS, Linux, and Windows for every push/PR
 # Release: builds platform binaries and publishes GitHub Release on tag push
 # =============================================================================
 
@@ -29,7 +29,7 @@ env:
   BINARY_NAME: corvex
 
 # =============================================================================
-# CI: test + lint on both platforms
+# CI: test + lint on all platforms
 # =============================================================================
 jobs:
   test:
@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, windows-latest]
+        os: [macos-14, ubuntu-latest, windows-latest]
 
     steps:
       - name: Checkout
