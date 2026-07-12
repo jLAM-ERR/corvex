@@ -103,13 +103,13 @@ Plus a prerequisite fix: `install.sh` installs only the xray binary, but `geosit
 **Files:**
 - Modify: `src/protocol.rs`
 
-- [ ] add `pub fn params_from_outbound(outbound: &serde_json::Value, name: &str) -> Result<ProxyParams>` — read-side inverse of `build_outbound_settings` + `build_stream_settings`: vless (vnext: address/port/users[0] id/encryption/flow), vmess (vnext + alterId/security), trojan (servers: address/port/password), shadowsocks (servers: address/port/method/password); streamSettings → network, security, sni, fingerprint, alpn, path, host_header, service_name
-- [ ] ⚠️ lossy-writer mappings (from review): grpc `multiMode: true` → `mode = "multi"` (writer emits `multiMode = (mode == "multi")`, so `"gun"`/empty are NOT recoverable — accept `multiMode:false` → `mode = ""`); tcp+http: `header.type == "http"` → `header_type = "http"`, and writer-injected defaults (`path = "/"`, `Host = server address`) read back as-is, not as the original empty strings
-- [ ] FAIL CLOSED on unrepresentable configs: `security == "reality"` (ProxyParams has no REALITY fields) and unknown `network` values (kcp, xhttp/splithttp, httpupgrade) → descriptive error, so Task 4's per-entry skip drops them instead of building a broken config
-- [ ] unsupported protocol or missing address/port → descriptive error
-- [ ] write round-trip tests: `parse_uri(uri)` → `build_outbound_settings`/`build_stream_settings` → `params_from_outbound` reproduces the original params for vless/vmess/trojan/ss with REPRESENTABLE fixtures (ws/grpc-multi/plain-tcp); for grpc non-multi and tcp-http assert functional equality (regenerated outbound JSON identical), not field equality
-- [ ] write error tests: freedom outbound rejected; missing vnext rejected; reality security rejected; unknown network rejected
-- [ ] run tests — must pass before task 4
+- [x] add `pub fn params_from_outbound(outbound: &serde_json::Value, name: &str) -> Result<ProxyParams>` — read-side inverse of `build_outbound_settings` + `build_stream_settings`: vless (vnext: address/port/users[0] id/encryption/flow), vmess (vnext + alterId/security), trojan (servers: address/port/password), shadowsocks (servers: address/port/method/password); streamSettings → network, security, sni, fingerprint, alpn, path, host_header, service_name
+- [x] ⚠️ lossy-writer mappings (from review): grpc `multiMode: true` → `mode = "multi"` (writer emits `multiMode = (mode == "multi")`, so `"gun"`/empty are NOT recoverable — accept `multiMode:false` → `mode = ""`); tcp+http: `header.type == "http"` → `header_type = "http"`, and writer-injected defaults (`path = "/"`, `Host = server address`) read back as-is, not as the original empty strings
+- [x] FAIL CLOSED on unrepresentable configs: `security == "reality"` (ProxyParams has no REALITY fields) and unknown `network` values (kcp, xhttp/splithttp, httpupgrade) → descriptive error, so Task 4's per-entry skip drops them instead of building a broken config
+- [x] unsupported protocol or missing address/port → descriptive error
+- [x] write round-trip tests: `parse_uri(uri)` → `build_outbound_settings`/`build_stream_settings` → `params_from_outbound` reproduces the original params for vless/vmess/trojan/ss with REPRESENTABLE fixtures (ws/grpc-multi/plain-tcp); for grpc non-multi and tcp-http assert functional equality (regenerated outbound JSON identical), not field equality
+- [x] write error tests: freedom outbound rejected; missing vnext rejected; reality security rejected; unknown network rejected
+- [x] run tests — must pass before task 4
 
 ### Task 4: Happ subscription format parsing
 
