@@ -183,17 +183,13 @@ fn try_gsettings_read_proxy() -> Option<ProxyStatus> {
 // --- KDE (kwriteconfig) ---
 
 fn kde_write_tool() -> Option<&'static str> {
-    for tool in &["kwriteconfig6", "kwriteconfig5"] {
-        if Command::new("which")
+    ["kwriteconfig6", "kwriteconfig5"].into_iter().find(|tool| {
+        Command::new("which")
             .arg(tool)
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
-        {
-            return Some(tool);
-        }
-    }
-    None
+    })
 }
 
 fn try_kde_set_proxy(host: &str, port: u16) {
@@ -431,7 +427,7 @@ pub fn parse_resolvectl_status(output: &str) -> BTreeMap<String, String> {
         // "DNS Servers: 10.0.0.1" or "DNS Servers: 10.0.0.1 10.0.0.2"
         if let Some(rest) = trimmed.strip_prefix("DNS Servers:") {
             in_domain_section = false;
-            if let Some(server) = rest.trim().split_whitespace().next() {
+            if let Some(server) = rest.split_whitespace().next() {
                 if server.parse::<std::net::IpAddr>().is_ok() {
                     current_dns = Some(server.to_string());
                 }
@@ -443,7 +439,7 @@ pub fn parse_resolvectl_status(output: &str) -> BTreeMap<String, String> {
         if let Some(rest) = trimmed.strip_prefix("Current DNS Server:") {
             in_domain_section = false;
             if current_dns.is_none() {
-                if let Some(server) = rest.trim().split_whitespace().next() {
+                if let Some(server) = rest.split_whitespace().next() {
                     if server.parse::<std::net::IpAddr>().is_ok() {
                         current_dns = Some(server.to_string());
                     }
