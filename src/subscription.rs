@@ -18,6 +18,24 @@ pub fn resolve_user_agent(configured: Option<&str>) -> &str {
     }
 }
 
+/// The value of the `User-Agent` key in extra_headers, if any (case-insensitive).
+fn user_agent_override(extra_headers: &BTreeMap<String, String>) -> Option<&str> {
+    extra_headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, value)| value.as_str())
+}
+
+/// The User-Agent that will actually be sent: an extra_headers override wins over
+/// the resolved value, so a caller-supplied `User-Agent`/`user-agent` header is
+/// never duplicated alongside the resolved one.
+pub fn effective_user_agent<'a>(
+    resolved: &'a str,
+    extra_headers: &'a BTreeMap<String, String>,
+) -> &'a str {
+    user_agent_override(extra_headers).unwrap_or(resolved)
+}
+
 /// Download a subscription from the given URL, returning the raw body.
 pub fn download_subscription(
     url: &str,
@@ -29,8 +47,13 @@ pub fn download_subscription(
         .timeout_global(Some(std::time::Duration::from_secs(30)))
         .build();
     let agent = ureq::Agent::new_with_config(config);
-    let mut request = agent.get(url).header("User-Agent", user_agent);
+    let ua = effective_user_agent(user_agent, extra_headers);
+    let mut request = agent.get(url).header("User-Agent", ua);
     for (name, value) in extra_headers {
+        // already set above (either the resolved UA or this override) — skip to avoid a duplicate header
+        if name.eq_ignore_ascii_case("user-agent") {
+            continue;
+        }
         request = request.header(name, value);
     }
     let mut body = String::new();
@@ -153,5 +176,44 @@ mod tests {
     fn test_resolve_user_agent_empty_string_falls_back_to_default() {
         assert_eq!(resolve_user_agent(Some("")), DEFAULT_SUBS_USER_AGENT);
         assert_eq!(resolve_user_agent(Some("   ")), DEFAULT_SUBS_USER_AGENT);
+    }
+
+    #[test]
+    fn test_effective_user_agent_no_override_uses_resolved() {
+        let headers = BTreeMap::new();
+        assert_eq!(
+            effective_user_agent("v2rayNG/1.10.2", &headers),
+            "v2rayNG/1.10.2"
+        );
+    }
+
+    #[test]
+    fn test_effective_user_agent_header_override_wins() {
+        let mut headers = BTreeMap::new();
+        headers.insert("User-Agent".to_string(), "Happ/3.13.0".to_string());
+        assert_eq!(
+            effective_user_agent("v2rayNG/1.10.2", &headers),
+            "Happ/3.13.0"
+        );
+    }
+
+    #[test]
+    fn test_effective_user_agent_header_override_case_insensitive() {
+        let mut headers = BTreeMap::new();
+        headers.insert("user-agent".to_string(), "Happ/3.13.0".to_string());
+        assert_eq!(
+            effective_user_agent("v2rayNG/1.10.2", &headers),
+            "Happ/3.13.0"
+        );
+    }
+
+    #[test]
+    fn test_effective_user_agent_unrelated_headers_ignored() {
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Hwid".to_string(), "abc".to_string());
+        assert_eq!(
+            effective_user_agent("v2rayNG/1.10.2", &headers),
+            "v2rayNG/1.10.2"
+        );
     }
 }
