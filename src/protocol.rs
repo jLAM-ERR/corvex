@@ -1845,6 +1845,73 @@ mod tests {
     }
 
     #[test]
+    fn params_from_outbound_round_trip_h2() {
+        let uri = "vless://uuid@host.net:443?type=h2&path=%2Fh2&host=h2.example.com&security=tls&sni=host.net&fp=chrome&alpn=h2#H2Name";
+        let original = parse_uri(uri).unwrap();
+        let read = params_from_outbound(&outbound_json(&original), "RoundTripName").unwrap();
+
+        assert_eq!(read.protocol, original.protocol);
+        assert_eq!(read.host, original.host);
+        assert_eq!(read.port, original.port);
+        assert_eq!(read.network, original.network);
+        assert_eq!(read.path, original.path);
+        assert_eq!(read.host_header, original.host_header);
+        assert_eq!(read.security, original.security);
+        assert_eq!(read.sni, original.sni);
+        assert_eq!(read.fingerprint, original.fingerprint);
+        assert_eq!(read.alpn, original.alpn);
+    }
+
+    #[test]
+    fn params_from_outbound_port_as_string() {
+        let outbound = serde_json::json!({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "h", "port": "443", "users": [{"id": "u"}]}]},
+            "streamSettings": {"network": "tcp", "security": ""}
+        });
+        let params = params_from_outbound(&outbound, "x").unwrap();
+        assert_eq!(params.port, 443);
+    }
+
+    #[test]
+    fn params_from_outbound_rejects_out_of_range_port_number() {
+        let outbound = serde_json::json!({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "h", "port": 70000, "users": [{"id": "u"}]}]},
+            "streamSettings": {"network": "tcp", "security": ""}
+        });
+        // Out-of-range ports must be rejected, not silently truncated to fit u16.
+        let err = params_from_outbound(&outbound, "x").unwrap_err();
+        assert!(err.to_string().contains("port"));
+    }
+
+    #[test]
+    fn params_from_outbound_rejects_out_of_range_port_string() {
+        let outbound = serde_json::json!({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "h", "port": "70000", "users": [{"id": "u"}]}]},
+            "streamSettings": {"network": "tcp", "security": ""}
+        });
+        let err = params_from_outbound(&outbound, "x").unwrap_err();
+        assert!(err.to_string().contains("port"));
+    }
+
+    #[test]
+    fn params_from_outbound_defaults_when_stream_settings_missing() {
+        // No streamSettings at all (e.g. a hand-written or malformed subscription
+        // entry): default to network="tcp", security="" — the fail-closed choice,
+        // since a no-TLS config simply fails to connect rather than silently
+        // leaking traffic outside a TLS tunnel.
+        let outbound = serde_json::json!({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "h", "port": 443, "users": [{"id": "u"}]}]}
+        });
+        let params = params_from_outbound(&outbound, "x").unwrap();
+        assert_eq!(params.network, "tcp");
+        assert_eq!(params.security, "");
+    }
+
+    #[test]
     fn params_from_outbound_grpc_non_multi_functional_equality() {
         // mode="gun" is a real, common non-multi grpc setting from subscription URIs.
         let uri = "vless://uuid@host.net:443?type=grpc&mode=gun&security=tls&sni=host.net&serviceName=svc#Name";
