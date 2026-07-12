@@ -119,6 +119,124 @@ fn detect_engine_mode(uri: &str) -> engine::EngineMode {
     }
 }
 
+/// Which source cmd_start should use to resolve a server, given what the
+/// subscription download loop found. Happ candidates are preferred over plain
+/// URIs whenever any were parsed; the caller falls back to the URI flow at
+/// runtime if no Happ candidate is reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceDecision {
+    Happ,
+    Uri,
+    NoneFound,
+}
+
+fn choose_source(has_happ: bool, has_xray_uris: bool, has_vpn_uris: bool) -> SourceDecision {
+    if has_happ {
+        SourceDecision::Happ
+    } else if has_xray_uris || has_vpn_uris {
+        SourceDecision::Uri
+    } else {
+        SourceDecision::NoneFound
+    }
+}
+
+/// The resolved start source: either a URI (direct or from subscriptions,
+/// dispatched to Xray or AWG by scheme) or a Happ subscription entry (always Xray).
+enum StartSource {
+    Uri(String),
+    Happ(Box<happ::HappEntry>),
+}
+
+/// Routing/log settings shared by both the direct-URI/subs-URI path and the
+/// Happ subscription path.
+struct RoutingContext<'a> {
+    corporate_traffic: &'a [String],
+    proxy_traffic: &'a [String],
+    direct_ru: bool,
+    log_config: &'a protocol::XrayLogConfig,
+}
+
+/// Pick a server URI from downloaded subscription URIs: try xray-compatible
+/// URIs first (with health checks), fall back to the first vpn:// URI.
+fn resolve_uri_flow(
+    xray_uris: &[String],
+    vpn_uris: &mut Vec<String>,
+    xray_bin: &str,
+) -> anyhow::Result<String> {
+    if !xray_uris.is_empty() {
+        match health::find_alive_server(xray_uris, xray_bin) {
+            Ok(uri) => Ok(uri),
+            Err(_) if !vpn_uris.is_empty() => {
+                debug!("no reachable xray servers, falling back to vpn:// URI");
+                Ok(vpn_uris.swap_remove(0))
+            }
+            Err(e) => Err(e),
+        }
+    } else {
+        Ok(vpn_uris.swap_remove(0))
+    }
+}
+
+/// Build routing rules, write/update xray config.json, sync corporate DNS, then
+/// start xray and enable the system proxy. Shared tail for both the
+/// direct-URI/subs-URI path and the Happ subscription path — the only
+/// difference between callers is `params` and `subs_direct` (Happ direct-rule
+/// merge, gated by `routes.merge-subs`).
+fn start_xray_engine(
+    config: &Config,
+    plat: &impl Platform,
+    params: &protocol::ProxyParams,
+    static_port: u16,
+    routing: &RoutingContext,
+    subs_direct: (&[String], &[String]),
+    corporate_dns: std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    debug!("Xray engine mode");
+    let proxy_tag = if params.name.is_empty() {
+        "proxy"
+    } else {
+        &params.name
+    };
+    let (subs_direct_domains, subs_direct_ips) = subs_direct;
+    let rules = traffic::build_routing_rules(
+        routing.corporate_traffic,
+        routing.proxy_traffic,
+        proxy_tag,
+        routing.direct_ru,
+        subs_direct_domains,
+        subs_direct_ips,
+    );
+    debug!("built {} routing rules", rules.len());
+
+    // Create or update xray config
+    if config.xray_config.exists() {
+        debug!("updating existing config {}", config.xray_config.display());
+        protocol::apply_to_config(params, &config.xray_config, routing.log_config)?;
+        update_routing_rules(&config.xray_config, &rules)?;
+    } else {
+        debug!("creating new config {}", config.xray_config.display());
+        let xray_cfg = protocol::create_config(params, static_port, &rules, routing.log_config);
+        if let Some(parent) = config.xray_config.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&xray_cfg)?;
+        config::write_restricted(&config.xray_config, &json)?;
+    }
+
+    // DNS sync
+    let mut dns_mappings = corporate_dns;
+    if let Ok(discovered) = plat.discover_corporate_dns() {
+        for (domain, ns) in discovered {
+            dns_mappings.entry(domain).or_insert(ns);
+        }
+    }
+    if !dns_mappings.is_empty() {
+        dns::sync_to_config(&config.xray_config, &dns_mappings)?;
+    }
+
+    main_algorithm(config, plat, static_port)
+}
+
 fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     // 1. Load corvex.json
     let s = settings::load(&config.corvex_settings)
@@ -147,12 +265,14 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     // Fail fast on a missing xray binary, before the subscription flow spawns it
     xray::ensure_installed(&config.xray_bin)?;
 
-    // 3. Resolve URI (direct or from subscriptions)
-    let resolved_uri = if let Some(ref uri) = s.uri {
+    // 3. Resolve start source: direct URI, or from subscriptions (base64 URIs
+    // or Happ-format entries — Happ candidates are preferred when present)
+    let source = if let Some(ref uri) = s.uri {
         debug!("start flow: using URI from corvex.json");
-        uri.clone()
+        StartSource::Uri(uri.clone())
     } else {
-        // subs-url flow: download, decode, filter, find alive
+        // subs-url flow: download, detect format per subscription, decode/filter
+        // base64 or harvest Happ entries, then find an alive candidate
         let urls = s
             .subs_url
             .as_ref()
@@ -163,13 +283,21 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         );
         let mut xray_uris = Vec::new();
         let mut vpn_uris = Vec::new();
+        let mut happ_entries: Vec<happ::HappEntry> = Vec::new();
         let user_agent = subscription::resolve_user_agent(s.subs_user_agent.as_deref());
         let empty_headers = std::collections::BTreeMap::new();
         let extra_headers = s.subs_headers.as_ref().unwrap_or(&empty_headers);
         for url in urls {
             match subscription::download_subscription(url, user_agent, extra_headers) {
                 Ok(body) => {
-                    if let Ok(uris) = subscription::decode_subscription(&body) {
+                    if let Some(entries) = happ::parse_happ_subscription(&body) {
+                        debug!(
+                            "subscription {}: Happ format, {} entries",
+                            url,
+                            entries.len()
+                        );
+                        happ_entries.extend(entries);
+                    } else if let Ok(uris) = subscription::decode_subscription(&body) {
                         let supported = subscription::filter_supported(&uris);
                         debug!("subscription {}: {} supported URIs", url, supported.len());
                         xray_uris.extend(supported);
@@ -183,21 +311,36 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
                 }
             }
         }
-        if xray_uris.is_empty() && vpn_uris.is_empty() {
-            anyhow::bail!("no supported proxy servers found in subscriptions");
-        }
-        // Try xray-compatible URIs first (with health checks), fall back to vpn://
-        if !xray_uris.is_empty() {
-            match health::find_alive_server(&xray_uris, &config.xray_bin) {
-                Ok(uri) => uri,
-                Err(_) if !vpn_uris.is_empty() => {
-                    debug!("no reachable xray servers, falling back to vpn:// URI");
-                    vpn_uris.swap_remove(0)
-                }
-                Err(e) => return Err(e),
+
+        match choose_source(
+            !happ_entries.is_empty(),
+            !xray_uris.is_empty(),
+            !vpn_uris.is_empty(),
+        ) {
+            SourceDecision::NoneFound => {
+                anyhow::bail!("no supported proxy servers found in subscriptions")
             }
-        } else {
-            vpn_uris.swap_remove(0)
+            SourceDecision::Happ => {
+                let candidate_params: Vec<protocol::ProxyParams> =
+                    happ_entries.iter().map(|e| e.params.clone()).collect();
+                match health::find_alive_params(&candidate_params, &config.xray_bin) {
+                    Ok(idx) => StartSource::Happ(Box::new(happ_entries.swap_remove(idx))),
+                    Err(e) if !xray_uris.is_empty() || !vpn_uris.is_empty() => {
+                        debug!("no reachable Happ servers, falling back to URI flow: {e}");
+                        StartSource::Uri(resolve_uri_flow(
+                            &xray_uris,
+                            &mut vpn_uris,
+                            &config.xray_bin,
+                        )?)
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            SourceDecision::Uri => StartSource::Uri(resolve_uri_flow(
+                &xray_uris,
+                &mut vpn_uris,
+                &config.xray_bin,
+            )?),
         }
     };
 
@@ -214,105 +357,104 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         .and_then(|r| r.corporate_traffic.clone())
         .unwrap_or_default();
     let log_config = build_xray_log_config(&s);
+    let merge_subs = s.routes.as_ref().and_then(|r| r.merge_subs) == Some(true);
+    let routing = RoutingContext {
+        corporate_traffic: &corporate_traffic,
+        proxy_traffic: &proxy_traffic,
+        direct_ru,
+        log_config: &log_config,
+    };
 
     // Stop a stale AWG tunnel from a previous engine mode before starting fresh
     stop_awg_if_running(config);
 
-    // 5. Branch on engine mode
-    match detect_engine_mode(&resolved_uri) {
-        engine::EngineMode::Awg => {
-            debug!("AWG engine mode");
-            let awg_config = engine::awg::parse_vpn_uri(&resolved_uri)?;
+    // 5. Branch on source / engine mode
+    match source {
+        StartSource::Uri(resolved_uri) => match detect_engine_mode(&resolved_uri) {
+            engine::EngineMode::Awg => {
+                debug!("AWG engine mode");
+                let awg_config = engine::awg::parse_vpn_uri(&resolved_uri)?;
 
-            // Write AWG .conf
-            let awg_conf_path = config.awg_conf_path()?;
-            engine::awg::write_conf(&awg_config, &awg_conf_path)?;
+                // Write AWG .conf
+                let awg_conf_path = config.awg_conf_path()?;
+                engine::awg::write_conf(&awg_config, &awg_conf_path)?;
 
-            // Ensure awg-quick is installed and start tunnel
-            engine::awg::ensure_awg_installed()?;
-            engine::awg::start_tunnel(&awg_conf_path)?;
-            println!("{}", "AWG tunnel started".green());
+                // Ensure awg-quick is installed and start tunnel
+                engine::awg::ensure_awg_installed()?;
+                engine::awg::start_tunnel(&awg_conf_path)?;
+                println!("{}", "AWG tunnel started".green());
 
-            // Build routing rules with "proxy" tag
-            let rules = traffic::build_routing_rules(
-                &corporate_traffic,
-                &proxy_traffic,
-                "proxy",
-                direct_ru,
-                &[],
-                &[],
-            );
-            debug!("built {} routing rules", rules.len());
+                // Build routing rules with "proxy" tag
+                let rules = traffic::build_routing_rules(
+                    &corporate_traffic,
+                    &proxy_traffic,
+                    "proxy",
+                    direct_ru,
+                    &[],
+                    &[],
+                );
+                debug!("built {} routing rules", rules.len());
 
-            // Create xray config with freedom outbound
-            let xray_cfg = protocol::create_config_awg_mode(static_port, &rules, &log_config);
-            if let Some(parent) = config.xray_config.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let json = serde_json::to_string_pretty(&xray_cfg)?;
-            config::write_restricted(&config.xray_config, &json)?;
-
-            // DNS sync
-            let mut dns_mappings = s.corporate_dns.unwrap_or_default();
-            if let Ok(discovered) = plat.discover_corporate_dns() {
-                for (domain, ns) in discovered {
-                    dns_mappings.entry(domain).or_insert(ns);
-                }
-            }
-            if !dns_mappings.is_empty() {
-                dns::sync_to_config(&config.xray_config, &dns_mappings)?;
-            }
-
-            // Start xray as routing layer and enable proxy
-            main_algorithm(config, plat, static_port)
-        }
-        engine::EngineMode::Xray => {
-            debug!("Xray engine mode");
-            let params = protocol::parse_uri(&resolved_uri)?;
-
-            // Build routing rules
-            let proxy_tag = if params.name.is_empty() {
-                "proxy"
-            } else {
-                &params.name
-            };
-            let rules = traffic::build_routing_rules(
-                &corporate_traffic,
-                &proxy_traffic,
-                proxy_tag,
-                direct_ru,
-                &[],
-                &[],
-            );
-            debug!("built {} routing rules", rules.len());
-
-            // Create or update xray config
-            if config.xray_config.exists() {
-                debug!("updating existing config {}", config.xray_config.display());
-                protocol::apply_to_config(&params, &config.xray_config, &log_config)?;
-                update_routing_rules(&config.xray_config, &rules)?;
-            } else {
-                debug!("creating new config {}", config.xray_config.display());
-                let xray_cfg = protocol::create_config(&params, static_port, &rules, &log_config);
+                // Create xray config with freedom outbound
+                let xray_cfg = protocol::create_config_awg_mode(static_port, &rules, &log_config);
                 if let Some(parent) = config.xray_config.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 let json = serde_json::to_string_pretty(&xray_cfg)?;
                 config::write_restricted(&config.xray_config, &json)?;
-            }
 
-            // DNS sync
-            let mut dns_mappings = s.corporate_dns.unwrap_or_default();
-            if let Ok(discovered) = plat.discover_corporate_dns() {
-                for (domain, ns) in discovered {
-                    dns_mappings.entry(domain).or_insert(ns);
+                // DNS sync
+                let mut dns_mappings = s.corporate_dns.unwrap_or_default();
+                if let Ok(discovered) = plat.discover_corporate_dns() {
+                    for (domain, ns) in discovered {
+                        dns_mappings.entry(domain).or_insert(ns);
+                    }
                 }
-            }
-            if !dns_mappings.is_empty() {
-                dns::sync_to_config(&config.xray_config, &dns_mappings)?;
-            }
+                if !dns_mappings.is_empty() {
+                    dns::sync_to_config(&config.xray_config, &dns_mappings)?;
+                }
 
-            main_algorithm(config, plat, static_port)
+                // Start xray as routing layer and enable proxy
+                main_algorithm(config, plat, static_port)
+            }
+            engine::EngineMode::Xray => {
+                let params = protocol::parse_uri(&resolved_uri)?;
+                let dns_mappings = s.corporate_dns.unwrap_or_default();
+                start_xray_engine(
+                    config,
+                    plat,
+                    &params,
+                    static_port,
+                    &routing,
+                    (&[], &[]),
+                    dns_mappings,
+                )
+            }
+        },
+        StartSource::Happ(entry) => {
+            debug!("using Happ subscription entry: {}", entry.params.name);
+            let (subs_domains, subs_ips): (&[String], &[String]) = if merge_subs {
+                (&entry.direct_domains, &entry.direct_ips)
+            } else {
+                (&[], &[])
+            };
+            if merge_subs && (!subs_domains.is_empty() || !subs_ips.is_empty()) {
+                info!(
+                    "merged {} direct domains + {} direct ip entries from subscription",
+                    subs_domains.len(),
+                    subs_ips.len()
+                );
+            }
+            let dns_mappings = s.corporate_dns.unwrap_or_default();
+            start_xray_engine(
+                config,
+                plat,
+                &entry.params,
+                static_port,
+                &routing,
+                (subs_domains, subs_ips),
+                dns_mappings,
+            )
         }
     }
 }
@@ -971,6 +1113,70 @@ mod tests {
         assert_eq!(
             super::detect_engine_mode("ss://abc"),
             crate::engine::EngineMode::Xray
+        );
+    }
+
+    #[test]
+    fn test_choose_source_all_empty_is_none_found() {
+        assert_eq!(
+            super::choose_source(false, false, false),
+            super::SourceDecision::NoneFound
+        );
+    }
+
+    #[test]
+    fn test_choose_source_xray_uris_only_is_uri() {
+        assert_eq!(
+            super::choose_source(false, true, false),
+            super::SourceDecision::Uri
+        );
+    }
+
+    #[test]
+    fn test_choose_source_vpn_uris_only_is_uri() {
+        assert_eq!(
+            super::choose_source(false, false, true),
+            super::SourceDecision::Uri
+        );
+    }
+
+    #[test]
+    fn test_choose_source_xray_and_vpn_uris_is_uri() {
+        assert_eq!(
+            super::choose_source(false, true, true),
+            super::SourceDecision::Uri
+        );
+    }
+
+    #[test]
+    fn test_choose_source_happ_only_is_happ() {
+        assert_eq!(
+            super::choose_source(true, false, false),
+            super::SourceDecision::Happ
+        );
+    }
+
+    #[test]
+    fn test_choose_source_happ_and_xray_uris_prefers_happ() {
+        assert_eq!(
+            super::choose_source(true, true, false),
+            super::SourceDecision::Happ
+        );
+    }
+
+    #[test]
+    fn test_choose_source_happ_and_vpn_uris_prefers_happ() {
+        assert_eq!(
+            super::choose_source(true, false, true),
+            super::SourceDecision::Happ
+        );
+    }
+
+    #[test]
+    fn test_choose_source_happ_and_both_uri_kinds_prefers_happ() {
+        assert_eq!(
+            super::choose_source(true, true, true),
+            super::SourceDecision::Happ
         );
     }
 }

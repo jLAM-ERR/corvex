@@ -151,15 +151,15 @@ Plus a prerequisite fix: `install.sh` installs only the xray binary, but `geosit
 **Files:**
 - Modify: `src/main.rs`
 
-- [ ] in the subs download loop: after each successful download, try `happ::parse_happ_subscription` FIRST; on Some, collect HappEntry candidates; on None, existing base64→URI path
-- [ ] ⚠️ restructure (from review): the current flow funnels everything through `resolved_uri: String` → `detect_engine_mode` → `parse_uri` (main.rs:150-265); Happ entries have NO URI. Extract (a) a pure decision helper `choose_source(has_happ, has_xray_uris, has_vpn_uris) -> SourceDecision` (unit-testable), and (b) a shared tail `fn start_xray_engine(params: ProxyParams, subs_direct: (&[String], &[String]), ...)` containing the existing Xray-branch body (apply_to_config/create_config, DNS sync, main_algorithm — main.rs:263-306) — called by both the parse_uri path and the Happ path
-- [ ] if Happ candidates exist: `health::find_alive_params` picks one → `start_xray_engine` directly with those ProxyParams; mixed case (some subs Happ, some base64): prefer Happ candidates, fall back to URI flow if none healthy
-- [ ] all-sources-empty case: a Happ body where every entry was skipped (unrepresentable) with no base64/vpn URIs must still hit the existing `bail!("no supported proxy servers found in subscriptions")` (main.rs:182-184)
-- [ ] merge gating: `routes.merge_subs == Some(true)` → pass the chosen entry's direct_domains/direct_ips into `build_routing_rules`; otherwise pass empty slices; log "merged N direct domains + M direct ip entries from subscription" (info) when non-empty
-- [ ] AWG path and direct-uri path: pass empty slices (merge applies only to Happ subscriptions)
-- [ ] note in docs task: merged rules are baked at `start`/`restart` time; `reload` keeps the last-generated config (consistent with existing subscription behavior)
-- [ ] write tests: `choose_source` decision table; full flow covered by round-trip tests from tasks 3-6
-- [ ] run tests — must pass before task 8
+- [x] in the subs download loop: after each successful download, try `happ::parse_happ_subscription` FIRST; on Some, collect HappEntry candidates; on None, existing base64→URI path
+- [x] ⚠️ restructure (from review): the current flow funnels everything through `resolved_uri: String` → `detect_engine_mode` → `parse_uri` (main.rs:150-265); Happ entries have NO URI. Extract (a) a pure decision helper `choose_source(has_happ, has_xray_uris, has_vpn_uris) -> SourceDecision` (unit-testable), and (b) a shared tail `fn start_xray_engine(params: ProxyParams, subs_direct: (&[String], &[String]), ...)` containing the existing Xray-branch body (apply_to_config/create_config, DNS sync, main_algorithm — main.rs:263-306) — called by both the parse_uri path and the Happ path
+- [x] if Happ candidates exist: `health::find_alive_params` picks one → `start_xray_engine` directly with those ProxyParams; mixed case (some subs Happ, some base64): prefer Happ candidates, fall back to URI flow if none healthy
+- [x] all-sources-empty case: a Happ body where every entry was skipped (unrepresentable) with no base64/vpn URIs must still hit the existing `bail!("no supported proxy servers found in subscriptions")` (main.rs:182-184)
+- [x] merge gating: `routes.merge_subs == Some(true)` → pass the chosen entry's direct_domains/direct_ips into `build_routing_rules`; otherwise pass empty slices; log "merged N direct domains + M direct ip entries from subscription" (info) when non-empty
+- [x] AWG path and direct-uri path: pass empty slices (merge applies only to Happ subscriptions)
+- [x] note in docs task: merged rules are baked at `start`/`restart` time; `reload` keeps the last-generated config (consistent with existing subscription behavior)
+- [x] write tests: `choose_source` decision table; full flow covered by round-trip tests from tasks 3-6
+- [x] run tests — must pass before task 8
 
 ### Task 8: Geo data files — install.sh + XRAY_LOCATION_ASSET
 
