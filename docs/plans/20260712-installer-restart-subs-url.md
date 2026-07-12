@@ -153,11 +153,11 @@ Docs must highlight everywhere: **xray is the default engine; AmneziaWG is an op
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] no `brew`/`winget` install invocations remain anywhere in `src/` (grep)
-- [ ] `sh -n install.sh` clean; `corvex restart` works end-to-end locally (manual: start → restart → status)
-- [ ] a config using `file-url` still starts (backward compat smoke check)
-- [ ] run full test suite: `cargo test`
-- [ ] run `cargo clippy -- -D warnings -A dead_code` and `cargo fmt --check`
+- [x] no `brew`/`winget` install invocations remain anywhere in `src/` (grep — only read-only winget *path lookups* remain in `resolve_from_common_locations`, correct to keep)
+- [x] `sh -n install.sh` clean + shellcheck clean; `corvex restart` executes the full start flow (validated via safe smoke: legacy config with unreachable subscription → validation, early xray check, AWG pre-stop, subscription flow all ran; live start → restart → status proxy flip stays in Post-Completion manual tests)
+- [x] a config using `file-url` still starts (backward compat smoke: real binary accepted the legacy key and proceeded to server resolution)
+- [x] run full test suite: `cargo test` — 175 passed, 0 failed
+- [x] run `cargo clippy -- -D warnings -A dead_code` and `cargo fmt --check` — both clean
 
 ### Task 8: Update documentation
 
