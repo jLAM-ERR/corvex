@@ -145,11 +145,11 @@ Docs must highlight everywhere: **xray is the default engine; AmneziaWG is an op
 **Files:**
 - Modify: `.github/workflows/rust.yml`
 
-- [ ] add `release-linux` job: `ubuntu-latest`, `needs: [test, release-guard]`, same explicit `if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'` guard as the sibling release jobs, install `musl-tools`, target `x86_64-unknown-linux-musl`, package `corvex-<ver>-linux-x86_64.tar.gz` + `.sha256` (mirror the macOS Package step), upload artifact
-- [ ] add `release-linux` to `publish-release`'s `needs:` (artifact glob already picks up the files)
-- [ ] add a Linux snippet (curl | tar + install.sh mention) to the composed release body in the "Compose release body" step
-- [ ] narrow triggers: `on.push` → tags `v*` only (drop `branches: [main, "release/**"]`); keep `pull_request` and `workflow_dispatch` — one CI run per PR, one per version tag, none on merge (accepted tradeoff: release branches get no push CI; their PR run + the tag run cover them)
-- [ ] validate workflow YAML parses (python3 yaml.safe_load or actionlint if installed) — must pass before task 7
+- [x] add `release-linux` job: `ubuntu-latest`, `needs: [test, release-guard]`, same explicit `if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'` guard as the sibling release jobs, install `musl-tools`, target `x86_64-unknown-linux-musl`, package `corvex-<ver>-linux-x86_64.tar.gz` + `.sha256` (mirror the macOS Package step), upload artifact
+- [x] add `release-linux` to `publish-release`'s `needs:` (artifact glob already picks up the files)
+- [x] add a Linux snippet (curl | tar + install.sh mention) to the composed release body in the "Compose release body" step
+- [x] narrow triggers: `on.push` → tags `v*` only (drop `branches: [main, "release/**"]`); keep `pull_request` and `workflow_dispatch` — one CI run per PR, one per version tag, none on merge (accepted tradeoff: release branches get no push CI; their PR run + the tag run cover them)
+- [x] validate workflow YAML parses (python3 yaml.safe_load or actionlint if installed) — must pass before task 7
 
 ### Task 7: Verify acceptance criteria
 
