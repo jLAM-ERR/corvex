@@ -381,6 +381,19 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     // 5. Branch on source / engine mode
     match source {
         StartSource::Uri(resolved_uri) => match detect_engine_mode(&resolved_uri) {
+            engine::EngineMode::Xray => {
+                let params = protocol::parse_uri(&resolved_uri)?;
+                let dns_mappings = s.corporate_dns.unwrap_or_default();
+                start_xray_engine(
+                    config,
+                    plat,
+                    &params,
+                    static_port,
+                    &routing,
+                    (&[], &[]),
+                    dns_mappings,
+                )
+            }
             engine::EngineMode::Awg => {
                 debug!("AWG engine mode");
                 let awg_config = engine::awg::parse_vpn_uri(&resolved_uri)?;
@@ -425,19 +438,6 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
 
                 // Start xray as routing layer and enable proxy
                 main_algorithm(config, plat, static_port)
-            }
-            engine::EngineMode::Xray => {
-                let params = protocol::parse_uri(&resolved_uri)?;
-                let dns_mappings = s.corporate_dns.unwrap_or_default();
-                start_xray_engine(
-                    config,
-                    plat,
-                    &params,
-                    static_port,
-                    &routing,
-                    (&[], &[]),
-                    dns_mappings,
-                )
             }
         },
         StartSource::Entry(entry) => {
