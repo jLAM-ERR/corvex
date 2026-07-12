@@ -15,7 +15,10 @@ pub fn normalize_entry(entry: &str) -> String {
 }
 
 /// Union `ctraffic` and `subs_direct_domains` (normalized, deduped), dropping
-/// any entry that also appears in `ptraffic` — local proxy-traffic wins.
+/// any `subs_direct_domains` entry that also appears in `ptraffic` — local
+/// proxy-traffic wins. `ctraffic` entries are never excluded: they are the
+/// user's own config and must keep matching the direct rule first, even if
+/// the same domain is also listed under proxy-traffic.
 fn merge_direct_domains(
     ctraffic: &[String],
     subs_direct_domains: &[String],
@@ -24,7 +27,13 @@ fn merge_direct_domains(
     let excluded: HashSet<String> = ptraffic.iter().map(|e| normalize_entry(e)).collect();
     let mut seen = HashSet::new();
     let mut merged = Vec::new();
-    for entry in ctraffic.iter().chain(subs_direct_domains.iter()) {
+    for entry in ctraffic {
+        let normalized = normalize_entry(entry);
+        if seen.insert(normalized.clone()) {
+            merged.push(serde_json::Value::String(normalized));
+        }
+    }
+    for entry in subs_direct_domains {
         let normalized = normalize_entry(entry);
         if excluded.contains(&normalized) {
             continue;
@@ -36,16 +45,16 @@ fn merge_direct_domains(
     merged
 }
 
-/// Dedup subscription direct-ip entries, dropping `geoip:private` since rule 0
-/// already covers it.
+/// Dedup subscription direct-ip entries case-insensitively, dropping
+/// `geoip:private` (any case) since rule 0 already covers it.
 fn dedup_subs_direct_ips(subs_direct_ips: &[String]) -> Vec<serde_json::Value> {
     let mut seen = HashSet::new();
     let mut ips = Vec::new();
     for entry in subs_direct_ips {
-        if entry == "geoip:private" {
+        if entry.eq_ignore_ascii_case("geoip:private") {
             continue;
         }
-        if seen.insert(entry.clone()) {
+        if seen.insert(entry.to_ascii_lowercase()) {
             ips.push(serde_json::Value::String(entry.clone()));
         }
     }
@@ -282,5 +291,65 @@ mod tests {
         let rules = build_routing_rules(&[], &[], "proxy", false, &subs_domains, &[]);
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[1]["domain"][0], "geosite:category-ru");
+    }
+
+    // Regression: a domain present in both ctraffic and ptraffic must stay in
+    // the direct rule (xray first-match routes it direct) — this held before
+    // the merge feature and must not change on the empty-slices path.
+    #[test]
+    fn test_build_routing_rules_ctraffic_ptraffic_overlap_stays_direct() {
+        let ct = vec!["shared.com".to_string()];
+        let pt = vec!["shared.com".to_string()];
+        let rules = build_routing_rules(&ct, &pt, "proxy", false, &[], &[]);
+        assert_eq!(rules.len(), 3);
+        assert_loopback_rule_first(&rules);
+        assert_eq!(rules[1]["outboundTag"], "direct");
+        assert_eq!(rules[1]["domain"][0], "domain:shared.com");
+        assert_eq!(rules[2]["outboundTag"], "proxy");
+        assert_eq!(rules[2]["domain"][0], "domain:shared.com");
+    }
+
+    #[test]
+    fn test_build_routing_rules_exclusion_ignores_prefix_mismatch_bare_ptraffic() {
+        let pt = vec!["yandex.com".to_string()];
+        let subs_domains = vec!["domain:yandex.com".to_string()];
+        let rules = build_routing_rules(&[], &pt, "proxy", false, &subs_domains, &[]);
+        // subs domain excluded via normalized match -> no direct rule, only proxy rule
+        assert_eq!(rules.len(), 2);
+        assert_loopback_rule_first(&rules);
+        assert_eq!(rules[1]["outboundTag"], "proxy");
+        assert_eq!(rules[1]["domain"][0], "domain:yandex.com");
+    }
+
+    #[test]
+    fn test_build_routing_rules_exclusion_ignores_prefix_mismatch_prefixed_ptraffic() {
+        let pt = vec!["domain:x.com".to_string()];
+        let subs_domains = vec!["x.com".to_string()];
+        let rules = build_routing_rules(&[], &pt, "proxy", false, &subs_domains, &[]);
+        assert_eq!(rules.len(), 2);
+        assert_loopback_rule_first(&rules);
+        assert_eq!(rules[1]["outboundTag"], "proxy");
+        assert_eq!(rules[1]["domain"][0], "domain:x.com");
+    }
+
+    #[test]
+    fn test_build_routing_rules_subs_direct_ip_geoip_private_filter_case_insensitive() {
+        let subs_ips = vec!["GEOIP:PRIVATE".to_string(), "geoip:ru".to_string()];
+        let rules = build_routing_rules(&[], &[], "proxy", false, &[], &subs_ips);
+        assert_eq!(rules.len(), 2);
+        let ips = rules[1]["ip"].as_array().unwrap();
+        assert_eq!(
+            ips,
+            &vec![serde_json::Value::String("geoip:ru".to_string())]
+        );
+    }
+
+    #[test]
+    fn test_build_routing_rules_subs_direct_ip_dedup_case_insensitive() {
+        let subs_ips = vec!["geoip:ru".to_string(), "GeoIP:RU".to_string()];
+        let rules = build_routing_rules(&[], &[], "proxy", false, &[], &subs_ips);
+        let ips = rules[1]["ip"].as_array().unwrap();
+        assert_eq!(ips.len(), 1);
+        assert_eq!(ips[0], "geoip:ru");
     }
 }
