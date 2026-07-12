@@ -128,11 +128,11 @@ Plus a prerequisite fix: `install.sh` installs only the xray binary, but `geosit
 **Files:**
 - Modify: `src/health.rs`
 
-- [ ] add `pub fn find_alive_params(candidates: &[ProxyParams], xray_bin: &str) -> Result<usize>` — same TCP pre-filter + tunnel-latency logic, returns index of first healthy candidate
-- [ ] refactor `find_alive_server` to parse URIs into `(uri, ProxyParams)` pairs and delegate to the shared selection logic (behavior unchanged: returns the URI string)
-- [ ] ⚠️ keep the error message containing "no reachable" — `test_find_alive_server_all_unreachable` (health.rs:333-336) asserts `.contains("no reachable")` against the current "no reachable servers found" (health.rs:212); progress-line numbering may shift cosmetically after pre-filtering unparseable URIs, which is acceptable
-- [ ] write test: `find_alive_params` on an empty slice errors; existing find_alive_server tests still pass
-- [ ] run tests — must pass before task 6
+- [x] add `pub fn find_alive_params(candidates: &[ProxyParams], xray_bin: &str) -> Result<usize>` — same TCP pre-filter + tunnel-latency logic, returns index of first healthy candidate
+- [x] refactor `find_alive_server` to parse URIs into `(uri, ProxyParams)` pairs and delegate to the shared selection logic (behavior unchanged: returns the URI string)
+- [x] ⚠️ keep the error message containing "no reachable" — `test_find_alive_server_all_unreachable` (health.rs:333-336) asserts `.contains("no reachable")` against the current "no reachable servers found" (health.rs:212); progress-line numbering may shift cosmetically after pre-filtering unparseable URIs, which is acceptable
+- [x] write test: `find_alive_params` on an empty slice errors; existing find_alive_server tests still pass
+- [x] run tests — must pass before task 6
 
 ### Task 6: Routing merge in build_routing_rules
 
