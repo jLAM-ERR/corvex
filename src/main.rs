@@ -162,8 +162,11 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         );
         let mut xray_uris = Vec::new();
         let mut vpn_uris = Vec::new();
+        let user_agent = subscription::resolve_user_agent(s.subs_user_agent.as_deref());
+        let empty_headers = std::collections::BTreeMap::new();
+        let extra_headers = s.subs_headers.as_ref().unwrap_or(&empty_headers);
         for url in urls {
-            match subscription::download_subscription(url) {
+            match subscription::download_subscription(url, user_agent, extra_headers) {
                 Ok(body) => {
                     if let Ok(uris) = subscription::decode_subscription(&body) {
                         let supported = subscription::filter_supported(&uris);

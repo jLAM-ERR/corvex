@@ -92,11 +92,11 @@ Plus a prerequisite fix: `install.sh` installs only the xray binary, but `geosit
 - Modify: `src/subscription.rs`
 - Modify: `src/main.rs`
 
-- [ ] add `pub const DEFAULT_SUBS_USER_AGENT: &str = "v2rayNG/1.10.2"` and pure `resolve_user_agent(configured: Option<&str>) -> &str`
-- [ ] change `download_subscription(url, user_agent: &str, extra_headers: &BTreeMap<String, String>)` — set the UA and each extra header on the ureq request (ureq v3 `.header(name, value)` builder; no existing usage in src/ to copy — check ureq 3 docs). Note: sending a default UA is a deliberate request-behavior change for ALL subscriptions (previously ureq's default); the DECODE path for base64 panels stays byte-identical
-- [ ] update the call site in `src/main.rs` (pass values from settings)
-- [ ] write tests: `resolve_user_agent` returns default when None/configured value when Some; DEFAULT constant is v2rayNG-flavored
-- [ ] run tests — must pass before task 3
+- [x] add `pub const DEFAULT_SUBS_USER_AGENT: &str = "v2rayNG/1.10.2"` and pure `resolve_user_agent(configured: Option<&str>) -> &str`
+- [x] change `download_subscription(url, user_agent: &str, extra_headers: &BTreeMap<String, String>)` — set the UA and each extra header on the ureq request (ureq v3 `.header(name, value)` builder; no existing usage in src/ to copy — check ureq 3 docs). Note: sending a default UA is a deliberate request-behavior change for ALL subscriptions (previously ureq's default); the DECODE path for base64 panels stays byte-identical
+- [x] update the call site in `src/main.rs` (pass values from settings)
+- [x] write tests: `resolve_user_agent` returns default when None/configured value when Some; DEFAULT constant is v2rayNG-flavored
+- [x] run tests — must pass before task 3
 
 ### Task 3: ProxyParams extraction from an xray outbound JSON
 
