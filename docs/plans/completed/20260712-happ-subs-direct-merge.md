@@ -182,10 +182,10 @@ Plus a prerequisite fix: `install.sh` installs only the xray binary, but `geosit
 
 ### Task 10: Update documentation
 
-- [ ] README.md: document `subs-user-agent` + `subs-headers` (why: panels filter unknown agents — broken config from curl/default corvex), Happ-format auto-detection, `routes.merge-subs` with explicit security warning (a compromised subscription can route chosen domains OUTSIDE the tunnel; default off), geo-files note for install.sh setups
-- [ ] README.md: note that merged direct rules are baked at `start`/`restart` time — `reload` keeps the last-generated config (deferred from Task 7)
-- [ ] CLAUDE.md: new keys in the corvex.json example, `happ.rs` in the architecture listing, subscription.rs description update
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README.md: document `subs-user-agent` + `subs-headers` (why: panels filter unknown agents — broken config from curl/default corvex), Happ-format auto-detection, `routes.merge-subs` with explicit security warning (a compromised subscription can route chosen domains OUTSIDE the tunnel; default off), geo-files note for install.sh setups
+- [x] README.md: note that merged direct rules are baked at `start`/`restart` time — `reload` keeps the last-generated config (deferred from Task 7)
+- [x] CLAUDE.md: new keys in the corvex.json example, `happ.rs` in the architecture listing, subscription.rs description update
+- [x] move this plan to `docs/plans/completed/`
 
 ➕ (discovered in Task 7 review, pre-existing, OUT OF SCOPE for this plan) switching AWG→Xray with a stale AWG-mode `config.json` on disk makes `apply_to_config` fail with "no proxy outbound found" — identical behavior before and after this work; candidate for a future bug-fix plan.
 

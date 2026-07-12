@@ -25,6 +25,8 @@ Or, from a checkout:
 
 This installs the `corvex` binary and, as a dependency, the `xray` engine binary (only when `xray` isn't already installed). Re-running the script always upgrades `corvex` to the latest release; an existing `xray` install is left untouched.
 
+When it installs `xray`, install.sh also installs xray's `geoip.dat`/`geosite.dat` to `/usr/local/share/xray` (needed for `geosite:`/`geoip:` routing rules, including corvex's own loopback/RFC1918 direct rule). A failure to install these files is a warning, not fatal — set `XRAY_LOCATION_ASSET` yourself (e.g. a brew-managed `xray` already provides its own geo data).
+
 Supported platforms: macOS (arm64, x86_64) and Linux (x86_64). On Windows, download the release zip from [Releases](https://github.com/jLAM-ERR/corvex/releases) manually.
 
 ### Installation from source
@@ -106,6 +108,11 @@ All settings live in a single JSONC file (comments allowed) at `$XDG_CONFIG_HOME
   // Option B: subscription URLs for auto-discovery (picks fastest healthy server)
   "subs-url": ["https://example.com/sub1.txt", "https://example.com/sub2.txt"],
 
+  // Optional: identity used when downloading subs-url (see "Subscription request
+  // identity" below); default "v2rayNG/1.10.2"
+  "subs-user-agent": "Happ/3.13.0",
+  "subs-headers": { "X-Hwid": "abc", "X-Device-Os": "Android" },
+
   // Required: static proxy port
   "proxy": { "port": 21080 },
 
@@ -117,9 +124,10 @@ All settings live in a single JSONC file (comments allowed) at `$XDG_CONFIG_HOME
 
   // Routing rules
   "routes": {
-    "direct-ru": true,                              // Route .ru TLD directly (bypass proxy)
-    "proxy-traffic": ["domain:youtube.com"],         // Force through proxy
-    "corporate-traffic": ["domain:corp.example.com"] // Bypass proxy (direct)
+    "direct-ru": true,                               // Route .ru TLD directly (bypass proxy)
+    "proxy-traffic": ["domain:youtube.com"],          // Force through proxy
+    "corporate-traffic": ["domain:corp.example.com"], // Bypass proxy (direct)
+    "merge-subs": false                               // Merge subscription's own direct-routing rules; SEE WARNING below; default off
   },
 
   // Logging
@@ -137,6 +145,22 @@ All settings live in a single JSONC file (comments allowed) at `$XDG_CONFIG_HOME
 Provide either `uri` (connect to a specific server) or `subs-url` (auto-discover from subscriptions). If both are present, `uri` takes precedence.
 
 `file-url` is a deprecated alias for `subs-url` and still works.
+
+### Subscription request identity
+
+Subscription panels commonly content-negotiate on the `User-Agent` header: an unknown or missing UA (plain `curl`, or corvex without this setting) can get a filtered or broken response instead of the real subscription. `subs-user-agent` sets the UA corvex sends when downloading `subs-url`/`file-url`; it defaults to `"v2rayNG/1.10.2"`, which reliably yields a plain base64 response from most panels. `subs-headers` adds extra request headers some panels require (e.g. `X-Hwid`, `X-Device-Os`, `X-Ver-Os`, `X-Device-Model`). A `User-Agent` key inside `subs-headers` (case-insensitive) wins over `subs-user-agent`.
+
+### Happ-format subscriptions
+
+Some panels serve a Happ-compatible response instead of base64: a JSON array of complete xray configs, one per server (there are no URIs to parse in this format). corvex auto-detects it and extracts server candidates directly from the JSON — health-checked the same way as URI-based candidates. No extra configuration is needed beyond `subs-user-agent`/`subs-headers` (the panel decides which format to serve based on those).
+
+### Merging subscription routing rules (`routes.merge-subs`)
+
+Happ-format subscriptions can carry their own routing rules, including domains/IPs the panel routes `direct` (bypassing the tunnel). When `routes.merge-subs: true`, corvex merges the chosen subscription entry's direct-routing domains and IPs into its own routing. Default is `false`.
+
+**Security warning:** turning this on means whoever controls the subscription can route the domains/IPs it lists OUTSIDE the tunnel — only enable it for a subscription provider you trust with that decision. Local `proxy-traffic` entries always win over subscription domains (so you can force a domain back through the tunnel regardless of what the subscription says), and the loopback/RFC1918 direct rule can never be displaced by a merge.
+
+Merged rules are baked into `config.json` at `start`/`restart` time, when corvex re-downloads and re-resolves the subscription. `reload` only re-validates the existing `config.json` and sends SIGHUP — it does not re-download subscriptions, so a change in the subscription's rules takes effect on the next `start`/`restart`, not on `reload`.
 
 ### Routing entries format
 
