@@ -126,10 +126,10 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     // Ensure all directories exist
     ensure_directories(config, &s);
 
-    // 2. Validate: need uri or file-url
-    if s.uri.is_none() && s.file_url.is_none() {
+    // 2. Validate: need uri or subs-url
+    if s.uri.is_none() && s.subs_url.is_none() {
         anyhow::bail!(
-            "corvex.json must contain \"uri\" or \"file-url\".\n\
+            "corvex.json must contain \"uri\" or \"subs-url\".\n\
              Config path: {}",
             config.corvex_settings.display()
         );
@@ -151,11 +151,11 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         debug!("start flow: using URI from corvex.json");
         uri.clone()
     } else {
-        // file-url flow: download, decode, filter, find alive
+        // subs-url flow: download, decode, filter, find alive
         let urls = s
-            .file_url
+            .subs_url
             .as_ref()
-            .context("bug: file_url should be Some after validation")?;
+            .context("bug: subs_url should be Some after validation")?;
         debug!(
             "start flow: downloading from {} subscription URLs",
             urls.len()
@@ -470,7 +470,7 @@ fn cmd_stop(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     debug!("stopping xray process");
     let xray_result = xray::stop(config);
 
-    // Don't let path errors swallow proxy/xray results
+    // Also stop any AWG tunnel left running from a previous session
     stop_awg_if_running(config);
 
     proxy_result?;
@@ -699,9 +699,9 @@ mod tests {
     }
 
     #[test]
-    fn test_settings_validation_requires_uri_or_file_url() {
+    fn test_settings_validation_requires_uri_or_subs_url() {
         let s = crate::settings::CorvexSettings::default();
-        assert!(s.uri.is_none() && s.file_url.is_none());
+        assert!(s.uri.is_none() && s.subs_url.is_none());
     }
 
     #[test]

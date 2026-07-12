@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Deserialize, Default)]
 pub struct CorvexSettings {
     pub uri: Option<String>,
-    #[serde(rename = "file-url")]
-    pub file_url: Option<Vec<String>>,
+    #[serde(rename = "subs-url", alias = "file-url")]
+    pub subs_url: Option<Vec<String>>,
     #[serde(rename = "corporate-dns")]
     pub corporate_dns: Option<BTreeMap<String, String>>,
     pub routes: Option<RoutesSettings>,
@@ -97,7 +97,7 @@ mod tests {
         let json = r#"{
             // This is a comment
             "uri": "vless://uuid@host:443?type=grpc",
-            "file-url": ["https://example.com/sub1", "https://example.com/sub2"],
+            "subs-url": ["https://example.com/sub1", "https://example.com/sub2"],
             "corporate-dns": {
                 "corp.internal": "10.0.0.1",
                 "dev.corp": "10.0.0.2"
@@ -124,9 +124,9 @@ mod tests {
 
         assert_eq!(s.uri.as_deref(), Some("vless://uuid@host:443?type=grpc"));
 
-        let file_url = s.file_url.unwrap();
-        assert_eq!(file_url.len(), 2);
-        assert_eq!(file_url[0], "https://example.com/sub1");
+        let subs_url = s.subs_url.unwrap();
+        assert_eq!(subs_url.len(), 2);
+        assert_eq!(subs_url[0], "https://example.com/sub1");
 
         let dns = s.corporate_dns.unwrap();
         assert_eq!(
@@ -160,19 +160,38 @@ mod tests {
         let (_dir, path) = write_temp(json);
         let s = load(&path).unwrap();
         assert_eq!(s.uri.as_deref(), Some("vless://abc@host:443"));
-        assert!(s.file_url.is_none());
+        assert!(s.subs_url.is_none());
         assert!(s.corporate_dns.is_none());
         assert!(s.routes.is_none());
         assert!(s.log.is_none());
     }
 
     #[test]
-    fn load_file_url_only() {
+    fn load_subs_url_only() {
+        let json = r#"{"subs-url": ["https://sub.example.com"]}"#;
+        let (_dir, path) = write_temp(json);
+        let s = load(&path).unwrap();
+        assert!(s.uri.is_none());
+        assert_eq!(s.subs_url.unwrap(), vec!["https://sub.example.com"]);
+    }
+
+    #[test]
+    fn load_legacy_file_url_alias() {
         let json = r#"{"file-url": ["https://sub.example.com"]}"#;
         let (_dir, path) = write_temp(json);
         let s = load(&path).unwrap();
         assert!(s.uri.is_none());
-        assert_eq!(s.file_url.unwrap(), vec!["https://sub.example.com"]);
+        assert_eq!(s.subs_url.unwrap(), vec!["https://sub.example.com"]);
+    }
+
+    #[test]
+    fn load_rejects_both_subs_url_and_legacy_file_url() {
+        let json = r#"{
+            "subs-url": ["https://a.com"],
+            "file-url": ["https://b.com"]
+        }"#;
+        let (_dir, path) = write_temp(json);
+        assert!(load(&path).is_err());
     }
 
     #[test]
@@ -181,7 +200,7 @@ mod tests {
         let (_dir, path) = write_temp(json);
         let s = load(&path).unwrap();
         assert!(s.uri.is_none());
-        assert!(s.file_url.is_none());
+        assert!(s.subs_url.is_none());
         assert!(s.corporate_dns.is_none());
         assert!(s.routes.is_none());
         assert!(s.log.is_none());
@@ -194,12 +213,12 @@ mod tests {
             "uri": "vless://x@y:1",
             /* block
                comment */
-            "file-url": ["https://a.com"]
+            "subs-url": ["https://a.com"]
         }"#;
         let (_dir, path) = write_temp(json);
         let s = load(&path).unwrap();
         assert_eq!(s.uri.as_deref(), Some("vless://x@y:1"));
-        assert_eq!(s.file_url.unwrap(), vec!["https://a.com"]);
+        assert_eq!(s.subs_url.unwrap(), vec!["https://a.com"]);
     }
 
     #[test]

@@ -131,14 +131,14 @@ Docs must highlight everywhere: **xray is the default engine; AmneziaWG is an op
 - Modify: `src/settings.rs`
 - Modify: `src/main.rs`
 
-- [ ] change field to `#[serde(rename = "subs-url", alias = "file-url")] pub subs_url: Option<Vec<String>>` in `src/settings.rs`
-- [ ] update all `file_url` references in `src/main.rs` (validation `:127`, error message `:129` → `"uri" or "subs-url"`, subscription flow `:149-152` incl. the `bug:` context string)
-- [ ] update ALL remaining `.file_url` field accesses or the build breaks (E0609): `src/settings.rs:163,175,184,202` and the `src/main.rs:676-678` test (`test_settings_validation_requires_uri_or_file_url`, incl. its `_file_url` variable name)
-- [ ] update existing settings tests using `file-url` (`src/settings.rs:100,127-129`) to the new key; keep at least one `"file-url"` JSON key in tests (e.g. settings.rs:171/197) as explicit alias coverage
-- [ ] write test: config with `subs-url` parses
-- [ ] write test: legacy config with `file-url` parses into `subs_url` (backward compat)
-- [ ] write test: config with BOTH keys fails with serde duplicate-field error
-- [ ] run tests — must pass before task 6
+- [x] change field to `#[serde(rename = "subs-url", alias = "file-url")] pub subs_url: Option<Vec<String>>` in `src/settings.rs`
+- [x] update all `file_url` references in `src/main.rs` (validation `:127`, error message `:129` → `"uri" or "subs-url"`, subscription flow `:149-152` incl. the `bug:` context string)
+- [x] update ALL remaining `.file_url` field accesses or the build breaks (E0609): `src/settings.rs:163,175,184,202` and the `src/main.rs:676-678` test (`test_settings_validation_requires_uri_or_file_url`, incl. its `_file_url` variable name)
+- [x] update existing settings tests using `file-url` (`src/settings.rs:100,127-129`) to the new key; keep at least one `"file-url"` JSON key in tests (e.g. settings.rs:171/197) as explicit alias coverage
+- [x] write test: config with `subs-url` parses
+- [x] write test: legacy config with `file-url` parses into `subs_url` (backward compat)
+- [x] write test: config with BOTH keys fails with serde duplicate-field error
+- [x] run tests — must pass before task 6
 
 ### Task 6: CI — Linux release build and single-trigger cleanup
 
