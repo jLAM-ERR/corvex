@@ -5,9 +5,14 @@ set -eu
 CORVEX_REPO="jLAM-ERR/corvex"
 XRAY_REPO="XTLS/Xray-core"
 INSTALL_DIR="/usr/local/bin"
+GEO_ASSET_DIR="/usr/local/share/xray"
 
 err() {
   printf 'Error: %s\n' "$1" >&2
+}
+
+warn() {
+  printf 'Warning: %s\n' "$1" >&2
 }
 
 corvex_manual_hint() {
@@ -16,6 +21,10 @@ corvex_manual_hint() {
 
 xray_manual_hint() {
   printf 'Manual install: download the Xray release for your platform from https://github.com/%s/releases/latest, extract the archive, and copy the "xray" binary into your PATH (e.g. %s).\n' "$XRAY_REPO" "$INSTALL_DIR" >&2
+}
+
+xray_dat_manual_hint() {
+  printf 'Manual install: extract geoip.dat and geosite.dat from the Xray release archive (https://github.com/%s/releases/latest) and copy them into %s (used only when XRAY_LOCATION_ASSET is not already set).\n' "$XRAY_REPO" "$GEO_ASSET_DIR" >&2
 }
 
 unsupported_platform() {
@@ -52,6 +61,29 @@ install_binary() {
     require_sudo "$hint"
     echo "Root privileges are required to write to ${INSTALL_DIR}; requesting sudo..." >&2
     sudo install -m 755 "$src" "$dest"
+  fi
+}
+
+# Best-effort install of a geo data file; non-fatal on failure (callers must warn, not exit).
+install_dat_file() {
+  src="$1"
+  name="$2"
+  dest="${GEO_ASSET_DIR}/${name}"
+  if [ ! -d "$GEO_ASSET_DIR" ]; then
+    if [ -w "$(dirname "$GEO_ASSET_DIR")" ]; then
+      mkdir -p "$GEO_ASSET_DIR" || return 1
+    elif command -v sudo >/dev/null 2>&1; then
+      sudo mkdir -p "$GEO_ASSET_DIR" || return 1
+    else
+      return 1
+    fi
+  fi
+  if [ -w "$GEO_ASSET_DIR" ]; then
+    install -m 644 "$src" "$dest" || return 1
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo install -m 644 "$src" "$dest" || return 1
+  else
+    return 1
   fi
 }
 
@@ -182,4 +214,16 @@ else
 
   install_binary "$XRAY_BIN" "xray" xray_manual_hint
   echo "xray installed to ${INSTALL_DIR}/xray"
+
+  echo "Installing geo data files (geoip.dat, geosite.dat)..."
+  GEOIP_FILE="${XRAY_EXTRACT_DIR}/geoip.dat"
+  GEOSITE_FILE="${XRAY_EXTRACT_DIR}/geosite.dat"
+  if [ -f "$GEOIP_FILE" ] && [ -f "$GEOSITE_FILE" ] \
+    && install_dat_file "$GEOIP_FILE" "geoip.dat" \
+    && install_dat_file "$GEOSITE_FILE" "geosite.dat"; then
+    echo "geo data files installed to ${GEO_ASSET_DIR}"
+  else
+    warn "failed to install geoip.dat/geosite.dat to ${GEO_ASSET_DIR} (geosite:/geoip: routing rules need XRAY_LOCATION_ASSET set some other way)"
+    xray_dat_manual_hint
+  fi
 fi

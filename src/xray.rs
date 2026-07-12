@@ -6,7 +6,6 @@ use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use std::fs;
-#[cfg(windows)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -249,6 +248,21 @@ fn is_process_alive(pid: i32) -> bool {
     }
 }
 
+/// Directory where install.sh places geoip.dat/geosite.dat for non-brew setups.
+const INSTALLED_ASSET_DIR: &str = "/usr/local/share/xray";
+
+/// Decide whether to override XRAY_LOCATION_ASSET for the spawned xray process.
+/// Only applies when the env var is unset AND the installer-managed asset dir
+/// exists, so brew/manual installs that already manage their own geo assets
+/// are left untouched.
+fn asset_dir_override(env_set: bool, dir_exists: bool) -> Option<&'static str> {
+    if !env_set && dir_exists {
+        Some(INSTALLED_ASSET_DIR)
+    } else {
+        None
+    }
+}
+
 /// Start the xray process.
 pub fn start(config: &Config) -> Result<i32> {
     if !config.xray_config.exists() {
@@ -280,11 +294,21 @@ pub fn start(config: &Config) -> Result<i32> {
         .try_clone()
         .context("Failed to clone log file handle")?;
 
-    let child = Command::new(&xray_bin)
-        .args(["run", "-c"])
+    let mut cmd = Command::new(&xray_bin);
+    cmd.args(["run", "-c"])
         .arg(&config.xray_config)
         .stdout(log_file)
-        .stderr(log_stderr)
+        .stderr(log_stderr);
+
+    if let Some(dir) = asset_dir_override(
+        std::env::var_os("XRAY_LOCATION_ASSET").is_some(),
+        Path::new(INSTALLED_ASSET_DIR).is_dir(),
+    ) {
+        debug!("setting XRAY_LOCATION_ASSET={}", dir);
+        cmd.env("XRAY_LOCATION_ASSET", dir);
+    }
+
+    let child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn xray process via {}", xray_bin.display()))?;
 
@@ -434,5 +458,28 @@ mod tests {
     #[test]
     fn test_xray_not_installed_msg_mentions_install_sh() {
         assert!(XRAY_NOT_INSTALLED_MSG.contains("install.sh"));
+    }
+
+    #[test]
+    fn test_asset_dir_override_env_unset_dir_exists() {
+        assert_eq!(
+            asset_dir_override(false, true),
+            Some("/usr/local/share/xray")
+        );
+    }
+
+    #[test]
+    fn test_asset_dir_override_env_unset_dir_missing() {
+        assert_eq!(asset_dir_override(false, false), None);
+    }
+
+    #[test]
+    fn test_asset_dir_override_env_set_dir_exists() {
+        assert_eq!(asset_dir_override(true, true), None);
+    }
+
+    #[test]
+    fn test_asset_dir_override_env_set_dir_missing() {
+        assert_eq!(asset_dir_override(true, false), None);
     }
 }

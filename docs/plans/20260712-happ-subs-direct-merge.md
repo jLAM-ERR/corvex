@@ -167,11 +167,11 @@ Plus a prerequisite fix: `install.sh` installs only the xray binary, but `geosit
 - Modify: `install.sh`
 - Modify: `src/xray.rs`
 
-- [ ] install.sh xray step: also extract `geoip.dat` and `geosite.dat` from the Xray zip and install (0644) to `/usr/local/share/xray/` (same sudo-only-when-needed logic; failure → warning + manual hint, not fatal, since brew setups don't need it)
-- [ ] `src/xray.rs::start`: when spawning xray, set `XRAY_LOCATION_ASSET=/usr/local/share/xray` on the child ONLY if the env var is unset AND that directory exists; pure helper `asset_dir_override(env_set: bool, dir_exists: bool) -> Option<&'static str>` for the decision
-- [ ] `sh -n install.sh` + `shellcheck install.sh` clean
-- [ ] write tests: `asset_dir_override` truth table (4 cases)
-- [ ] run tests — must pass before task 9
+- [x] install.sh xray step: also extract `geoip.dat` and `geosite.dat` from the Xray zip and install (0644) to `/usr/local/share/xray/` (same sudo-only-when-needed logic; failure → warning + manual hint, not fatal, since brew setups don't need it)
+- [x] `src/xray.rs::start`: when spawning xray, set `XRAY_LOCATION_ASSET=/usr/local/share/xray` on the child ONLY if the env var is unset AND that directory exists; pure helper `asset_dir_override(env_set: bool, dir_exists: bool) -> Option<&'static str>` for the decision
+- [x] `sh -n install.sh` + `shellcheck install.sh` clean
+- [x] write tests: `asset_dir_override` truth table (4 cases)
+- [x] run tests — must pass before task 9
 
 ### Task 9: Verify acceptance criteria
 
@@ -186,6 +186,8 @@ Plus a prerequisite fix: `install.sh` installs only the xray binary, but `geosit
 - [ ] README.md: note that merged direct rules are baked at `start`/`restart` time — `reload` keeps the last-generated config (deferred from Task 7)
 - [ ] CLAUDE.md: new keys in the corvex.json example, `happ.rs` in the architecture listing, subscription.rs description update
 - [ ] move this plan to `docs/plans/completed/`
+
+➕ (discovered in Task 7 review, pre-existing, OUT OF SCOPE for this plan) switching AWG→Xray with a stale AWG-mode `config.json` on disk makes `apply_to_config` fail with "no proxy outbound found" — identical behavior before and after this work; candidate for a future bug-fix plan.
 
 ## Post-Completion
 
