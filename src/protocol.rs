@@ -929,13 +929,11 @@ pub fn apply_to_config(
         })
         .context("no proxy outbound found in config")?;
 
-    // Preserve existing tag if new params have no name
+    // Tag must match what the routing rules are built with (name or the
+    // "proxy" fallback) — preserving a stale tag from a previous named run
+    // would leave proxy-traffic rules pointing at a nonexistent outbound.
     let tag = if params.name.is_empty() {
-        outbounds[idx]
-            .get("tag")
-            .and_then(|t| t.as_str())
-            .unwrap_or("proxy")
-            .to_string()
+        "proxy".to_string()
     } else {
         params.name.clone()
     };
@@ -1485,12 +1483,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_to_config_preserves_tag_when_name_empty() {
+    fn apply_to_config_resets_stale_tag_when_name_empty() {
+        // A stale named tag from a previous run must be replaced with the
+        // "proxy" fallback — routing rules for an unnamed server are built
+        // with "proxy", and a preserved stale tag would leave them pointing
+        // at a nonexistent outbound.
         let config_json = serde_json::json!({
             "inbounds": [],
             "outbounds": [{
                 "protocol": "vless",
-                "tag": "keep-this-tag",
+                "tag": "stale-named-tag",
                 "settings": {"vnext": [{"address": "h", "port": 1, "users": [{"id": "u"}]}]},
                 "streamSettings": {"network": "tcp", "security": ""}
             }]
@@ -1509,13 +1511,13 @@ mod tests {
         params.host = "new.host".to_string();
         params.port = 443;
         params.uuid = "new-uuid".to_string();
-        // name is empty — should preserve existing tag
+        // name is empty — tag must become the "proxy" fallback
 
         apply_to_config(&params, tmpfile.path(), &XrayLogConfig::default()).unwrap();
 
         let updated: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(tmpfile.path()).unwrap()).unwrap();
-        assert_eq!(updated["outbounds"][0]["tag"], "keep-this-tag");
+        assert_eq!(updated["outbounds"][0]["tag"], "proxy");
     }
 
     #[test]
