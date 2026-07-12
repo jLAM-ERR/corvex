@@ -18,20 +18,38 @@ xray_manual_hint() {
   printf 'Manual install: download the Xray release for your platform from https://github.com/%s/releases/latest, extract the archive, and copy the "xray" binary into your PATH (e.g. %s).\n' "$XRAY_REPO" "$INSTALL_DIR" >&2
 }
 
+unsupported_platform() {
+  err "unsupported platform: $1"
+  err "Build from source instead: cargo build --release (see README)"
+  exit 1
+}
+
+require_sudo() {
+  hint="$1"
+  if ! command -v sudo >/dev/null 2>&1; then
+    err "sudo is required to write to ${INSTALL_DIR} but was not found"
+    "$hint"
+    exit 1
+  fi
+}
+
 install_binary() {
   src="$1"
   name="$2"
+  hint="$3"
   dest="${INSTALL_DIR}/${name}"
   if [ ! -d "$INSTALL_DIR" ]; then
     if [ -w "$(dirname "$INSTALL_DIR")" ]; then
       mkdir -p "$INSTALL_DIR"
     else
+      require_sudo "$hint"
       sudo mkdir -p "$INSTALL_DIR"
     fi
   fi
   if [ -w "$INSTALL_DIR" ]; then
     install -m 755 "$src" "$dest"
   else
+    require_sudo "$hint"
     echo "Root privileges are required to write to ${INSTALL_DIR}; requesting sudo..." >&2
     sudo install -m 755 "$src" "$dest"
   fi
@@ -45,31 +63,17 @@ case "$OS" in
     case "$ARCH" in
       arm64) XRAY_ASSET="Xray-macos-arm64-v8a.zip" ;;
       x86_64) XRAY_ASSET="Xray-macos-64.zip" ;;
-      *)
-        err "unsupported macOS architecture: ${ARCH} (corvex install.sh supports arm64 and x86_64)"
-        corvex_manual_hint
-        exit 1
-        ;;
+      *) unsupported_platform "macOS architecture ${ARCH} (corvex install.sh supports arm64 and x86_64)" ;;
     esac
     ;;
   Linux)
     case "$ARCH" in
       x86_64) XRAY_ASSET="Xray-linux-64.zip" ;;
-      aarch64|arm64)
-        err "Linux aarch64 is not supported: corvex does not publish an aarch64 Linux build"
-        err "Build from source instead: cargo build --release (see README)"
-        exit 1
-        ;;
-      *)
-        err "unsupported Linux architecture: ${ARCH} (corvex install.sh supports x86_64 only)"
-        exit 1
-        ;;
+      aarch64|arm64) unsupported_platform "Linux aarch64 (corvex does not publish an aarch64 Linux build)" ;;
+      *) unsupported_platform "Linux architecture ${ARCH} (corvex install.sh supports x86_64 only)" ;;
     esac
     ;;
-  *)
-    err "unsupported operating system: ${OS} (corvex install.sh supports macOS and Linux only)"
-    exit 1
-    ;;
+  *) unsupported_platform "operating system ${OS} (corvex install.sh supports macOS and Linux only)" ;;
 esac
 
 WORKDIR="$(mktemp -d)"
@@ -126,7 +130,11 @@ esac ); then
 fi
 
 echo "Extracting ${CORVEX_ASSET}..."
-tar -xzf "${WORKDIR}/${CORVEX_ASSET}" -C "$WORKDIR"
+if ! tar -xzf "${WORKDIR}/${CORVEX_ASSET}" -C "$WORKDIR"; then
+  err "failed to extract ${CORVEX_ASSET}"
+  corvex_manual_hint
+  exit 1
+fi
 
 CORVEX_BIN="${WORKDIR}/${CORVEX_ASSET%.tar.gz}/corvex"
 if [ ! -f "$CORVEX_BIN" ]; then
@@ -135,7 +143,7 @@ if [ ! -f "$CORVEX_BIN" ]; then
   exit 1
 fi
 
-install_binary "$CORVEX_BIN" "corvex"
+install_binary "$CORVEX_BIN" "corvex" corvex_manual_hint
 echo "corvex installed to ${INSTALL_DIR}/corvex (${TAG})"
 
 if command -v xray >/dev/null 2>&1; then
@@ -159,7 +167,11 @@ else
   echo "Extracting ${XRAY_ASSET}..."
   XRAY_EXTRACT_DIR="${WORKDIR}/xray-extract"
   mkdir -p "$XRAY_EXTRACT_DIR"
-  unzip -q -o "${WORKDIR}/${XRAY_ASSET}" -d "$XRAY_EXTRACT_DIR"
+  if ! unzip -q -o "${WORKDIR}/${XRAY_ASSET}" -d "$XRAY_EXTRACT_DIR"; then
+    err "failed to extract ${XRAY_ASSET}"
+    xray_manual_hint
+    exit 1
+  fi
 
   XRAY_BIN="${XRAY_EXTRACT_DIR}/xray"
   if [ ! -f "$XRAY_BIN" ]; then
@@ -168,6 +180,6 @@ else
     exit 1
   fi
 
-  install_binary "$XRAY_BIN" "xray"
+  install_binary "$XRAY_BIN" "xray" xray_manual_hint
   echo "xray installed to ${INSTALL_DIR}/xray"
 fi
