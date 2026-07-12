@@ -28,8 +28,6 @@ pub struct ProxySettings {
 
 #[derive(Debug, Deserialize)]
 pub struct RoutesSettings {
-    #[serde(rename = "direct-ru")]
-    pub direct_ru: Option<bool>,
     #[serde(rename = "proxy-traffic")]
     pub proxy_traffic: Option<Vec<String>>,
     #[serde(rename = "corporate-traffic")]
@@ -68,7 +66,20 @@ pub fn load(path: &Path) -> anyhow::Result<CorvexSettings> {
         .with_context(|| format!("failed to strip comments from {}", path.display()))?;
     let settings: CorvexSettings = serde_json::from_str(&buf)
         .with_context(|| format!("failed to parse {}", path.display()))?;
+    warn_on_leftover_direct_ru(&buf);
     Ok(settings)
+}
+
+/// `routes.direct-ru` was removed; warn (don't fail) if a config still has it,
+/// so users notice it no longer does anything.
+fn warn_on_leftover_direct_ru(buf: &str) {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(buf) {
+        if value.pointer("/routes/direct-ru").is_some() {
+            log::warn!(
+                "the \"direct-ru\" setting was removed — route .ru directly via routes.corporate-traffic or a subscription's direct rules (merge-subs)"
+            );
+        }
+    }
 }
 
 pub fn xdg_settings_path() -> PathBuf {
@@ -109,7 +120,6 @@ mod tests {
                 "dev.corp": "10.0.0.2"
             },
             "routes": {
-                "direct-ru": true,
                 "proxy-traffic": ["example.com", "github.com"],
                 "corporate-traffic": ["corp.internal", "dev.corp"],
                 "merge-subs": true
@@ -148,7 +158,6 @@ mod tests {
         assert_eq!(dns.get("dev.corp").map(|s| s.as_str()), Some("10.0.0.2"));
 
         let routes = s.routes.unwrap();
-        assert_eq!(routes.direct_ru, Some(true));
         assert_eq!(routes.proxy_traffic.as_ref().unwrap().len(), 2);
         assert_eq!(
             routes.corporate_traffic.as_ref().unwrap()[0],
@@ -231,10 +240,23 @@ mod tests {
 
     #[test]
     fn load_merge_subs_absent_defaults_to_none() {
-        let json = r#"{"routes": {"direct-ru": true}}"#;
+        let json = r#"{"routes": {"proxy-traffic": ["example.com"]}}"#;
         let (_dir, path) = write_temp(json);
         let s = load(&path).unwrap();
         assert_eq!(s.routes.unwrap().merge_subs, None);
+    }
+
+    #[test]
+    fn load_leftover_direct_ru_key_still_parses() {
+        // "direct-ru" was removed; a config that still has it must not fail to
+        // load (a warning is logged, but that's not asserted here).
+        let json = r#"{"routes": {"direct-ru": true, "proxy-traffic": ["example.com"]}}"#;
+        let (_dir, path) = write_temp(json);
+        let s = load(&path).unwrap();
+        assert_eq!(
+            s.routes.unwrap().proxy_traffic.as_deref(),
+            Some(&["example.com".to_string()][..])
+        );
     }
 
     #[test]

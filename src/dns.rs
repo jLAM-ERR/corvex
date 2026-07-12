@@ -464,7 +464,6 @@ resolver #2
             &["corp.com".to_string()],
             &["ext.com".to_string()],
             "proxy",
-            true,
             &[],
             &[],
         );

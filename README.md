@@ -124,7 +124,6 @@ All settings live in a single JSONC file (comments allowed) at `$XDG_CONFIG_HOME
 
   // Routing rules
   "routes": {
-    "direct-ru": true,                               // Route .ru TLD directly (bypass proxy)
     "proxy-traffic": ["domain:youtube.com"],          // Force through proxy
     "corporate-traffic": ["domain:corp.example.com"], // Bypass proxy (direct)
     "merge-subs": false                               // Merge subscription's own direct-routing rules; SEE WARNING below; default off

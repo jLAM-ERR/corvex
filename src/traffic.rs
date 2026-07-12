@@ -67,7 +67,6 @@ pub fn build_routing_rules(
     ctraffic: &[String],
     ptraffic: &[String],
     proxy_tag: &str,
-    ru_direct: bool,
     subs_direct_domains: &[String],
     subs_direct_ips: &[String],
 ) -> Vec<serde_json::Value> {
@@ -107,14 +106,6 @@ pub fn build_routing_rules(
         rules.push(serde_json::json!({
             "outboundTag": proxy_tag,
             "domain": domains,
-        }));
-    }
-
-    if ru_direct {
-        rules.push(serde_json::json!({
-            "ruleTag": "ru-tld-direct",
-            "domain": ["regexp:\\.ru$"],
-            "outboundTag": "direct",
         }));
     }
 
@@ -158,7 +149,7 @@ mod tests {
     #[test]
     fn test_build_routing_rules_ctraffic_only() {
         let ct = vec!["corp.example.com".to_string()];
-        let rules = build_routing_rules(&ct, &[], "proxy", false, &[], &[]);
+        let rules = build_routing_rules(&ct, &[], "proxy", &[], &[]);
         assert_eq!(rules.len(), 2);
         assert_loopback_rule_first(&rules);
         assert_eq!(rules[1]["outboundTag"], "direct");
@@ -168,7 +159,7 @@ mod tests {
     #[test]
     fn test_build_routing_rules_ptraffic_only() {
         let pt = vec!["external.com".to_string()];
-        let rules = build_routing_rules(&[], &pt, "proxy-out", false, &[], &[]);
+        let rules = build_routing_rules(&[], &pt, "proxy-out", &[], &[]);
         assert_eq!(rules.len(), 2);
         assert_loopback_rule_first(&rules);
         assert_eq!(rules[1]["outboundTag"], "proxy-out");
@@ -179,7 +170,7 @@ mod tests {
     fn test_build_routing_rules_both() {
         let ct = vec!["corp.com".to_string()];
         let pt = vec!["ext.com".to_string()];
-        let rules = build_routing_rules(&ct, &pt, "proxy", false, &[], &[]);
+        let rules = build_routing_rules(&ct, &pt, "proxy", &[], &[]);
         assert_eq!(rules.len(), 3);
         assert_loopback_rule_first(&rules);
         assert_eq!(rules[1]["outboundTag"], "direct");
@@ -187,30 +178,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_routing_rules_with_ru_flag() {
-        let rules = build_routing_rules(&[], &[], "proxy", true, &[], &[]);
-        assert_eq!(rules.len(), 2);
-        assert_loopback_rule_first(&rules);
-        assert_eq!(rules[1]["ruleTag"], "ru-tld-direct");
-        assert_eq!(rules[1]["domain"][0], "regexp:\\.ru$");
-        assert_eq!(rules[1]["outboundTag"], "direct");
-    }
-
-    #[test]
-    fn test_build_routing_rules_both_with_ru() {
-        let ct = vec!["corp.com".to_string()];
-        let pt = vec!["ext.com".to_string()];
-        let rules = build_routing_rules(&ct, &pt, "proxy", true, &[], &[]);
-        assert_eq!(rules.len(), 4);
-        assert_loopback_rule_first(&rules);
-        assert_eq!(rules[1]["outboundTag"], "direct");
-        assert_eq!(rules[2]["outboundTag"], "proxy");
-        assert_eq!(rules[3]["ruleTag"], "ru-tld-direct");
-    }
-
-    #[test]
     fn test_build_routing_rules_always_emits_loopback_rule_first() {
-        let rules = build_routing_rules(&[], &[], "proxy", false, &[], &[]);
+        let rules = build_routing_rules(&[], &[], "proxy", &[], &[]);
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0]["ruleTag"], "loopback-and-private-direct");
         assert_eq!(rules[0]["outboundTag"], "direct");
@@ -225,7 +194,7 @@ mod tests {
 
     #[test]
     fn test_build_routing_rules_loopback_rule_uses_ip_field_not_domain() {
-        let rules = build_routing_rules(&[], &[], "proxy", false, &[], &[]);
+        let rules = build_routing_rules(&[], &[], "proxy", &[], &[]);
         assert!(rules[0].get("domain").is_none());
         assert!(rules[0]["ip"].is_array());
     }
@@ -234,7 +203,7 @@ mod tests {
     fn test_build_routing_rules_merge_dedup() {
         let ct = vec!["corp.com".to_string()];
         let subs_domains = vec!["corp.com".to_string(), "other.com".to_string()];
-        let rules = build_routing_rules(&ct, &[], "proxy", false, &subs_domains, &[]);
+        let rules = build_routing_rules(&ct, &[], "proxy", &subs_domains, &[]);
         assert_eq!(rules.len(), 2);
         assert_loopback_rule_first(&rules);
         let domains = rules[1]["domain"].as_array().unwrap();
@@ -247,7 +216,7 @@ mod tests {
     fn test_build_routing_rules_proxy_traffic_excludes_subs_direct_domain() {
         let pt = vec!["shared.com".to_string()];
         let subs_domains = vec!["shared.com".to_string(), "unique.com".to_string()];
-        let rules = build_routing_rules(&[], &pt, "proxy", false, &subs_domains, &[]);
+        let rules = build_routing_rules(&[], &pt, "proxy", &subs_domains, &[]);
         assert_eq!(rules.len(), 3);
         assert_loopback_rule_first(&rules);
         let direct_domains = rules[1]["domain"].as_array().unwrap();
@@ -260,7 +229,7 @@ mod tests {
     #[test]
     fn test_build_routing_rules_subs_direct_ip_filters_geoip_private() {
         let subs_ips = vec!["geoip:private".to_string(), "geoip:ru".to_string()];
-        let rules = build_routing_rules(&[], &[], "proxy", false, &[], &subs_ips);
+        let rules = build_routing_rules(&[], &[], "proxy", &[], &subs_ips);
         assert_eq!(rules.len(), 2);
         assert_loopback_rule_first(&rules);
         let ips = rules[1]["ip"].as_array().unwrap();
@@ -274,20 +243,19 @@ mod tests {
     fn test_build_routing_rules_subs_direct_ip_placed_right_after_loopback() {
         let ct = vec!["corp.com".to_string()];
         let subs_ips = vec!["geoip:ru".to_string()];
-        let rules = build_routing_rules(&ct, &[], "proxy", true, &[], &subs_ips);
-        assert_eq!(rules.len(), 4);
+        let rules = build_routing_rules(&ct, &[], "proxy", &[], &subs_ips);
+        assert_eq!(rules.len(), 3);
         assert_loopback_rule_first(&rules);
         assert_eq!(rules[1]["outboundTag"], "direct");
         assert_eq!(rules[1]["ip"][0], "geoip:ru");
         assert_eq!(rules[2]["outboundTag"], "direct");
         assert_eq!(rules[2]["domain"][0], "domain:corp.com");
-        assert_eq!(rules[3]["ruleTag"], "ru-tld-direct");
     }
 
     #[test]
     fn test_build_routing_rules_geosite_prefix_preserved_unnormalized() {
         let subs_domains = vec!["geosite:category-ru".to_string()];
-        let rules = build_routing_rules(&[], &[], "proxy", false, &subs_domains, &[]);
+        let rules = build_routing_rules(&[], &[], "proxy", &subs_domains, &[]);
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[1]["domain"][0], "geosite:category-ru");
     }
@@ -299,7 +267,7 @@ mod tests {
     fn test_build_routing_rules_ctraffic_ptraffic_overlap_stays_direct() {
         let ct = vec!["shared.com".to_string()];
         let pt = vec!["shared.com".to_string()];
-        let rules = build_routing_rules(&ct, &pt, "proxy", false, &[], &[]);
+        let rules = build_routing_rules(&ct, &pt, "proxy", &[], &[]);
         assert_eq!(rules.len(), 3);
         assert_loopback_rule_first(&rules);
         assert_eq!(rules[1]["outboundTag"], "direct");
@@ -312,7 +280,7 @@ mod tests {
     fn test_build_routing_rules_exclusion_ignores_prefix_mismatch_bare_ptraffic() {
         let pt = vec!["yandex.com".to_string()];
         let subs_domains = vec!["domain:yandex.com".to_string()];
-        let rules = build_routing_rules(&[], &pt, "proxy", false, &subs_domains, &[]);
+        let rules = build_routing_rules(&[], &pt, "proxy", &subs_domains, &[]);
         // subs domain excluded via normalized match -> no direct rule, only proxy rule
         assert_eq!(rules.len(), 2);
         assert_loopback_rule_first(&rules);
@@ -324,7 +292,7 @@ mod tests {
     fn test_build_routing_rules_exclusion_ignores_prefix_mismatch_prefixed_ptraffic() {
         let pt = vec!["domain:x.com".to_string()];
         let subs_domains = vec!["x.com".to_string()];
-        let rules = build_routing_rules(&[], &pt, "proxy", false, &subs_domains, &[]);
+        let rules = build_routing_rules(&[], &pt, "proxy", &subs_domains, &[]);
         assert_eq!(rules.len(), 2);
         assert_loopback_rule_first(&rules);
         assert_eq!(rules[1]["outboundTag"], "proxy");
@@ -334,7 +302,7 @@ mod tests {
     #[test]
     fn test_build_routing_rules_subs_direct_ip_geoip_private_filter_case_insensitive() {
         let subs_ips = vec!["GEOIP:PRIVATE".to_string(), "geoip:ru".to_string()];
-        let rules = build_routing_rules(&[], &[], "proxy", false, &[], &subs_ips);
+        let rules = build_routing_rules(&[], &[], "proxy", &[], &subs_ips);
         assert_eq!(rules.len(), 2);
         let ips = rules[1]["ip"].as_array().unwrap();
         assert_eq!(
@@ -346,7 +314,7 @@ mod tests {
     #[test]
     fn test_build_routing_rules_subs_direct_ip_dedup_case_insensitive() {
         let subs_ips = vec!["geoip:ru".to_string(), "GeoIP:RU".to_string()];
-        let rules = build_routing_rules(&[], &[], "proxy", false, &[], &subs_ips);
+        let rules = build_routing_rules(&[], &[], "proxy", &[], &subs_ips);
         let ips = rules[1]["ip"].as_array().unwrap();
         assert_eq!(ips.len(), 1);
         assert_eq!(ips[0], "geoip:ru");

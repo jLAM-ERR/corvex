@@ -152,7 +152,6 @@ enum StartSource {
 struct RoutingContext<'a> {
     corporate_traffic: &'a [String],
     proxy_traffic: &'a [String],
-    direct_ru: bool,
     log_config: &'a protocol::XrayLogConfig,
 }
 
@@ -214,7 +213,6 @@ fn start_xray_engine(
         routing.corporate_traffic,
         routing.proxy_traffic,
         proxy_tag,
-        routing.direct_ru,
         subs_direct_domains,
         subs_direct_ips,
     );
@@ -359,7 +357,6 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     };
 
     // 4. Extract routing settings (shared between both engine modes)
-    let direct_ru = s.routes.as_ref().and_then(|r| r.direct_ru).unwrap_or(false);
     let proxy_traffic: Vec<String> = s
         .routes
         .as_ref()
@@ -375,7 +372,6 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     let routing = RoutingContext {
         corporate_traffic: &corporate_traffic,
         proxy_traffic: &proxy_traffic,
-        direct_ru,
         log_config: &log_config,
     };
 
@@ -403,7 +399,6 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
                     &corporate_traffic,
                     &proxy_traffic,
                     "proxy",
-                    direct_ru,
                     &[],
                     &[],
                 );
@@ -813,7 +808,6 @@ mod tests {
             &["corp.com".to_string()],
             &["ext.com".to_string()],
             "proxy",
-            true,
             &[],
             &[],
         );
@@ -825,13 +819,12 @@ mod tests {
         );
 
         let r = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(r.len(), 4);
+        assert_eq!(r.len(), 3);
         assert_eq!(r[0]["ruleTag"], "loopback-and-private-direct");
         assert_eq!(r[1]["outboundTag"], "direct");
         assert_eq!(r[1]["domain"][0], "domain:corp.com");
         assert_eq!(r[2]["outboundTag"], "proxy");
         assert_eq!(r[2]["domain"][0], "domain:ext.com");
-        assert_eq!(r[3]["ruleTag"], "ru-tld-direct");
     }
 
     #[test]
@@ -909,7 +902,6 @@ mod tests {
             &["corp.com".to_string()],
             &["ext.com".to_string()],
             "proxy",
-            true,
             &[],
             &[],
         );
@@ -919,7 +911,7 @@ mod tests {
         assert_eq!(config["outbounds"][0]["protocol"], "vless");
         assert_eq!(config["log"]["loglevel"], "warning");
         let r = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(r.len(), 4);
+        assert_eq!(r.len(), 3);
         assert_eq!(r[0]["ruleTag"], "loopback-and-private-direct");
     }
 
@@ -927,13 +919,11 @@ mod tests {
     fn test_routing_rules_from_settings_values() {
         let corporate = vec!["corp.internal".to_string(), "dev.corp".to_string()];
         let proxy = vec!["example.com".to_string()];
-        let rules =
-            crate::traffic::build_routing_rules(&corporate, &proxy, "proxy", true, &[], &[]);
-        assert_eq!(rules.len(), 4);
+        let rules = crate::traffic::build_routing_rules(&corporate, &proxy, "proxy", &[], &[]);
+        assert_eq!(rules.len(), 3);
         assert_eq!(rules[0]["ruleTag"], "loopback-and-private-direct");
         assert_eq!(rules[1]["outboundTag"], "direct");
         assert_eq!(rules[2]["outboundTag"], "proxy");
-        assert_eq!(rules[3]["ruleTag"], "ru-tld-direct");
     }
 
     #[test]

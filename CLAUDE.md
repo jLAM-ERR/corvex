@@ -43,7 +43,6 @@ All configuration is in a single JSONC file at `$XDG_CONFIG_HOME/corvex/corvex.j
   "proxy": { "port": 21080 },                   // REQUIRED: static proxy port
   "corporate-dns": { "corp.com": "10.0.0.1" },  // Domain -> nameserver mappings
   "routes": {
-    "direct-ru": true,                           // Route .ru TLD directly
     "proxy-traffic": ["domain:ext.com"],         // Force through proxy
     "corporate-traffic": ["domain:corp.com"],    // Bypass proxy (direct)
     "merge-subs": false                          // Merge the subscription's direct rules into routing; default off, security-sensitive (see README)
