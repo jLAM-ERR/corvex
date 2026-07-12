@@ -80,12 +80,12 @@ Docs must highlight everywhere: **xray is the default engine; AmneziaWG is an op
 **Files:**
 - Create: `install.sh`
 
-- [ ] platform detection (`uname -s` / `uname -m`) with clear unsupported-platform error (incl. Linux aarch64 — no corvex build for it)
-- [ ] corvex install: API tag query (`curl` + `sed`, no jq), download versioned tar.gz + `.sha256`, verify checksum, `install -m 755` to `/usr/local/bin` (sudo fallback only when not writable)
-- [ ] ⚠️ checksum gotcha: the published `.sha256` embeds the bare archive filename (`shasum`/`sha256sum` output) — download the tarball under exactly that name in the same directory or `-c` verification fails
-- [ ] xray dependency: skip when `command -v xray` succeeds; otherwise download per-platform zip from `releases/latest/download/`, unzip (polite error if `unzip` missing), install alongside corvex
-- [ ] `mktemp -d` workdir + `trap` cleanup; every failure path prints a manual-install hint
-- [ ] syntax check `sh -n install.sh` (+ `shellcheck install.sh` if installed) — must pass before task 2
+- [x] platform detection (`uname -s` / `uname -m`) with clear unsupported-platform error (incl. Linux aarch64 — no corvex build for it)
+- [x] corvex install: API tag query (`curl` + `sed`, no jq), download versioned tar.gz + `.sha256`, verify checksum, `install -m 755` to `/usr/local/bin` (sudo fallback only when not writable)
+- [x] ⚠️ checksum gotcha: the published `.sha256` embeds the bare archive filename (`shasum`/`sha256sum` output) — download the tarball under exactly that name in the same directory or `-c` verification fails
+- [x] xray dependency: skip when `command -v xray` succeeds; otherwise download per-platform zip from `releases/latest/download/`, unzip (polite error if `unzip` missing), install alongside corvex
+- [x] `mktemp -d` workdir + `trap` cleanup; every failure path prints a manual-install hint
+- [x] syntax check `sh -n install.sh` (+ `shellcheck install.sh` if installed) — must pass before task 2
 
 ### Task 2: Simplify xray presence check (delete auto-install)
 
