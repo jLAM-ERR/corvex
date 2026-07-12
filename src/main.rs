@@ -39,6 +39,8 @@ enum Commands {
     Reload,
     /// Show xray process, ports, and proxy settings
     Status,
+    /// Restart xray and re-apply system proxy (full stop + start)
+    Restart,
     /// Show xray log
     Logs {
         /// Follow log output (like tail -f)
@@ -102,6 +104,7 @@ fn run() -> anyhow::Result<()> {
         Commands::Stop => cmd_stop(&config, &plat),
         Commands::Reload => cmd_reload(&config),
         Commands::Status => cmd_status(&config, &plat),
+        Commands::Restart => cmd_start(&config, &plat),
         Commands::Logs { follow } => cmd_logs(&config, follow),
     }
 }
@@ -139,6 +142,9 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
             "corvex.json must contain \"proxy.port\" (e.g., {{\"proxy\":{{\"port\":21080}}}})"
         ),
     };
+
+    // Fail fast on a missing xray binary, before the subscription flow spawns it
+    xray::ensure_installed(&config.xray_bin)?;
 
     // 3. Resolve URI (direct or from subscriptions)
     let resolved_uri = if let Some(ref uri) = s.uri {
@@ -204,6 +210,9 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         .and_then(|r| r.corporate_traffic.clone())
         .unwrap_or_default();
     let log_config = build_xray_log_config(&s);
+
+    // Stop a stale AWG tunnel from a previous engine mode before starting fresh
+    stop_awg_if_running(config);
 
     // 5. Branch on engine mode
     match detect_engine_mode(&resolved_uri) {
@@ -439,14 +448,8 @@ fn update_config_port(config_path: &std::path::Path, port: u16) -> anyhow::Resul
     Ok(())
 }
 
-fn cmd_stop(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
-    debug!("disabling system proxy");
-    let service = plat.detect_active_service()?;
-    let proxy_result = plat.disable_proxy(&service);
-    debug!("stopping xray process");
-    let xray_result = xray::stop(config);
-
-    // Stop AWG tunnel if running (don't let path errors swallow proxy/xray results)
+/// Stop the AWG tunnel if one is running (no-op otherwise).
+fn stop_awg_if_running(config: &Config) {
     if let Ok(awg_conf_path) = config.awg_conf_path() {
         let iface = engine::awg::conf_interface_name(&awg_conf_path);
         if engine::awg::is_tunnel_running(&iface) {
@@ -458,6 +461,17 @@ fn cmd_stop(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
             }
         }
     }
+}
+
+fn cmd_stop(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
+    debug!("disabling system proxy");
+    let service = plat.detect_active_service()?;
+    let proxy_result = plat.disable_proxy(&service);
+    debug!("stopping xray process");
+    let xray_result = xray::stop(config);
+
+    // Don't let path errors swallow proxy/xray results
+    stop_awg_if_running(config);
 
     proxy_result?;
     xray_result?;
@@ -662,6 +676,18 @@ mod tests {
     fn test_start_command_no_args() {
         let cli = Cli::try_parse_from(["corvex", "start"]).unwrap();
         assert!(matches!(cli.command, super::Commands::Start));
+    }
+
+    #[test]
+    fn test_restart_command_parses() {
+        let cli = Cli::try_parse_from(["corvex", "restart"]).unwrap();
+        assert!(matches!(cli.command, super::Commands::Restart));
+    }
+
+    #[test]
+    fn test_unknown_command_rejected() {
+        let result = Cli::try_parse_from(["corvex", "bogus-command"]);
+        assert!(result.is_err());
     }
 
     #[test]

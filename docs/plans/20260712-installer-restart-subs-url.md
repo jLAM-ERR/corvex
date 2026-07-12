@@ -115,15 +115,15 @@ Docs must highlight everywhere: **xray is the default engine; AmneziaWG is an op
 **Files:**
 - Modify: `src/main.rs`
 
-- [ ] ➕ (discovered in Task 2 review, pre-existing) call `xray::ensure_installed` early in `cmd_start` — before the subscription health checks (`main.rs:181` spawns the xray binary via `health::find_alive_server` before the current `ensure_installed` call sites) — so a missing xray yields `XRAY_NOT_INSTALLED_MSG` instead of a raw spawn error
-- [ ] add `Restart` variant to `Commands` enum with help text "Restart xray and re-apply system proxy (full stop + start)"
-- [ ] dispatch `Commands::Restart => cmd_start(&config, &plat)` in `run()`
-- [ ] extract the AWG-tunnel stop block from `cmd_stop` (`main.rs:449-460`) into `fn stop_awg_if_running(config: &Config)` and call it from `cmd_stop`
-- [ ] call `stop_awg_if_running` in `cmd_start` BEFORE the `match detect_engine_mode(...)` branch (`main.rs:209`) — ⚠️ NOT in `main_algorithm`, which runs after `start_tunnel` in the AWG branch and would kill the fresh tunnel
-- [ ] ⚠️ note: the AWG pre-stop has no automated test (`stop_awg_if_running` wraps system calls) — the AWG→xray and AWG→AWG manual smoke tests in Post-Completion are the guard
-- [ ] write CLI parse test: `corvex restart` → `Commands::Restart` (alongside existing parse tests at `main.rs:664+`)
-- [ ] write parse test for error case: unknown command still rejected
-- [ ] run tests — must pass before task 5
+- [x] ➕ (discovered in Task 2 review, pre-existing) call `xray::ensure_installed` early in `cmd_start` — before the subscription health checks (`main.rs:181` spawns the xray binary via `health::find_alive_server` before the current `ensure_installed` call sites) — so a missing xray yields `XRAY_NOT_INSTALLED_MSG` instead of a raw spawn error
+- [x] add `Restart` variant to `Commands` enum with help text "Restart xray and re-apply system proxy (full stop + start)"
+- [x] dispatch `Commands::Restart => cmd_start(&config, &plat)` in `run()`
+- [x] extract the AWG-tunnel stop block from `cmd_stop` (`main.rs:449-460`) into `fn stop_awg_if_running(config: &Config)` and call it from `cmd_stop`
+- [x] call `stop_awg_if_running` in `cmd_start` BEFORE the `match detect_engine_mode(...)` branch (`main.rs:209`) — ⚠️ NOT in `main_algorithm`, which runs after `start_tunnel` in the AWG branch and would kill the fresh tunnel
+- [x] ⚠️ note: the AWG pre-stop has no automated test (`stop_awg_if_running` wraps system calls) — the AWG→xray and AWG→AWG manual smoke tests in Post-Completion are the guard
+- [x] write CLI parse test: `corvex restart` → `Commands::Restart` (alongside existing parse tests at `main.rs:664+`)
+- [x] write parse test for error case: unknown command still rejected
+- [x] run tests — must pass before task 5
 
 ### Task 5: Rename `file-url` to `subs-url` with legacy alias
 
