@@ -178,8 +178,52 @@ fi
 install_binary "$CORVEX_BIN" "corvex" corvex_manual_hint
 echo "corvex installed to ${INSTALL_DIR}/corvex (${TAG})"
 
+XRAY_EXTRACT_DIR="${WORKDIR}/xray-extract"
+
+# Download + extract the Xray release zip into $XRAY_EXTRACT_DIR (idempotent per run).
+fetch_xray_archive() {
+  [ -f "${XRAY_EXTRACT_DIR}/.fetched" ] && return 0
+  XRAY_URL="https://github.com/${XRAY_REPO}/releases/latest/download/${XRAY_ASSET}"
+  echo "Downloading xray archive (${XRAY_ASSET})..."
+  curl -fsSL -o "${WORKDIR}/${XRAY_ASSET}" "$XRAY_URL" || return 1
+  mkdir -p "$XRAY_EXTRACT_DIR" || return 1
+  unzip -q -o "${WORKDIR}/${XRAY_ASSET}" -d "$XRAY_EXTRACT_DIR" || return 1
+  touch "${XRAY_EXTRACT_DIR}/.fetched" || return 1
+}
+
+geo_files_present() {
+  [ -f "${GEO_ASSET_DIR}/geoip.dat" ] && [ -f "${GEO_ASSET_DIR}/geosite.dat" ]
+}
+
+# Best-effort geo data install from an already-fetched archive; warns, never exits.
+install_geo_data() {
+  GEOIP_FILE="${XRAY_EXTRACT_DIR}/geoip.dat"
+  GEOSITE_FILE="${XRAY_EXTRACT_DIR}/geosite.dat"
+  if [ -f "$GEOIP_FILE" ] && [ -f "$GEOSITE_FILE" ] \
+    && install_dat_file "$GEOIP_FILE" "geoip.dat" \
+    && install_dat_file "$GEOSITE_FILE" "geosite.dat"; then
+    echo "geo data files installed to ${GEO_ASSET_DIR}"
+  else
+    warn "failed to install geoip.dat/geosite.dat to ${GEO_ASSET_DIR} (geosite:/geoip: routing rules need XRAY_LOCATION_ASSET set some other way)"
+    xray_dat_manual_hint
+  fi
+}
+
 if command -v xray >/dev/null 2>&1; then
-  echo "xray already installed at $(command -v xray); skipping."
+  echo "xray already installed at $(command -v xray); skipping binary install."
+  # Earlier installer versions did not ship geo data files — top them up when missing.
+  if ! geo_files_present; then
+    echo "Geo data files missing from ${GEO_ASSET_DIR}; installing (geoip.dat, geosite.dat)..."
+    if ! command -v unzip >/dev/null 2>&1; then
+      warn "unzip not found — cannot extract geo data files"
+      xray_dat_manual_hint
+    elif ! fetch_xray_archive; then
+      warn "failed to download or extract ${XRAY_ASSET} for geo data files"
+      xray_dat_manual_hint
+    else
+      install_geo_data
+    fi
+  fi
 else
   if ! command -v unzip >/dev/null 2>&1; then
     err "unzip is required to install xray but was not found"
@@ -188,19 +232,8 @@ else
     exit 1
   fi
 
-  XRAY_URL="https://github.com/${XRAY_REPO}/releases/latest/download/${XRAY_ASSET}"
-  echo "Downloading xray (${XRAY_ASSET})..."
-  if ! curl -fsSL -o "${WORKDIR}/${XRAY_ASSET}" "$XRAY_URL"; then
-    err "failed to download ${XRAY_ASSET} from ${XRAY_URL}"
-    xray_manual_hint
-    exit 1
-  fi
-
-  echo "Extracting ${XRAY_ASSET}..."
-  XRAY_EXTRACT_DIR="${WORKDIR}/xray-extract"
-  mkdir -p "$XRAY_EXTRACT_DIR"
-  if ! unzip -q -o "${WORKDIR}/${XRAY_ASSET}" -d "$XRAY_EXTRACT_DIR"; then
-    err "failed to extract ${XRAY_ASSET}"
+  if ! fetch_xray_archive; then
+    err "failed to download or extract ${XRAY_ASSET}"
     xray_manual_hint
     exit 1
   fi
@@ -216,14 +249,5 @@ else
   echo "xray installed to ${INSTALL_DIR}/xray"
 
   echo "Installing geo data files (geoip.dat, geosite.dat)..."
-  GEOIP_FILE="${XRAY_EXTRACT_DIR}/geoip.dat"
-  GEOSITE_FILE="${XRAY_EXTRACT_DIR}/geosite.dat"
-  if [ -f "$GEOIP_FILE" ] && [ -f "$GEOSITE_FILE" ] \
-    && install_dat_file "$GEOIP_FILE" "geoip.dat" \
-    && install_dat_file "$GEOSITE_FILE" "geosite.dat"; then
-    echo "geo data files installed to ${GEO_ASSET_DIR}"
-  else
-    warn "failed to install geoip.dat/geosite.dat to ${GEO_ASSET_DIR} (geosite:/geoip: routing rules need XRAY_LOCATION_ASSET set some other way)"
-    xray_dat_manual_hint
-  fi
+  install_geo_data
 fi
