@@ -20,7 +20,11 @@ use std::io::Write;
 use std::process::{self, Command};
 
 #[derive(Parser)]
-#[command(name = "corvex", about = "Manage Xray VPN proxy and system proxy")]
+#[command(
+    name = "corvex",
+    version,
+    about = "Manage Xray VPN proxy and system proxy"
+)]
 struct Cli {
     /// Path to corvex.json settings file (overrides default)
     #[arg(long = "settings", global = true)]
