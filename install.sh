@@ -15,6 +15,20 @@ warn() {
   printf 'Warning: %s\n' "$1" >&2
 }
 
+# curl with retries: a single TLS handshake timeout must not abort the whole
+# install (shell loop instead of --retry-all-errors, which needs curl >= 7.71).
+fetch() {
+  _fetch_attempt=1
+  while ! curl -fsSL --connect-timeout 15 "$@"; do
+    if [ "$_fetch_attempt" -ge 3 ]; then
+      return 1
+    fi
+    warn "download failed (attempt ${_fetch_attempt}/3), retrying in 2s..."
+    _fetch_attempt=$((_fetch_attempt + 1))
+    sleep 2
+  done
+}
+
 corvex_manual_hint() {
   printf 'Manual install: download the corvex release for your platform from https://github.com/%s/releases/latest, extract the archive, and copy the "corvex" binary into your PATH (e.g. %s).\n' "$CORVEX_REPO" "$INSTALL_DIR" >&2
 }
@@ -113,13 +127,15 @@ trap 'rm -rf "$WORKDIR"' EXIT
 
 echo "Fetching latest corvex release info..."
 API_URL="https://api.github.com/repos/${CORVEX_REPO}/releases/latest"
-if ! API_RESPONSE="$(curl -fsSL "$API_URL")"; then
+# download to a file rather than a variable: a retried attempt would append to
+# partial output captured from the failed one
+if ! fetch -o "${WORKDIR}/release.json" "$API_URL"; then
   err "failed to reach GitHub API for ${CORVEX_REPO}"
   corvex_manual_hint
   exit 1
 fi
 
-TAG="$(printf '%s\n' "$API_RESPONSE" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)"
+TAG="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "${WORKDIR}/release.json" | head -n 1)"
 if [ -z "$TAG" ]; then
   err "could not determine latest corvex release tag"
   corvex_manual_hint
@@ -135,7 +151,7 @@ esac
 CORVEX_URL="https://github.com/${CORVEX_REPO}/releases/download/${TAG}/${CORVEX_ASSET}"
 
 echo "Downloading ${CORVEX_ASSET} (${TAG})..."
-if ! curl -fsSL -o "${WORKDIR}/${CORVEX_ASSET}" "$CORVEX_URL"; then
+if ! fetch -o "${WORKDIR}/${CORVEX_ASSET}" "$CORVEX_URL"; then
   err "failed to download ${CORVEX_ASSET} from ${CORVEX_URL}"
   if [ "$OS" = "Linux" ]; then
     err "Linux binaries are published starting v0.6.0. If ${TAG} predates that, build from source instead: cargo build --release (see README)."
@@ -144,7 +160,8 @@ if ! curl -fsSL -o "${WORKDIR}/${CORVEX_ASSET}" "$CORVEX_URL"; then
   exit 1
 fi
 
-if ! curl -fsSL -o "${WORKDIR}/${CORVEX_ASSET}.sha256" "${CORVEX_URL}.sha256"; then
+echo "Downloading checksum file ${CORVEX_ASSET}.sha256..."
+if ! fetch -o "${WORKDIR}/${CORVEX_ASSET}.sha256" "${CORVEX_URL}.sha256"; then
   err "failed to download checksum file ${CORVEX_ASSET}.sha256"
   corvex_manual_hint
   exit 1
@@ -185,7 +202,7 @@ fetch_xray_archive() {
   [ -f "${XRAY_EXTRACT_DIR}/.fetched" ] && return 0
   XRAY_URL="https://github.com/${XRAY_REPO}/releases/latest/download/${XRAY_ASSET}"
   echo "Downloading xray archive (${XRAY_ASSET})..."
-  curl -fsSL -o "${WORKDIR}/${XRAY_ASSET}" "$XRAY_URL" || return 1
+  fetch -o "${WORKDIR}/${XRAY_ASSET}" "$XRAY_URL" || return 1
   mkdir -p "$XRAY_EXTRACT_DIR" || return 1
   unzip -q -o "${WORKDIR}/${XRAY_ASSET}" -d "$XRAY_EXTRACT_DIR" || return 1
   touch "${XRAY_EXTRACT_DIR}/.fetched" || return 1

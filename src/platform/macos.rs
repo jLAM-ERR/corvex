@@ -18,19 +18,35 @@ fn run_networksetup(args: &[&str]) -> Result<String> {
         .output()
         .with_context(|| format!("Failed to run: networksetup {}", args.join(" ")))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if is_admin_required_error(&stderr) {
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // networksetup reports errors inconsistently across macOS versions:
+    // sometimes on stderr, sometimes on stdout (e.g. "** Error: Command
+    // requires admin privileges."), and not always with a failing exit code.
+    if !output.status.success() || stdout.contains("** Error") {
+        let detail = join_output(&stdout, &stderr);
+        if is_admin_required_error(&detail) {
             debug!(
                 "admin required for networksetup {}, escalating via osascript",
                 args.join(" ")
             );
             return run_networksetup_elevated(args);
         }
-        anyhow::bail!("networksetup {} failed: {}", args.join(" "), stderr);
+        anyhow::bail!("networksetup {} failed: {}", args.join(" "), detail);
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(stdout)
+}
+
+/// Combine stdout and stderr into one error detail string.
+fn join_output(stdout: &str, stderr: &str) -> String {
+    [stdout.trim(), stderr.trim()]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn run_networksetup_elevated(args: &[&str]) -> Result<String> {
@@ -51,7 +67,7 @@ fn run_networksetup_elevated(args: &[&str]) -> Result<String> {
         anyhow::bail!(
             "networksetup {} failed (elevated): {}",
             args.join(" "),
-            stderr
+            join_output(&String::from_utf8_lossy(&output.stdout), &stderr)
         );
     }
 
@@ -359,6 +375,22 @@ mod tests {
     #[test]
     fn admin_required_negative() {
         assert!(!is_admin_required_error("some other error"));
+    }
+
+    /// networksetup on newer macOS prints the admin error to stdout with the
+    /// exact text below; detection must work on the combined output.
+    #[test]
+    fn admin_required_stdout_variant() {
+        let detail = join_output("** Error: Command requires admin privileges.\n", "");
+        assert!(is_admin_required_error(&detail));
+    }
+
+    #[test]
+    fn join_output_both_streams() {
+        assert_eq!(join_output("out\n", "err\n"), "out err");
+        assert_eq!(join_output("", "err"), "err");
+        assert_eq!(join_output("out", ""), "out");
+        assert_eq!(join_output("", ""), "");
     }
 
     #[test]
