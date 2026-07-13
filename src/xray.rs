@@ -6,7 +6,6 @@ use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
 use nix::unistd::Pid;
 use std::fs;
-#[cfg(windows)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -38,8 +37,11 @@ pub fn resolve_binary(xray_bin: &str) -> Option<PathBuf> {
     resolve_from_path(xray_bin).or_else(|| resolve_from_common_locations(xray_bin))
 }
 
-/// Check if xray binary is installed; if not, install silently.
-/// On macOS: uses brew. On Windows: checks PATH and common install locations.
+/// Message shown when the xray binary cannot be found on the system.
+pub const XRAY_NOT_INSTALLED_MSG: &str =
+    "'xray' is not installed — run the corvex installer (install.sh) or see README";
+
+/// Check if the xray binary is installed; no side effects.
 pub fn ensure_installed(xray_bin: &str) -> Result<()> {
     debug!("checking if '{}' is installed", xray_bin);
 
@@ -48,50 +50,7 @@ pub fn ensure_installed(xray_bin: &str) -> Result<()> {
         return Ok(());
     }
 
-    #[cfg(unix)]
-    {
-        #[cfg(target_os = "macos")]
-        {
-            debug!("'{}' not found, installing via brew", xray_bin);
-            let brew_output = Command::new("brew")
-                .args(["install", "--quiet", "xray"])
-                .output()
-                .context("Failed to run 'brew install xray' - is Homebrew installed?")?;
-
-            if !brew_output.status.success() {
-                let stderr = String::from_utf8_lossy(&brew_output.stderr);
-                anyhow::bail!("brew install xray failed: {}", stderr.trim());
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            anyhow::bail!(
-                "'{}' not found in PATH. Install xray-core:\n\
-                 - Snap:   sudo snap install xray\n\
-                 - Manual: https://github.com/XTLS/Xray-core/releases",
-                xray_bin
-            );
-        }
-
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    {
-        debug!("'{}' not found, installing via winget", xray_bin);
-        let winget_output = Command::new("winget")
-            .args(["install", "--silent", "xray"])
-            .output()
-            .context("Failed to run 'winget install xray'")?;
-
-        if !winget_output.status.success() {
-            let stderr = String::from_utf8_lossy(&winget_output.stderr);
-            anyhow::bail!("winget install xray failed: {}", stderr.trim());
-        }
-
-        Ok(())
-    }
+    anyhow::bail!(XRAY_NOT_INSTALLED_MSG)
 }
 
 #[cfg(unix)]
@@ -289,6 +248,22 @@ fn is_process_alive(pid: i32) -> bool {
     }
 }
 
+/// Directory where install.sh places geoip.dat/geosite.dat for non-brew setups.
+const INSTALLED_ASSET_DIR: &str = "/usr/local/share/xray";
+
+/// Decide whether to override XRAY_LOCATION_ASSET for the spawned xray process.
+/// Only applies when the env var is unset AND both geoip.dat and geosite.dat
+/// are present in the installer-managed asset dir, so brew/manual installs
+/// that already manage their own geo assets are left untouched, and a
+/// partially-populated dir doesn't get pointed to.
+fn asset_dir_override(env_set: bool, both_dat_files_exist: bool) -> Option<&'static str> {
+    if !env_set && both_dat_files_exist {
+        Some(INSTALLED_ASSET_DIR)
+    } else {
+        None
+    }
+}
+
 /// Start the xray process.
 pub fn start(config: &Config) -> Result<i32> {
     if !config.xray_config.exists() {
@@ -320,11 +295,23 @@ pub fn start(config: &Config) -> Result<i32> {
         .try_clone()
         .context("Failed to clone log file handle")?;
 
-    let child = Command::new(&xray_bin)
-        .args(["run", "-c"])
+    let mut cmd = Command::new(&xray_bin);
+    cmd.args(["run", "-c"])
         .arg(&config.xray_config)
         .stdout(log_file)
-        .stderr(log_stderr)
+        .stderr(log_stderr);
+
+    let both_dat_files_exist = Path::new(INSTALLED_ASSET_DIR).join("geoip.dat").is_file()
+        && Path::new(INSTALLED_ASSET_DIR).join("geosite.dat").is_file();
+    if let Some(dir) = asset_dir_override(
+        std::env::var_os("XRAY_LOCATION_ASSET").is_some(),
+        both_dat_files_exist,
+    ) {
+        debug!("setting XRAY_LOCATION_ASSET={}", dir);
+        cmd.env("XRAY_LOCATION_ASSET", dir);
+    }
+
+    let child = cmd
         .spawn()
         .with_context(|| format!("Failed to spawn xray process via {}", xray_bin.display()))?;
 
@@ -462,5 +449,40 @@ mod tests {
         #[cfg(windows)]
         let result = ensure_installed("cmd");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ensure_installed_missing_binary_message() {
+        let result = ensure_installed("nonexistent_binary_xyz_999");
+        let err = result.expect_err("missing binary must error");
+        assert_eq!(err.to_string(), XRAY_NOT_INSTALLED_MSG);
+    }
+
+    #[test]
+    fn test_xray_not_installed_msg_mentions_install_sh() {
+        assert!(XRAY_NOT_INSTALLED_MSG.contains("install.sh"));
+    }
+
+    #[test]
+    fn test_asset_dir_override_env_unset_both_dat_files_exist() {
+        assert_eq!(
+            asset_dir_override(false, true),
+            Some("/usr/local/share/xray")
+        );
+    }
+
+    #[test]
+    fn test_asset_dir_override_env_unset_dat_files_missing() {
+        assert_eq!(asset_dir_override(false, false), None);
+    }
+
+    #[test]
+    fn test_asset_dir_override_env_set_both_dat_files_exist() {
+        assert_eq!(asset_dir_override(true, true), None);
+    }
+
+    #[test]
+    fn test_asset_dir_override_env_set_dat_files_missing() {
+        assert_eq!(asset_dir_override(true, false), None);
     }
 }

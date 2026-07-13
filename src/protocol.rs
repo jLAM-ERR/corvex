@@ -456,6 +456,293 @@ pub fn build_outbound_settings(params: &ProxyParams) -> serde_json::Value {
     }
 }
 
+/// Extract a u16 port from a JSON value that may be a number or a numeric string.
+fn extract_port(v: &serde_json::Value) -> Result<u16> {
+    match v {
+        serde_json::Value::Number(n) => {
+            let p = n.as_u64().context("port is not a valid number")?;
+            u16::try_from(p).context("port out of range (must be 0-65535)")
+        }
+        serde_json::Value::String(s) => s.parse().context("invalid port string"),
+        _ => bail!("port must be a number or string"),
+    }
+}
+
+/// Extract ProxyParams from an xray outbound JSON object (as found in
+/// JSON-array subscription entries). The read-side inverse of `build_outbound_settings` +
+/// `build_stream_settings`; some writer output is lossy and cannot be recovered
+/// exactly (see the grpc `multiMode` and tcp `header.type == "http"` handling below).
+pub fn params_from_outbound(outbound: &serde_json::Value, name: &str) -> Result<ProxyParams> {
+    let protocol = outbound
+        .get("protocol")
+        .and_then(|p| p.as_str())
+        .context("outbound missing 'protocol' field")?;
+
+    let mut params = default_params();
+    params.protocol = protocol.to_string();
+    params.name = name.to_string();
+
+    match protocol {
+        "vless" => {
+            let settings = outbound
+                .get("settings")
+                .context("vless outbound missing 'settings'")?;
+            let vnext = settings
+                .get("vnext")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .context("vless outbound missing settings.vnext[0]")?;
+            params.host = vnext
+                .get("address")
+                .and_then(|a| a.as_str())
+                .context("vless outbound missing vnext[0].address")?
+                .to_string();
+            params.port = extract_port(
+                vnext
+                    .get("port")
+                    .context("vless outbound missing vnext[0].port")?,
+            )
+            .context("vless outbound has invalid vnext[0].port")?;
+            let user = vnext
+                .get("users")
+                .and_then(|u| u.as_array())
+                .and_then(|a| a.first())
+                .context("vless outbound missing vnext[0].users[0]")?;
+            params.uuid = user
+                .get("id")
+                .and_then(|i| i.as_str())
+                .context("vless outbound missing users[0].id")?
+                .to_string();
+            params.encryption = user
+                .get("encryption")
+                .and_then(|e| e.as_str())
+                .unwrap_or("none")
+                .to_string();
+            params.flow = user
+                .get("flow")
+                .and_then(|f| f.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+        "vmess" => {
+            let settings = outbound
+                .get("settings")
+                .context("vmess outbound missing 'settings'")?;
+            let vnext = settings
+                .get("vnext")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .context("vmess outbound missing settings.vnext[0]")?;
+            params.host = vnext
+                .get("address")
+                .and_then(|a| a.as_str())
+                .context("vmess outbound missing vnext[0].address")?
+                .to_string();
+            params.port = extract_port(
+                vnext
+                    .get("port")
+                    .context("vmess outbound missing vnext[0].port")?,
+            )
+            .context("vmess outbound has invalid vnext[0].port")?;
+            let user = vnext
+                .get("users")
+                .and_then(|u| u.as_array())
+                .and_then(|a| a.first())
+                .context("vmess outbound missing vnext[0].users[0]")?;
+            params.uuid = user
+                .get("id")
+                .and_then(|i| i.as_str())
+                .context("vmess outbound missing users[0].id")?
+                .to_string();
+            params.alter_id = match user.get("alterId") {
+                Some(serde_json::Value::Number(n)) => n.as_u64().unwrap_or(0) as u32,
+                Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0),
+                _ => 0,
+            };
+            params.vmess_security = user
+                .get("security")
+                .and_then(|s| s.as_str())
+                .unwrap_or("auto")
+                .to_string();
+        }
+        "trojan" => {
+            let settings = outbound
+                .get("settings")
+                .context("trojan outbound missing 'settings'")?;
+            let server = settings
+                .get("servers")
+                .and_then(|s| s.as_array())
+                .and_then(|a| a.first())
+                .context("trojan outbound missing settings.servers[0]")?;
+            params.host = server
+                .get("address")
+                .and_then(|a| a.as_str())
+                .context("trojan outbound missing servers[0].address")?
+                .to_string();
+            params.port = extract_port(
+                server
+                    .get("port")
+                    .context("trojan outbound missing servers[0].port")?,
+            )
+            .context("trojan outbound has invalid servers[0].port")?;
+            params.password = server
+                .get("password")
+                .and_then(|p| p.as_str())
+                .context("trojan outbound missing servers[0].password")?
+                .to_string();
+        }
+        "shadowsocks" => {
+            let settings = outbound
+                .get("settings")
+                .context("shadowsocks outbound missing 'settings'")?;
+            let server = settings
+                .get("servers")
+                .and_then(|s| s.as_array())
+                .and_then(|a| a.first())
+                .context("shadowsocks outbound missing settings.servers[0]")?;
+            params.host = server
+                .get("address")
+                .and_then(|a| a.as_str())
+                .context("shadowsocks outbound missing servers[0].address")?
+                .to_string();
+            params.port = extract_port(
+                server
+                    .get("port")
+                    .context("shadowsocks outbound missing servers[0].port")?,
+            )
+            .context("shadowsocks outbound has invalid servers[0].port")?;
+            params.method = server
+                .get("method")
+                .and_then(|m| m.as_str())
+                .context("shadowsocks outbound missing servers[0].method")?
+                .to_string();
+            params.password = server
+                .get("password")
+                .and_then(|p| p.as_str())
+                .context("shadowsocks outbound missing servers[0].password")?
+                .to_string();
+        }
+        other => bail!("unsupported outbound protocol: {other}"),
+    }
+
+    let stream = outbound.get("streamSettings");
+    params.network = stream
+        .and_then(|s| s.get("network"))
+        .and_then(|n| n.as_str())
+        .unwrap_or("tcp")
+        .to_string();
+    params.security = stream
+        .and_then(|s| s.get("security"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if params.security == "reality" {
+        bail!("outbound uses REALITY security, which ProxyParams cannot represent");
+    }
+
+    let tls = stream.and_then(|s| s.get("tlsSettings"));
+    params.sni = tls
+        .and_then(|t| t.get("serverName"))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    params.fingerprint = tls
+        .and_then(|t| t.get("fingerprint"))
+        .and_then(|f| f.as_str())
+        .unwrap_or("")
+        .to_string();
+    params.alpn = tls
+        .and_then(|t| t.get("alpn"))
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    match params.network.as_str() {
+        "grpc" => {
+            let grpc = stream.and_then(|s| s.get("grpcSettings"));
+            params.service_name = grpc
+                .and_then(|g| g.get("serviceName"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            // multiMode:false and an absent key are the same to xray (Go zero
+            // value), so both collapse to mode="" — the original non-"multi"
+            // string (e.g. "gun") cannot be recovered.
+            params.mode = match grpc
+                .and_then(|g| g.get("multiMode"))
+                .and_then(|m| m.as_bool())
+            {
+                Some(true) => "multi".to_string(),
+                _ => String::new(),
+            };
+        }
+        "ws" => {
+            let ws = stream.and_then(|s| s.get("wsSettings"));
+            params.path = ws
+                .and_then(|w| w.get("path"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            params.host_header = ws
+                .and_then(|w| w.get("headers"))
+                .and_then(|h| h.get("Host"))
+                .and_then(|h| h.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+        "h2" => {
+            let h2 = stream.and_then(|s| s.get("httpSettings"));
+            params.path = h2
+                .and_then(|h| h.get("path"))
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .to_string();
+            params.host_header = h2
+                .and_then(|h| h.get("host"))
+                .and_then(|h| h.as_array())
+                .and_then(|a| a.first())
+                .and_then(|h| h.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+        "tcp" => {
+            let header = stream
+                .and_then(|s| s.get("tcpSettings"))
+                .and_then(|t| t.get("header"));
+            let header_type = header.and_then(|h| h.get("type")).and_then(|t| t.as_str());
+            if header_type == Some("http") {
+                params.header_type = "http".to_string();
+                let request = header.and_then(|h| h.get("request"));
+                // Writer-injected defaults ("/", server address) are read back
+                // as-is, not as the original empty strings.
+                params.path = request
+                    .and_then(|r| r.get("path"))
+                    .and_then(|p| p.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                params.host_header = request
+                    .and_then(|r| r.get("headers"))
+                    .and_then(|h| h.get("Host"))
+                    .and_then(|h| h.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|h| h.as_str())
+                    .unwrap_or("")
+                    .to_string();
+            }
+        }
+        other => bail!("unsupported network type: {other}"),
+    }
+
+    Ok(params)
+}
+
 /// Xray log configuration for create_config.
 pub struct XrayLogConfig {
     pub loglevel: String,
@@ -642,13 +929,11 @@ pub fn apply_to_config(
         })
         .context("no proxy outbound found in config")?;
 
-    // Preserve existing tag if new params have no name
+    // Tag must match what the routing rules are built with (name or the
+    // "proxy" fallback) — preserving a stale tag from a previous named run
+    // would leave proxy-traffic rules pointing at a nonexistent outbound.
     let tag = if params.name.is_empty() {
-        outbounds[idx]
-            .get("tag")
-            .and_then(|t| t.as_str())
-            .unwrap_or("proxy")
-            .to_string()
+        "proxy".to_string()
     } else {
         params.name.clone()
     };
@@ -1198,12 +1483,16 @@ mod tests {
     }
 
     #[test]
-    fn apply_to_config_preserves_tag_when_name_empty() {
+    fn apply_to_config_resets_stale_tag_when_name_empty() {
+        // A stale named tag from a previous run must be replaced with the
+        // "proxy" fallback — routing rules for an unnamed server are built
+        // with "proxy", and a preserved stale tag would leave them pointing
+        // at a nonexistent outbound.
         let config_json = serde_json::json!({
             "inbounds": [],
             "outbounds": [{
                 "protocol": "vless",
-                "tag": "keep-this-tag",
+                "tag": "stale-named-tag",
                 "settings": {"vnext": [{"address": "h", "port": 1, "users": [{"id": "u"}]}]},
                 "streamSettings": {"network": "tcp", "security": ""}
             }]
@@ -1222,13 +1511,13 @@ mod tests {
         params.host = "new.host".to_string();
         params.port = 443;
         params.uuid = "new-uuid".to_string();
-        // name is empty — should preserve existing tag
+        // name is empty — tag must become the "proxy" fallback
 
         apply_to_config(&params, tmpfile.path(), &XrayLogConfig::default()).unwrap();
 
         let updated: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(tmpfile.path()).unwrap()).unwrap();
-        assert_eq!(updated["outbounds"][0]["tag"], "keep-this-tag");
+        assert_eq!(updated["outbounds"][0]["tag"], "proxy");
     }
 
     #[test]
@@ -1331,23 +1620,23 @@ mod tests {
             &["corp.com".to_string()],
             &["ext.com".to_string()],
             "proxy",
-            true,
+            &[],
+            &[],
         );
         let config = create_config(&params, 30000, &rules, &XrayLogConfig::default());
 
         let r = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(r.len(), 4);
+        assert_eq!(r.len(), 3);
         assert_eq!(r[0]["ruleTag"], "loopback-and-private-direct");
         assert_eq!(r[1]["outboundTag"], "direct");
         assert_eq!(r[1]["domain"][0], "domain:corp.com");
         assert_eq!(r[2]["outboundTag"], "proxy");
         assert_eq!(r[2]["domain"][0], "domain:ext.com");
-        assert_eq!(r[3]["ruleTag"], "ru-tld-direct");
     }
 
     #[test]
     fn awg_mode_config_has_freedom_outbound() {
-        let rules = crate::traffic::build_routing_rules(&[], &[], "proxy", false);
+        let rules = crate::traffic::build_routing_rules(&[], &[], "proxy", &[], &[]);
         let config = create_config_awg_mode(21080, &rules, &XrayLogConfig::default());
 
         // Proxy outbound should be freedom
@@ -1374,11 +1663,12 @@ mod tests {
             &["corp.com".to_string()],
             &["ext.com".to_string()],
             "proxy",
-            true,
+            &[],
+            &[],
         );
         let config = create_config_awg_mode(21080, &rules, &XrayLogConfig::default());
         let r = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(r.len(), 4);
+        assert_eq!(r.len(), 3);
         assert_eq!(r[0]["ruleTag"], "loopback-and-private-direct");
     }
 
@@ -1423,5 +1713,306 @@ mod tests {
         assert_eq!(config["log"]["loglevel"], "debug");
         assert_eq!(config["log"]["access"], "/tmp/access.log");
         assert_eq!(config["log"]["error"], "/tmp/error.log");
+    }
+
+    // --- params_from_outbound ---
+
+    fn outbound_json(params: &ProxyParams) -> serde_json::Value {
+        serde_json::json!({
+            "protocol": params.protocol,
+            "tag": "ignored",
+            "settings": build_outbound_settings(params),
+            "streamSettings": build_stream_settings(params),
+        })
+    }
+
+    #[test]
+    fn params_from_outbound_round_trip_vless_ws() {
+        let uri = "vless://550e8400-e29b-41d4-a716-446655440000@host.net:443?type=ws&security=tls&sni=host.net&fp=chrome&alpn=h2,http/1.1&path=%2Fws&host=cdn.example.com&flow=xtls-rprx-vision#Ignored";
+        let original = parse_uri(uri).unwrap();
+        let read = params_from_outbound(&outbound_json(&original), "RoundTripName").unwrap();
+
+        assert_eq!(read.protocol, original.protocol);
+        assert_eq!(read.host, original.host);
+        assert_eq!(read.port, original.port);
+        assert_eq!(read.name, "RoundTripName");
+        assert_eq!(read.uuid, original.uuid);
+        assert_eq!(read.encryption, original.encryption);
+        assert_eq!(read.flow, original.flow);
+        assert_eq!(read.network, original.network);
+        assert_eq!(read.security, original.security);
+        assert_eq!(read.sni, original.sni);
+        assert_eq!(read.fingerprint, original.fingerprint);
+        assert_eq!(read.alpn, original.alpn);
+        assert_eq!(read.path, original.path);
+        assert_eq!(read.host_header, original.host_header);
+    }
+
+    #[test]
+    fn params_from_outbound_round_trip_vless_grpc_multi() {
+        let uri = "vless://uuid@host.net:443?type=grpc&mode=multi&security=tls&sni=host.net&serviceName=my-service&fp=chrome#Name";
+        let original = parse_uri(uri).unwrap();
+        let read = params_from_outbound(&outbound_json(&original), "RoundTripName").unwrap();
+
+        assert_eq!(read.protocol, original.protocol);
+        assert_eq!(read.host, original.host);
+        assert_eq!(read.port, original.port);
+        assert_eq!(read.uuid, original.uuid);
+        assert_eq!(read.encryption, original.encryption);
+        assert_eq!(read.flow, original.flow);
+        assert_eq!(read.network, original.network);
+        assert_eq!(read.mode, original.mode);
+        assert_eq!(read.security, original.security);
+        assert_eq!(read.sni, original.sni);
+        assert_eq!(read.fingerprint, original.fingerprint);
+        assert_eq!(read.alpn, original.alpn);
+        assert_eq!(read.service_name, original.service_name);
+    }
+
+    #[test]
+    fn params_from_outbound_round_trip_vmess() {
+        let json = serde_json::json!({
+            "v": "2",
+            "ps": "VMess Server",
+            "add": "vmess.example.com",
+            "port": 443,
+            "id": "abcd-1234",
+            "aid": 0,
+            "scy": "auto",
+            "net": "ws",
+            "type": "none",
+            "host": "ws.example.com",
+            "path": "/websocket",
+            "tls": "tls",
+            "sni": "vmess.example.com",
+            "fp": "chrome",
+            "alpn": "h2,http/1.1"
+        });
+        let encoded = base64::engine::general_purpose::STANDARD.encode(json.to_string());
+        let uri = format!("vmess://{encoded}");
+        let original = parse_uri(&uri).unwrap();
+        let read = params_from_outbound(&outbound_json(&original), "RoundTripName").unwrap();
+
+        assert_eq!(read.protocol, original.protocol);
+        assert_eq!(read.host, original.host);
+        assert_eq!(read.port, original.port);
+        assert_eq!(read.uuid, original.uuid);
+        assert_eq!(read.alter_id, original.alter_id);
+        assert_eq!(read.vmess_security, original.vmess_security);
+        assert_eq!(read.network, original.network);
+        assert_eq!(read.path, original.path);
+        assert_eq!(read.host_header, original.host_header);
+        assert_eq!(read.security, original.security);
+        assert_eq!(read.sni, original.sni);
+        assert_eq!(read.fingerprint, original.fingerprint);
+        assert_eq!(read.alpn, original.alpn);
+    }
+
+    #[test]
+    fn params_from_outbound_round_trip_trojan() {
+        let uri = "trojan://myPassword@trojan.example.com:443?type=ws&path=%2Fws&host=cdn.example.com&security=tls&sni=trojan.example.com&fp=chrome&alpn=h2#TrojanRT";
+        let original = parse_uri(uri).unwrap();
+        let read = params_from_outbound(&outbound_json(&original), "RoundTripName").unwrap();
+
+        assert_eq!(read.protocol, original.protocol);
+        assert_eq!(read.host, original.host);
+        assert_eq!(read.port, original.port);
+        assert_eq!(read.password, original.password);
+        assert_eq!(read.network, original.network);
+        assert_eq!(read.path, original.path);
+        assert_eq!(read.host_header, original.host_header);
+        assert_eq!(read.security, original.security);
+        assert_eq!(read.sni, original.sni);
+        assert_eq!(read.fingerprint, original.fingerprint);
+        assert_eq!(read.alpn, original.alpn);
+    }
+
+    #[test]
+    fn params_from_outbound_round_trip_ss_plain_tcp() {
+        let userinfo =
+            base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:mypassword123");
+        let uri = format!("ss://{userinfo}@ss.example.com:8388#SS%20Server");
+        let original = parse_uri(&uri).unwrap();
+        let read = params_from_outbound(&outbound_json(&original), "RoundTripName").unwrap();
+
+        assert_eq!(read.protocol, original.protocol);
+        assert_eq!(read.host, original.host);
+        assert_eq!(read.port, original.port);
+        assert_eq!(read.method, original.method);
+        assert_eq!(read.password, original.password);
+        assert_eq!(read.network, original.network);
+        assert_eq!(read.security, original.security);
+        assert_eq!(read.header_type, original.header_type);
+        assert_eq!(read.path, original.path);
+        assert_eq!(read.host_header, original.host_header);
+    }
+
+    #[test]
+    fn params_from_outbound_round_trip_h2() {
+        let uri = "vless://uuid@host.net:443?type=h2&path=%2Fh2&host=h2.example.com&security=tls&sni=host.net&fp=chrome&alpn=h2#H2Name";
+        let original = parse_uri(uri).unwrap();
+        let read = params_from_outbound(&outbound_json(&original), "RoundTripName").unwrap();
+
+        assert_eq!(read.protocol, original.protocol);
+        assert_eq!(read.host, original.host);
+        assert_eq!(read.port, original.port);
+        assert_eq!(read.network, original.network);
+        assert_eq!(read.path, original.path);
+        assert_eq!(read.host_header, original.host_header);
+        assert_eq!(read.security, original.security);
+        assert_eq!(read.sni, original.sni);
+        assert_eq!(read.fingerprint, original.fingerprint);
+        assert_eq!(read.alpn, original.alpn);
+    }
+
+    #[test]
+    fn params_from_outbound_port_as_string() {
+        let outbound = serde_json::json!({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "h", "port": "443", "users": [{"id": "u"}]}]},
+            "streamSettings": {"network": "tcp", "security": ""}
+        });
+        let params = params_from_outbound(&outbound, "x").unwrap();
+        assert_eq!(params.port, 443);
+    }
+
+    #[test]
+    fn params_from_outbound_rejects_out_of_range_port_number() {
+        let outbound = serde_json::json!({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "h", "port": 70000, "users": [{"id": "u"}]}]},
+            "streamSettings": {"network": "tcp", "security": ""}
+        });
+        // Out-of-range ports must be rejected, not silently truncated to fit u16.
+        let err = params_from_outbound(&outbound, "x").unwrap_err();
+        assert!(err.to_string().contains("port"));
+    }
+
+    #[test]
+    fn params_from_outbound_rejects_out_of_range_port_string() {
+        let outbound = serde_json::json!({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "h", "port": "70000", "users": [{"id": "u"}]}]},
+            "streamSettings": {"network": "tcp", "security": ""}
+        });
+        let err = params_from_outbound(&outbound, "x").unwrap_err();
+        assert!(err.to_string().contains("port"));
+    }
+
+    #[test]
+    fn params_from_outbound_defaults_when_stream_settings_missing() {
+        // No streamSettings at all (e.g. a hand-written or malformed subscription
+        // entry): default to network="tcp", security="" — the fail-closed choice,
+        // since a no-TLS config simply fails to connect rather than silently
+        // leaking traffic outside a TLS tunnel.
+        let outbound = serde_json::json!({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "h", "port": 443, "users": [{"id": "u"}]}]}
+        });
+        let params = params_from_outbound(&outbound, "x").unwrap();
+        assert_eq!(params.network, "tcp");
+        assert_eq!(params.security, "");
+    }
+
+    #[test]
+    fn params_from_outbound_grpc_non_multi_functional_equality() {
+        // mode="gun" is a real, common non-multi grpc setting from subscription URIs.
+        let uri = "vless://uuid@host.net:443?type=grpc&mode=gun&security=tls&sni=host.net&serviceName=svc#Name";
+        let original = parse_uri(uri).unwrap();
+        let original_json = outbound_json(&original);
+
+        let read = params_from_outbound(&original_json, "Name").unwrap();
+        // "gun" is lossy: an explicit multiMode:false and an absent key are
+        // indistinguishable to xray (both are the Go zero value), so both
+        // collapse to mode="" on read-back.
+        assert_eq!(read.mode, "");
+
+        let regen_json = outbound_json(&read);
+
+        // Functional equality: everything but the grpc multiMode key/value
+        // representation is identical, and the *effective* multiMode (xray
+        // treats an absent key the same as `false`) is identical too.
+        assert_eq!(regen_json["protocol"], original_json["protocol"]);
+        assert_eq!(regen_json["settings"], original_json["settings"]);
+        assert_eq!(
+            regen_json["streamSettings"]["network"],
+            original_json["streamSettings"]["network"]
+        );
+        assert_eq!(
+            regen_json["streamSettings"]["tlsSettings"],
+            original_json["streamSettings"]["tlsSettings"]
+        );
+        assert_eq!(
+            regen_json["streamSettings"]["grpcSettings"]["serviceName"],
+            original_json["streamSettings"]["grpcSettings"]["serviceName"]
+        );
+        let effective_multi_mode = |j: &serde_json::Value| {
+            j["streamSettings"]["grpcSettings"]["multiMode"]
+                .as_bool()
+                .unwrap_or(false)
+        };
+        assert_eq!(
+            effective_multi_mode(&regen_json),
+            effective_multi_mode(&original_json)
+        );
+    }
+
+    #[test]
+    fn params_from_outbound_tcp_http_functional_equality() {
+        let mut original = default_params();
+        original.protocol = "vless".to_string();
+        original.host = "tcp.example.com".to_string();
+        original.port = 443;
+        original.uuid = "uuid".to_string();
+        original.network = "tcp".to_string();
+        original.header_type = "http".to_string();
+        // path/host_header left empty — writer injects defaults ("/", server address).
+
+        let original_json = outbound_json(&original);
+        let read = params_from_outbound(&original_json, "Name").unwrap();
+
+        // Writer-injected defaults are read back literally, not as the
+        // original empty strings.
+        assert_eq!(read.path, "/");
+        assert_eq!(read.host_header, "tcp.example.com");
+
+        let regen_json = outbound_json(&read);
+        assert_eq!(regen_json, original_json);
+    }
+
+    #[test]
+    fn params_from_outbound_rejects_freedom() {
+        let outbound = serde_json::json!({"protocol": "freedom", "tag": "direct"});
+        let err = params_from_outbound(&outbound, "x").unwrap_err();
+        assert!(err.to_string().contains("unsupported outbound protocol"));
+    }
+
+    #[test]
+    fn params_from_outbound_rejects_missing_vnext() {
+        let outbound = serde_json::json!({"protocol": "vless", "settings": {}});
+        let err = params_from_outbound(&outbound, "x").unwrap_err();
+        assert!(err.to_string().contains("vnext"));
+    }
+
+    #[test]
+    fn params_from_outbound_rejects_reality() {
+        let outbound = serde_json::json!({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "h", "port": 443, "users": [{"id": "u"}]}]},
+            "streamSettings": {"network": "tcp", "security": "reality"}
+        });
+        let err = params_from_outbound(&outbound, "x").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("reality"));
+    }
+
+    #[test]
+    fn params_from_outbound_rejects_unknown_network() {
+        let outbound = serde_json::json!({
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "h", "port": 443, "users": [{"id": "u"}]}]},
+            "streamSettings": {"network": "kcp", "security": ""}
+        });
+        let err = params_from_outbound(&outbound, "x").unwrap_err();
+        assert!(err.to_string().contains("network"));
     }
 }

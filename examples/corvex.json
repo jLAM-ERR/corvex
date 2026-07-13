@@ -20,9 +20,6 @@
 
   // Routing rules
   "routes": {
-    // Route .ru TLD directly (bypass proxy)
-    "direct-ru": true,
-
     // Domains forced through the proxy
     "proxy-traffic": [
       "domain:youtube.com",

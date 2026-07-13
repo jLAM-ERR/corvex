@@ -13,7 +13,6 @@
 
   // Routing rules work the same as with xray-only mode
   "routes": {
-    "direct-ru": true,
     "proxy-traffic": ["domain:youtube.com"],
     "corporate-traffic": ["domain:corp.example.com"]
   },

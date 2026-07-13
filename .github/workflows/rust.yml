@@ -1,7 +1,7 @@
 # =============================================================================
-# GitHub Actions: CI + Release for macOS & Windows
+# GitHub Actions: CI + Release for macOS, Linux & Windows
 # =============================================================================
-# CI:      runs tests, clippy, fmt on macOS and Windows for every push/PR
+# CI:      runs tests, clippy, fmt on macOS, Linux, and Windows for every push/PR
 # Release: builds platform binaries and publishes GitHub Release on tag push
 # =============================================================================
 
@@ -9,7 +9,6 @@ name: CI & Release
 
 on:
   push:
-    branches: [main, "release/**"]
     tags:
       - "v*"
   pull_request:
@@ -30,7 +29,7 @@ env:
   BINARY_NAME: corvex
 
 # =============================================================================
-# CI: test + lint on both platforms
+# CI: test + lint on all platforms
 # =============================================================================
 jobs:
   test:
@@ -39,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, windows-latest]
+        os: [macos-14, ubuntu-latest, windows-latest]
 
     steps:
       - name: Checkout
@@ -210,6 +209,86 @@ jobs:
           retention-days: 7
 
   # ==========================================================================
+  # Release: Linux x86_64 binary (static, musl)
+  # ==========================================================================
+  release-linux:
+    name: Release Linux
+    needs: [test, release-guard]
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Extract version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+            TAG_NAME="v${VERSION}"
+          else
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG_NAME#v}"
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl-tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Cache Cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            linux-cargo-
+
+      - name: Build
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Package
+        run: |
+          ARCHIVE_NAME="${BINARY_NAME}-${VERSION}-linux-x86_64"
+          ARCHIVE_DIR="archive-staging/${ARCHIVE_NAME}"
+          mkdir -p "${ARCHIVE_DIR}"
+          cp target/x86_64-unknown-linux-musl/release/${BINARY_NAME} "${ARCHIVE_DIR}/"
+          chmod +x "${ARCHIVE_DIR}/${BINARY_NAME}"
+          for f in README.md LICENSE CHANGELOG.md; do
+            [ -f "$f" ] && cp "$f" "${ARCHIVE_DIR}/"
+          done
+          [ -d "examples" ] && cp -a examples "${ARCHIVE_DIR}/examples"
+          tar -czf "${ARCHIVE_NAME}.tar.gz" -C archive-staging "${ARCHIVE_NAME}"
+          sha256sum "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ env.ARCHIVE_NAME }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}.tar.gz
+            ${{ env.ARCHIVE_NAME }}.tar.gz.sha256
+          retention-days: 7
+
+  # ==========================================================================
   # Release: Windows x86_64 binary
   # ==========================================================================
   release-windows:
@@ -285,7 +364,7 @@ jobs:
   # ==========================================================================
   publish-release:
     name: Publish Release
-    needs: [release-macos, release-windows]
+    needs: [release-macos, release-linux, release-windows]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
@@ -327,10 +406,23 @@ jobs:
           cat >> "${BODY_FILE}" << EOF
           ## Installation
 
+          On macOS or Linux, \`install.sh\` installs corvex and the xray engine binary automatically:
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/install.sh | sh
+          \`\`\`
+
+          Or install manually:
+
           ### macOS
           \`\`\`bash
           curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/${BINARY_NAME}-${VERSION}-darwin-universal.tar.gz | tar xz
           sudo mv ${BINARY_NAME}-${VERSION}-darwin-universal/${BINARY_NAME} /usr/local/bin/
+          \`\`\`
+
+          ### Linux (x86_64)
+          \`\`\`bash
+          curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/${BINARY_NAME}-${VERSION}-linux-x86_64.tar.gz | tar xz
+          sudo mv ${BINARY_NAME}-${VERSION}-linux-x86_64/${BINARY_NAME} /usr/local/bin/
           \`\`\`
 
           ### Windows

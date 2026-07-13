@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use log::{debug, info};
+use log::debug;
 use std::path::Path;
 use std::process::Command;
 
@@ -184,7 +184,10 @@ pub fn write_conf(config: &AwgConfig, path: &Path) -> Result<()> {
     crate::config::write_restricted(path, &content)
 }
 
-/// Ensure awg-quick is installed; auto-install silently if not found.
+/// Message shown when awg-quick cannot be found on the system.
+pub const AWG_NOT_INSTALLED_MSG: &str = "'awg-quick' is not installed. AmneziaWG is optional and is never installed by corvex — install amneziawg-tools manually with your package manager.";
+
+/// Check if awg-quick is installed; no side effects.
 pub fn ensure_awg_installed() -> Result<()> {
     debug!("checking if awg-quick is installed");
 
@@ -199,29 +202,6 @@ pub fn ensure_awg_installed() -> Result<()> {
             debug!("awg-quick found in PATH");
             return Ok(());
         }
-
-        #[cfg(target_os = "macos")]
-        {
-            info!("awg-quick not found, installing amneziawg-tools via brew");
-            let brew = Command::new("brew")
-                .args(["install", "--quiet", "amneziawg-tools"])
-                .output()
-                .context("failed to run 'brew install amneziawg-tools' — is Homebrew installed?")?;
-
-            if !brew.status.success() {
-                let stderr = String::from_utf8_lossy(&brew.stderr);
-                anyhow::bail!("brew install amneziawg-tools failed: {}", stderr.trim());
-            }
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            anyhow::bail!(
-                "awg-quick not found in PATH. Install amneziawg-tools:\n\
-                 - Debian/Ubuntu: sudo apt install amneziawg-tools\n\
-                 - Manual: https://github.com/amnezia-vpn/amneziawg-linux-kernel-module"
-            );
-        }
     }
 
     #[cfg(windows)]
@@ -235,20 +215,9 @@ pub fn ensure_awg_installed() -> Result<()> {
             debug!("awg-quick found in PATH");
             return Ok(());
         }
-
-        info!("awg-quick not found, installing via winget");
-        let winget = Command::new("winget")
-            .args(["install", "--silent", "AmneziaVPN.AmneziaWG"])
-            .output()
-            .context("failed to run 'winget install AmneziaWG'")?;
-
-        if !winget.status.success() {
-            let stderr = String::from_utf8_lossy(&winget.stderr);
-            anyhow::bail!("winget install AmneziaWG failed: {}", stderr.trim());
-        }
     }
 
-    Ok(())
+    bail!(AWG_NOT_INSTALLED_MSG)
 }
 
 /// Start AWG tunnel. Requires root/sudo.
@@ -523,6 +492,14 @@ mod tests {
     fn conf_interface_name_custom() {
         let path = std::path::PathBuf::from("/tmp/myiface.conf");
         assert_eq!(conf_interface_name(&path), "myiface");
+    }
+
+    #[test]
+    fn awg_not_installed_msg_mentions_manual_install_no_url() {
+        assert!(AWG_NOT_INSTALLED_MSG.contains("amneziawg-tools"));
+        assert!(AWG_NOT_INSTALLED_MSG.contains("manually"));
+        assert!(AWG_NOT_INSTALLED_MSG.contains("package manager"));
+        assert!(!AWG_NOT_INSTALLED_MSG.contains("http"));
     }
 
     #[test]
