@@ -646,17 +646,19 @@ fn stop_awg_if_running(config: &Config) {
 }
 
 fn cmd_stop(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
-    debug!("disabling system proxy");
+    // Stop xray first. If that fails for any reason (not running, owned by
+    // another user, ...), leave the system proxy and the AWG tunnel untouched
+    // so a failed stop never half-tears-down a working setup.
+    debug!("stopping xray");
+    xray::stop(config)?;
+
     let service = plat.detect_active_service()?;
-    let proxy_result = plat.disable_proxy(&service);
-    debug!("stopping xray process");
-    let xray_result = xray::stop(config);
+    debug!("disabling system proxy");
+    plat.disable_proxy(&service)?;
 
     // Also stop any AWG tunnel left running from a previous session
     stop_awg_if_running(config);
 
-    proxy_result?;
-    xray_result?;
     println!("{}", "corvex stopped!".green());
     Ok(())
 }
@@ -764,7 +766,159 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::Cli;
+    use crate::platform::{Platform, ProxyInfo, ProxyStatus};
     use clap::Parser;
+    use std::cell::RefCell;
+
+    /// Test double for `Platform` that records every method call and can be
+    /// configured to fail `disable_proxy`. Lets tests assert whether/when
+    /// `cmd_stop` touched the system proxy without any real system calls.
+    struct RecordingPlatform {
+        calls: RefCell<Vec<String>>,
+        fail_disable_proxy: bool,
+    }
+
+    impl RecordingPlatform {
+        fn new() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                fail_disable_proxy: false,
+            }
+        }
+
+        fn failing_disable_proxy() -> Self {
+            Self {
+                fail_disable_proxy: true,
+                ..Self::new()
+            }
+        }
+
+        fn count(&self, method: &str) -> usize {
+            self.calls.borrow().iter().filter(|c| *c == method).count()
+        }
+    }
+
+    impl Platform for RecordingPlatform {
+        fn detect_active_service(&self) -> anyhow::Result<String> {
+            self.calls
+                .borrow_mut()
+                .push("detect_active_service".to_string());
+            Ok("Wi-Fi".to_string())
+        }
+
+        fn enable_proxy(&self, _service: &str, _host: &str, _port: u16) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push("enable_proxy".to_string());
+            Ok(())
+        }
+
+        fn disable_proxy(&self, _service: &str) -> anyhow::Result<()> {
+            self.calls.borrow_mut().push("disable_proxy".to_string());
+            if self.fail_disable_proxy {
+                anyhow::bail!("disable_proxy failed (test)");
+            }
+            Ok(())
+        }
+
+        fn proxy_status(&self, _service: &str) -> anyhow::Result<ProxyStatus> {
+            self.calls.borrow_mut().push("proxy_status".to_string());
+            let off = || ProxyInfo {
+                enabled: false,
+                server: String::new(),
+                port: String::new(),
+            };
+            Ok(ProxyStatus {
+                socks: off(),
+                http: off(),
+                https: off(),
+            })
+        }
+
+        fn discover_corporate_dns(
+            &self,
+        ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+            self.calls
+                .borrow_mut()
+                .push("discover_corporate_dns".to_string());
+            Ok(std::collections::BTreeMap::new())
+        }
+    }
+
+    /// Config rooted in a temp dir so tests never touch real state.
+    fn temp_config(base: &std::path::Path, xray_bin: &str) -> crate::config::Config {
+        crate::config::Config {
+            xray_bin: xray_bin.to_string(),
+            xray_config: base.join("xray/config.json"),
+            xray_log: base.join("logs/xray.log"),
+            xray_pid_file: base.join("xray/xray.pid"),
+            corvex_settings: base.join("corvex/corvex.json"),
+            corvex_log: base.join("state/corvex/corvex.log"),
+        }
+    }
+
+    /// Spawn a `/bin/sleep` child standing in for a running xray process and
+    /// write its PID to the config's PID file (config uses `xray_bin = "sleep"`
+    /// so the PID-reuse guard in `xray::is_running` accepts it).
+    #[cfg(unix)]
+    fn spawn_fake_xray(config: &crate::config::Config) -> std::process::Child {
+        std::fs::create_dir_all(config.xray_pid_file.parent().unwrap()).unwrap();
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("failed to spawn sleep");
+        std::fs::write(&config.xray_pid_file, child.id().to_string()).unwrap();
+        child
+    }
+
+    /// Regression test: a failed stop (here: xray not running) must not touch
+    /// the system proxy at all — previously the proxy was disabled first.
+    #[test]
+    fn test_cmd_stop_without_running_xray_never_touches_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "xray");
+        let plat = RecordingPlatform::new();
+
+        let err = super::cmd_stop(&config, &plat).expect_err("stop must fail with no PID file");
+
+        assert!(err.to_string().contains("not running"));
+        assert_eq!(plat.count("disable_proxy"), 0);
+        assert_eq!(plat.count("detect_active_service"), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_stop_disables_proxy_after_successful_xray_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "sleep");
+        let mut child = spawn_fake_xray(&config);
+
+        let plat = RecordingPlatform::new();
+        let result = super::cmd_stop(&config, &plat);
+
+        // Reap the child before asserting: a zombie still answers
+        // kill(pid, 0) as alive (see test_process_dead_after_exit in xray.rs).
+        child.wait().expect("failed to reap sleep child");
+
+        result.expect("cmd_stop must succeed when xray stops cleanly");
+        assert_eq!(plat.count("disable_proxy"), 1);
+        assert!(!config.xray_pid_file.exists(), "PID file must be removed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_stop_propagates_disable_proxy_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "sleep");
+        let mut child = spawn_fake_xray(&config);
+
+        let plat = RecordingPlatform::failing_disable_proxy();
+        let result = super::cmd_stop(&config, &plat);
+
+        child.wait().expect("failed to reap sleep child");
+
+        let err = result.expect_err("cmd_stop must propagate disable_proxy error");
+        assert!(err.to_string().contains("disable_proxy failed"));
+        assert_eq!(plat.count("disable_proxy"), 1);
+    }
 
     fn format_xray_status(pid: Option<i32>) -> String {
         match pid {

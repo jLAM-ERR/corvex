@@ -20,7 +20,7 @@ cargo run -- --help   # Show CLI help
 
 ```bash
 cargo run -- start                              # Load corvex.json, resolve server, start
-cargo run -- stop                               # Disable system proxy + stop xray (+ AWG if active)
+cargo run -- stop                               # Stop xray first; system proxy is disabled (+ AWG stopped) only if the stop succeeded
 cargo run -- restart                            # Full stop + start: restarts xray, re-applies system proxy
 cargo run -- reload                             # Validate config, send SIGHUP
 cargo run -- status                             # Show engine type, xray process, ports, proxy settings
