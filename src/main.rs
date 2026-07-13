@@ -651,13 +651,16 @@ fn stop_awg_if_running(config: &Config) {
 }
 
 fn cmd_stop(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
-    // Stop xray first. If that fails for any reason (not running, owned by
-    // another user, ...), leave the system proxy and the AWG tunnel untouched
-    // so a failed stop never half-tears-down a working setup.
+    // Resolve the network service first: detection is read-only, so a
+    // detection failure aborts before anything is touched. Then stop xray;
+    // if that fails for any reason (not running, owned by another user, ...),
+    // the system proxy and the AWG tunnel likewise stay untouched, so a
+    // failed stop never half-tears-down a working setup.
+    let service = plat.detect_active_service()?;
+
     debug!("stopping xray");
     xray::stop(config)?;
 
-    let service = plat.detect_active_service()?;
     debug!("disabling system proxy");
     plat.disable_proxy(&service)?;
 
@@ -779,8 +782,9 @@ mod tests {
     /// configured to fail `detect_active_service` or `disable_proxy`. Lets
     /// tests assert whether/when/in what order `cmd_stop` touched the system
     /// proxy without any real system calls. When `pid_file_must_be_gone` is
-    /// set, every recorded call also asserts that the xray PID file no longer
-    /// exists — pinning "proxy is only touched after xray fully stopped".
+    /// set, the mutating proxy calls also assert that the xray PID file no
+    /// longer exists — pinning "proxy is only touched after xray fully
+    /// stopped" (read-only `detect_active_service` runs before the stop).
     #[derive(Default)]
     struct RecordingPlatform {
         calls: RefCell<Vec<String>>,
@@ -792,6 +796,9 @@ mod tests {
     impl RecordingPlatform {
         fn record(&self, method: &str) {
             self.calls.borrow_mut().push(method.to_string());
+        }
+
+        fn assert_pid_file_gone(&self, method: &str) {
             if let Some(pid_file) = &self.pid_file_must_be_gone {
                 assert!(
                     !pid_file.exists(),
@@ -812,11 +819,13 @@ mod tests {
 
         fn enable_proxy(&self, _service: &str, _host: &str, _port: u16) -> anyhow::Result<()> {
             self.record("enable_proxy");
+            self.assert_pid_file_gone("enable_proxy");
             Ok(())
         }
 
         fn disable_proxy(&self, _service: &str) -> anyhow::Result<()> {
             self.record("disable_proxy");
+            self.assert_pid_file_gone("disable_proxy");
             if self.fail_disable_proxy {
                 anyhow::bail!("disable_proxy failed (test)");
             }
@@ -888,6 +897,8 @@ mod tests {
 
     /// Regression test: a failed stop (here: xray not running) must not touch
     /// the system proxy at all — previously the proxy was disabled first.
+    /// Read-only service detection runs before the stop and is allowed; the
+    /// mutating `disable_proxy` must never be reached.
     #[test]
     fn test_cmd_stop_without_running_xray_never_touches_proxy() {
         let dir = tempfile::tempdir().unwrap();
@@ -897,10 +908,10 @@ mod tests {
         let err = super::cmd_stop(&config, &plat).expect_err("stop must fail with no PID file");
 
         assert!(err.to_string().contains("not running"));
-        assert!(
-            plat.calls.borrow().is_empty(),
-            "no Platform call is allowed after a failed stop, got {:?}",
-            plat.calls.borrow()
+        assert_eq!(
+            *plat.calls.borrow(),
+            ["detect_active_service"],
+            "only read-only detection is allowed on a failed stop"
         );
     }
 
@@ -911,8 +922,8 @@ mod tests {
         let config = temp_config(dir.path(), "sleep");
         let reaper = spawn_fake_xray(&config);
 
-        // The mock asserts at every call that the PID file is already gone,
-        // pinning the ordering (xray stopped first) on the success path too.
+        // The mock asserts that the PID file is already gone when the proxy
+        // is mutated, pinning the ordering on the success path too.
         let plat = RecordingPlatform {
             pid_file_must_be_gone: Some(config.xray_pid_file.clone()),
             ..Default::default()
@@ -929,12 +940,20 @@ mod tests {
         assert!(!config.xray_pid_file.exists(), "PID file must be removed");
     }
 
+    /// Service detection runs before the stop, so a detection failure must
+    /// leave everything untouched: xray keeps running, PID file preserved,
+    /// proxy never mutated.
     #[test]
     #[cfg(unix)]
-    fn test_cmd_stop_propagates_detect_active_service_error() {
+    fn test_cmd_stop_detect_service_error_leaves_xray_running() {
         let dir = tempfile::tempdir().unwrap();
         let config = temp_config(dir.path(), "sleep");
-        let reaper = spawn_fake_xray(&config);
+        std::fs::create_dir_all(config.xray_pid_file.parent().unwrap()).unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("failed to spawn sleep");
+        std::fs::write(&config.xray_pid_file, child.id().to_string()).unwrap();
 
         let plat = RecordingPlatform {
             fail_detect_active_service: true,
@@ -942,13 +961,16 @@ mod tests {
         };
         let result = super::cmd_stop(&config, &plat);
 
-        reaper.join().expect("failed to join reaper thread");
-
         let err = result.expect_err("cmd_stop must propagate detect_active_service error");
         assert!(err.to_string().contains("detect_active_service failed"));
-        // xray is already stopped, but the proxy itself was never touched.
         assert_eq!(*plat.calls.borrow(), ["detect_active_service"]);
-        assert!(!config.xray_pid_file.exists(), "PID file must be removed");
+        assert!(
+            config.xray_pid_file.exists(),
+            "PID file must be preserved when detection fails before the stop"
+        );
+
+        child.kill().expect("failed to kill fake xray");
+        let _ = child.wait();
     }
 
     #[test]
