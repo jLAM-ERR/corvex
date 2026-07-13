@@ -218,20 +218,13 @@ fn start_xray_engine(
     );
     debug!("built {} routing rules", rules.len());
 
-    // Create or update xray config
-    if config.xray_config.exists() {
-        debug!("updating existing config {}", config.xray_config.display());
-        protocol::apply_to_config(params, &config.xray_config, routing.log_config)?;
-        update_routing_rules(&config.xray_config, &rules)?;
-    } else {
-        debug!("creating new config {}", config.xray_config.display());
-        let xray_cfg = protocol::create_config(params, static_port, &rules, routing.log_config);
-        if let Some(parent) = config.xray_config.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let json = serde_json::to_string_pretty(&xray_cfg)?;
-        config::write_restricted(&config.xray_config, &json)?;
-    }
+    write_xray_config(
+        &config.xray_config,
+        params,
+        static_port,
+        &rules,
+        routing.log_config,
+    )?;
 
     // DNS sync
     let mut dns_mappings = corporate_dns;
@@ -486,6 +479,36 @@ fn build_xray_log_config(settings: &settings::CorvexSettings) -> protocol::XrayL
 }
 
 /// Update routing rules in an existing xray config.
+/// Write the xray config for `params`: update the existing file in place, or
+/// (re)create it from scratch when none exists or the existing one cannot be
+/// updated — e.g. an AWG-mode config (freedom/blackhole outbounds only) left
+/// by a previous run has no proxy outbound to replace, and failing here after
+/// the AWG pre-stop would leave the user with no tunnel at all.
+fn write_xray_config(
+    xray_config: &std::path::Path,
+    params: &protocol::ProxyParams,
+    static_port: u16,
+    rules: &[serde_json::Value],
+    log_config: &protocol::XrayLogConfig,
+) -> anyhow::Result<()> {
+    if xray_config.exists() {
+        debug!("updating existing config {}", xray_config.display());
+        match protocol::apply_to_config(params, xray_config, log_config)
+            .and_then(|()| update_routing_rules(xray_config, rules))
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => warn!("cannot update existing config ({e}); regenerating from scratch"),
+        }
+    }
+    debug!("creating new config {}", xray_config.display());
+    let xray_cfg = protocol::create_config(params, static_port, rules, log_config);
+    if let Some(parent) = xray_config.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(&xray_cfg)?;
+    config::write_restricted(xray_config, &json)
+}
+
 fn update_routing_rules(
     config_path: &std::path::Path,
     rules: &[serde_json::Value],
@@ -946,6 +969,61 @@ mod tests {
         let r = updated["routing"]["rules"].as_array().unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0]["outboundTag"], "direct");
+    }
+
+    fn vless_test_params() -> crate::protocol::ProxyParams {
+        crate::protocol::parse_uri(
+            "vless://11111111-1111-1111-1111-111111111111@example.com:443?encryption=none&type=tcp#",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_write_xray_config_regenerates_awg_mode_config() {
+        // An AWG-mode config has only freedom/blackhole outbounds, so the
+        // in-place update fails — write_xray_config must fall back to a full
+        // regenerate instead of erroring (the AWG pre-stop already ran, so an
+        // error here would leave no tunnel at all).
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        let log_cfg = crate::protocol::XrayLogConfig::default();
+        let awg_cfg = crate::protocol::create_config_awg_mode(10808, &[], &log_cfg);
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&awg_cfg).unwrap(),
+        )
+        .unwrap();
+
+        let params = vless_test_params();
+        super::write_xray_config(&config_path, &params, 21080, &[], &log_cfg).unwrap();
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(updated["outbounds"][0]["protocol"], "vless");
+        assert_eq!(updated["inbounds"][0]["port"], 21080);
+    }
+
+    #[test]
+    fn test_write_xray_config_updates_existing_in_place() {
+        // A healthy existing config keeps the in-place update path: the
+        // inbound port must be preserved, not reset to static_port.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.json");
+        let log_cfg = crate::protocol::XrayLogConfig::default();
+        let existing = crate::protocol::create_config(&vless_test_params(), 12345, &[], &log_cfg);
+        std::fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        let params = vless_test_params();
+        super::write_xray_config(&config_path, &params, 21080, &[], &log_cfg).unwrap();
+
+        let updated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(updated["inbounds"][0]["port"], 12345);
+        assert_eq!(updated["outbounds"][0]["protocol"], "vless");
     }
 
     #[test]
