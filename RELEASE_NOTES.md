@@ -1,6 +1,8 @@
-# Corvex Unreleased (next version)
+# Corvex v0.6.2 Release Notes
 
-## Changes
+A bug-fix release for the 0.6.x line.
+
+## Fixes
 
 ### `corvex stop` stops xray before touching the system proxy
 `corvex stop` now stops the xray process first and disables the system proxy (and stops an AWG tunnel, if one is running) only after the stop succeeded. Previously the proxy was disabled first, so a failed stop — for example, xray started with `sudo` while `corvex stop` runs as a regular user — left you with the proxy already off (after typing the admin password) while xray kept running.
