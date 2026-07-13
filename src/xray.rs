@@ -25,6 +25,8 @@ pub enum XrayError {
     StartFailed,
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+    #[error("xray (PID: {0}) is running as another user - try again with sudo")]
+    NotPermitted(i32),
 }
 
 /// Resolve an xray executable from PATH or common install locations.
@@ -220,7 +222,12 @@ pub fn is_running(config: &Config) -> Option<i32> {
 
 #[cfg(unix)]
 fn is_process_alive(pid: i32) -> bool {
-    signal::kill(Pid::from_raw(pid), None).is_ok()
+    // EPERM means the process exists but belongs to another user (e.g. started
+    // via sudo) - it is alive, we just cannot signal it. Only ESRCH means dead.
+    match signal::kill(Pid::from_raw(pid), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => true,
+        Err(_) => false,
+    }
 }
 
 #[cfg(windows)]
@@ -341,7 +348,7 @@ pub fn stop(config: &Config) -> Result<()> {
         None => return Err(XrayError::NotRunning.into()),
     };
 
-    stop_process(pid);
+    stop_process(pid)?;
 
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(100));
@@ -359,15 +366,21 @@ pub fn stop(config: &Config) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn stop_process(pid: i32) {
+fn stop_process(pid: i32) -> Result<()> {
     debug!("sending SIGTERM to xray (PID {})", pid);
-    let _ = signal::kill(Pid::from_raw(pid), Signal::SIGTERM);
+    match signal::kill(Pid::from_raw(pid), Signal::SIGTERM) {
+        // Keep the PID file: the process is alive, we just lack the rights.
+        Err(nix::errno::Errno::EPERM) => Err(XrayError::NotPermitted(pid).into()),
+        // ESRCH (already gone) is fine - the wait loop below sees it as dead.
+        _ => Ok(()),
+    }
 }
 
 #[cfg(windows)]
-fn stop_process(pid: i32) {
+fn stop_process(pid: i32) -> Result<()> {
     // Xray is spawned without CREATE_NEW_PROCESS_GROUP, so terminate directly.
     force_kill_process(pid);
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -407,8 +420,12 @@ pub fn reload(config: &Config) -> Result<()> {
     #[cfg(unix)]
     {
         debug!("sending SIGHUP to xray (PID {})", pid);
-        signal::kill(Pid::from_raw(pid), Signal::SIGHUP)
-            .context("Failed to send SIGHUP to xray")?;
+        match signal::kill(Pid::from_raw(pid), Signal::SIGHUP) {
+            Err(nix::errno::Errno::EPERM) => {
+                return Err(XrayError::NotPermitted(pid).into());
+            }
+            r => r.context("Failed to send SIGHUP to xray")?,
+        }
     }
 
     #[cfg(windows)]
@@ -440,6 +457,36 @@ mod tests {
     #[test]
     fn test_nonexistent_binary_not_found() {
         assert!(!is_binary_in_path("nonexistent_binary_xyz_999"));
+    }
+
+    #[test]
+    fn test_process_alive_self() {
+        assert!(is_process_alive(std::process::id() as i32));
+    }
+
+    /// PID 1 (launchd/init) always exists and is owned by root, so signalling
+    /// it from an unprivileged test yields EPERM - which must count as alive.
+    /// Regression test: EPERM used to be treated as dead, so a root-owned xray
+    /// (started via `sudo corvex start`) got its PID file wrongly removed.
+    #[test]
+    #[cfg(unix)]
+    fn test_process_alive_root_owned() {
+        assert!(is_process_alive(1));
+    }
+
+    #[test]
+    fn test_process_dead_after_exit() {
+        let mut child = Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                &["/C", "exit"][..]
+            } else {
+                &[][..]
+            })
+            .spawn()
+            .expect("failed to spawn test process");
+        let pid = child.id() as i32;
+        child.wait().expect("failed to wait for test process");
+        assert!(!is_process_alive(pid));
     }
 
     #[test]
