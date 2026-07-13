@@ -9,7 +9,10 @@
 
 Manage Xray VPN proxy and system proxy from the command line.
 
-corvex starts/stops the [Xray](https://github.com/XTLS/Xray-core) daemon (the default engine), configures it from a single `corvex.json` settings file, supports multiple proxy protocols (VLESS, VMess, Trojan, Shadowsocks), and toggles system proxy settings automatically. It also supports [AmneziaWG](https://amnezia.org/) as an optional alternative tunnel engine.
+corvex configures everything from a single `corvex.json` settings file, resolves the best server (directly or from subscriptions), and toggles system proxy settings automatically. Under the hood it drives one of two tunnel engines:
+
+- **[Xray](https://github.com/XTLS/Xray-core) — the default engine.** Used for every VLESS, VMess, Trojan, and Shadowsocks URI and for all subscription-based configs. corvex generates its config, manages its process, and `install.sh` installs the binary for you.
+- **[AmneziaWG](https://amnezia.org/) — an optional alternative engine.** Used only when the configured URI is `vpn://`. corvex never installs it — see [AmneziaWG support](#amneziawg-support).
 
 ## Installation
 
@@ -27,14 +30,22 @@ This installs the `corvex` binary and, as a dependency, the `xray` engine binary
 
 When it installs `xray`, install.sh also installs xray's `geoip.dat`/`geosite.dat` to `/usr/local/share/xray` (needed for `geosite:`/`geoip:` routing rules, including corvex's own loopback/RFC1918 direct rule). A failure to install these files is a warning, not fatal: point `XRAY_LOCATION_ASSET` at a directory containing the `.dat` files yourself, or use a package-manager xray (a brew-managed `xray` already ships its own geo data).
 
-Supported platforms: macOS (arm64, x86_64) and Linux (x86_64). On Windows, download the release zip from [Releases](https://github.com/jLAM-ERR/corvex/releases) manually.
+The script needs `curl` and `tar`; `unzip` is required only when it has to install xray.
+
+### Supported platforms
+
+`install.sh` supports macOS (arm64, x86_64) and Linux (x86_64). On Windows, download the release zip from [Releases](https://github.com/jLAM-ERR/corvex/releases) manually. corvex itself runs on macOS, Linux, and Windows.
 
 ### Installation from source
+
+Requires a stable [Rust toolchain](https://rustup.rs):
 
 ```bash
 cargo build --release
 cp target/release/corvex /usr/local/bin/
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, test gates, and workflow.
 
 ## Quick start
 
@@ -192,7 +203,7 @@ When using a `vpn://` URI, corvex runs in AWG mode:
 3. Starts xray as a local routing layer with a `freedom` outbound (traffic exits through the AWG tunnel)
 4. Enables system proxy pointing to xray's SOCKS port
 
-AmneziaWG is an optional alternative engine. corvex never installs it — install `amneziawg-tools` manually with your package manager.
+AmneziaWG is an optional alternative engine and corvex never installs it. **If you plan to use a `vpn://` config, install `amneziawg-tools` with your package manager (e.g. `brew install amneziawg-tools`, `apt install amneziawg-tools`) before launching corvex** — `corvex start` refuses to bring up AWG mode when `awg-quick` is not in PATH.
 
 ## Key paths
 
@@ -223,9 +234,3 @@ Setting system proxy on macOS requires admin privileges. When running without `s
 - SSH (no GUI) — falls back to a clear error message suggesting `sudo`
 - Canceling the dialog — reports "Authorization denied" without partial changes
 
-## Requirements
-
-- macOS, Linux, or Windows
-- Rust toolchain (for building from source)
-- `curl` and `tar` (for `install.sh`); `unzip` only when it needs to install xray
-- `proxy.port` must be set in corvex.json
