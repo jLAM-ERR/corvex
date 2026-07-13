@@ -210,14 +210,27 @@ pub fn is_running(config: &Config) -> Option<i32> {
         }
     };
 
-    if is_process_alive(pid) {
-        debug!("xray process {} is running", pid);
-        Some(pid)
-    } else {
+    if !is_process_alive(pid) {
         debug!("stale PID file (process {} dead), removing", pid);
         let _ = fs::remove_file(&config.xray_pid_file);
-        None
+        return None;
     }
+
+    // Guard against PID reuse: a stale xray.pid that outlived a crash or reboot
+    // may now point at an unrelated process (possibly owned by another user, so
+    // alive but not ours to signal). Confirm the process is actually xray
+    // before trusting the PID file, or we would block start/status on a stranger.
+    if !process_is_xray(pid, &config.xray_bin) {
+        debug!(
+            "PID {} is alive but is not xray (reused PID), removing stale PID file",
+            pid
+        );
+        let _ = fs::remove_file(&config.xray_pid_file);
+        return None;
+    }
+
+    debug!("xray process {} is running", pid);
+    Some(pid)
 }
 
 #[cfg(unix)]
@@ -228,6 +241,47 @@ fn is_process_alive(pid: i32) -> bool {
         Ok(()) | Err(nix::errno::Errno::EPERM) => true,
         Err(_) => false,
     }
+}
+
+/// Whether the running process `pid` looks like an xray process, used to reject
+/// a reused PID from a stale PID file. Works across user boundaries: `ps` can
+/// read another user's command even when we cannot signal that process.
+#[cfg(unix)]
+fn process_is_xray(pid: i32, xray_bin: &str) -> bool {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            command_matches(&String::from_utf8_lossy(&o.stdout), xray_bin)
+        }
+        // If ps is unavailable or errors, we cannot disprove the identity;
+        // assume it is xray so we never delete a live xray's PID file and start
+        // a duplicate (the bug this whole check protects against).
+        _ => true,
+    }
+}
+
+#[cfg(windows)]
+fn process_is_xray(_pid: i32, _xray_bin: &str) -> bool {
+    true
+}
+
+/// Does a process command (e.g. from `ps -o comm=`) belong to the xray binary?
+/// Compares basenames so a full path like `/opt/.../xray` matches `xray`. The
+/// real binary is always named `xray` (short, never truncated by `ps`), so a
+/// substring match on the configured basename is reliable.
+fn command_matches(process_comm: &str, xray_bin: &str) -> bool {
+    let comm = process_comm.trim();
+    let name = Path::new(comm)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(comm);
+    let expected = Path::new(xray_bin)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(xray_bin);
+    !name.is_empty() && !expected.is_empty() && name.contains(expected)
 }
 
 #[cfg(windows)]
@@ -472,6 +526,35 @@ mod tests {
     #[cfg(unix)]
     fn test_process_alive_root_owned() {
         assert!(is_process_alive(1));
+    }
+
+    #[test]
+    fn test_command_matches_xray() {
+        assert!(command_matches(
+            "/opt/homebrew/Cellar/xray/26.3.27/libexec/xray",
+            "xray"
+        ));
+        assert!(command_matches("xray\n", "xray")); // Linux `ps -o comm=` form
+        assert!(command_matches(
+            "/opt/homebrew/bin/xray",
+            "/opt/homebrew/bin/xray"
+        )); // full-path xray_bin
+    }
+
+    #[test]
+    fn test_command_matches_rejects_other_processes() {
+        assert!(!command_matches("/bin/zsh", "xray"));
+        assert!(!command_matches("/usr/sbin/sshd", "xray"));
+        assert!(!command_matches("", "xray"));
+    }
+
+    /// A stale PID reused by an unrelated process must not be reported as xray.
+    /// Our own test binary stands in for the reused-PID process; its command is
+    /// not xray, so process_is_xray must reject it (Codex PR #10 P2).
+    #[test]
+    #[cfg(unix)]
+    fn test_process_is_xray_rejects_self() {
+        assert!(!process_is_xray(std::process::id() as i32, "xray"));
     }
 
     #[test]
