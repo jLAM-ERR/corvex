@@ -1,4 +1,12 @@
+# Build
 /target
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local working files (not part of the project)
+resources/
 xray-proxy
 config.json_temp
 pr-description.md
