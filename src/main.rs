@@ -38,7 +38,7 @@ struct Cli {
 enum Commands {
     /// Start xray and enable system proxy
     Start,
-    /// Disable system proxy and stop xray
+    /// Stop xray, then disable system proxy
     Stop,
     /// Validate config and reload xray
     Reload,
@@ -633,6 +633,11 @@ fn update_config_port(config_path: &std::path::Path, port: u16) -> anyhow::Resul
 /// Stop the AWG tunnel if one is running (no-op otherwise).
 fn stop_awg_if_running(config: &Config) {
     if let Ok(awg_conf_path) = config.awg_conf_path() {
+        // No conf file means there is no tunnel we could stop (`awg-quick
+        // down` needs the file), so skip the `awg show` probe entirely.
+        if !awg_conf_path.exists() {
+            return;
+        }
         let iface = engine::awg::conf_interface_name(&awg_conf_path);
         if engine::awg::is_tunnel_running(&iface) {
             debug!("stopping AWG tunnel");
@@ -771,48 +776,47 @@ mod tests {
     use std::cell::RefCell;
 
     /// Test double for `Platform` that records every method call and can be
-    /// configured to fail `disable_proxy`. Lets tests assert whether/when
-    /// `cmd_stop` touched the system proxy without any real system calls.
+    /// configured to fail `detect_active_service` or `disable_proxy`. Lets
+    /// tests assert whether/when/in what order `cmd_stop` touched the system
+    /// proxy without any real system calls. When `pid_file_must_be_gone` is
+    /// set, every recorded call also asserts that the xray PID file no longer
+    /// exists — pinning "proxy is only touched after xray fully stopped".
+    #[derive(Default)]
     struct RecordingPlatform {
         calls: RefCell<Vec<String>>,
+        fail_detect_active_service: bool,
         fail_disable_proxy: bool,
+        pid_file_must_be_gone: Option<std::path::PathBuf>,
     }
 
     impl RecordingPlatform {
-        fn new() -> Self {
-            Self {
-                calls: RefCell::new(Vec::new()),
-                fail_disable_proxy: false,
+        fn record(&self, method: &str) {
+            self.calls.borrow_mut().push(method.to_string());
+            if let Some(pid_file) = &self.pid_file_must_be_gone {
+                assert!(
+                    !pid_file.exists(),
+                    "{method} called while the xray PID file still exists"
+                );
             }
-        }
-
-        fn failing_disable_proxy() -> Self {
-            Self {
-                fail_disable_proxy: true,
-                ..Self::new()
-            }
-        }
-
-        fn count(&self, method: &str) -> usize {
-            self.calls.borrow().iter().filter(|c| *c == method).count()
         }
     }
 
     impl Platform for RecordingPlatform {
         fn detect_active_service(&self) -> anyhow::Result<String> {
-            self.calls
-                .borrow_mut()
-                .push("detect_active_service".to_string());
+            self.record("detect_active_service");
+            if self.fail_detect_active_service {
+                anyhow::bail!("detect_active_service failed (test)");
+            }
             Ok("Wi-Fi".to_string())
         }
 
         fn enable_proxy(&self, _service: &str, _host: &str, _port: u16) -> anyhow::Result<()> {
-            self.calls.borrow_mut().push("enable_proxy".to_string());
+            self.record("enable_proxy");
             Ok(())
         }
 
         fn disable_proxy(&self, _service: &str) -> anyhow::Result<()> {
-            self.calls.borrow_mut().push("disable_proxy".to_string());
+            self.record("disable_proxy");
             if self.fail_disable_proxy {
                 anyhow::bail!("disable_proxy failed (test)");
             }
@@ -820,7 +824,7 @@ mod tests {
         }
 
         fn proxy_status(&self, _service: &str) -> anyhow::Result<ProxyStatus> {
-            self.calls.borrow_mut().push("proxy_status".to_string());
+            self.record("proxy_status");
             let off = || ProxyInfo {
                 enabled: false,
                 server: String::new(),
@@ -836,9 +840,7 @@ mod tests {
         fn discover_corporate_dns(
             &self,
         ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
-            self.calls
-                .borrow_mut()
-                .push("discover_corporate_dns".to_string());
+            self.record("discover_corporate_dns");
             Ok(std::collections::BTreeMap::new())
         }
     }
@@ -855,19 +857,34 @@ mod tests {
         }
     }
 
-    /// Spawn a `/bin/sleep` child standing in for a running xray process and
-    /// write its PID to the config's PID file (config uses `xray_bin = "sleep"`
-    /// so the PID-reuse guard in `xray::is_running` accepts it).
+    /// Spawn a `/bin/sleep` child standing in for a running xray process,
+    /// write its PID to the config's PID file (config uses `xray_bin =
+    /// "sleep"` so the PID-reuse guard in `xray::is_running` accepts it), and
+    /// reap it on a background thread. The reaper matters: without it the
+    /// SIGTERM'd child lingers as a zombie, a zombie still answers
+    /// `kill(pid, 0)` as alive (see test_process_dead_after_exit in xray.rs),
+    /// and `xray::stop` would burn its full 2s wait loop and take the SIGKILL
+    /// fallback instead of the graceful-termination branch these tests are
+    /// meant to cover. Join the returned handle after `cmd_stop` returns.
     #[cfg(unix)]
-    fn spawn_fake_xray(config: &crate::config::Config) -> std::process::Child {
+    fn spawn_fake_xray(config: &crate::config::Config) -> std::thread::JoinHandle<()> {
         std::fs::create_dir_all(config.xray_pid_file.parent().unwrap()).unwrap();
-        let child = std::process::Command::new("/bin/sleep")
+        let mut child = std::process::Command::new("/bin/sleep")
             .arg("30")
             .spawn()
             .expect("failed to spawn sleep");
         std::fs::write(&config.xray_pid_file, child.id().to_string()).unwrap();
-        child
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        })
     }
+
+    // Note on coverage: the motivating NotPermitted case (xray owned by
+    // another user, EPERM on SIGTERM) cannot be exercised in a unit test
+    // without a root-owned process; it is covered by manual verification
+    // (see the plan's Post-Completion section). Every `xray::stop` error
+    // takes the same early-return path in `cmd_stop` as the NotRunning case
+    // below.
 
     /// Regression test: a failed stop (here: xray not running) must not touch
     /// the system proxy at all — previously the proxy was disabled first.
@@ -875,13 +892,16 @@ mod tests {
     fn test_cmd_stop_without_running_xray_never_touches_proxy() {
         let dir = tempfile::tempdir().unwrap();
         let config = temp_config(dir.path(), "xray");
-        let plat = RecordingPlatform::new();
+        let plat = RecordingPlatform::default();
 
         let err = super::cmd_stop(&config, &plat).expect_err("stop must fail with no PID file");
 
         assert!(err.to_string().contains("not running"));
-        assert_eq!(plat.count("disable_proxy"), 0);
-        assert_eq!(plat.count("detect_active_service"), 0);
+        assert!(
+            plat.calls.borrow().is_empty(),
+            "no Platform call is allowed after a failed stop, got {:?}",
+            plat.calls.borrow()
+        );
     }
 
     #[test]
@@ -889,17 +909,45 @@ mod tests {
     fn test_cmd_stop_disables_proxy_after_successful_xray_stop() {
         let dir = tempfile::tempdir().unwrap();
         let config = temp_config(dir.path(), "sleep");
-        let mut child = spawn_fake_xray(&config);
+        let reaper = spawn_fake_xray(&config);
 
-        let plat = RecordingPlatform::new();
+        // The mock asserts at every call that the PID file is already gone,
+        // pinning the ordering (xray stopped first) on the success path too.
+        let plat = RecordingPlatform {
+            pid_file_must_be_gone: Some(config.xray_pid_file.clone()),
+            ..Default::default()
+        };
         let result = super::cmd_stop(&config, &plat);
 
-        // Reap the child before asserting: a zombie still answers
-        // kill(pid, 0) as alive (see test_process_dead_after_exit in xray.rs).
-        child.wait().expect("failed to reap sleep child");
+        reaper.join().expect("failed to join reaper thread");
 
         result.expect("cmd_stop must succeed when xray stops cleanly");
-        assert_eq!(plat.count("disable_proxy"), 1);
+        assert_eq!(
+            *plat.calls.borrow(),
+            ["detect_active_service", "disable_proxy"]
+        );
+        assert!(!config.xray_pid_file.exists(), "PID file must be removed");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_stop_propagates_detect_active_service_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "sleep");
+        let reaper = spawn_fake_xray(&config);
+
+        let plat = RecordingPlatform {
+            fail_detect_active_service: true,
+            ..Default::default()
+        };
+        let result = super::cmd_stop(&config, &plat);
+
+        reaper.join().expect("failed to join reaper thread");
+
+        let err = result.expect_err("cmd_stop must propagate detect_active_service error");
+        assert!(err.to_string().contains("detect_active_service failed"));
+        // xray is already stopped, but the proxy itself was never touched.
+        assert_eq!(*plat.calls.borrow(), ["detect_active_service"]);
         assert!(!config.xray_pid_file.exists(), "PID file must be removed");
     }
 
@@ -908,16 +956,22 @@ mod tests {
     fn test_cmd_stop_propagates_disable_proxy_error() {
         let dir = tempfile::tempdir().unwrap();
         let config = temp_config(dir.path(), "sleep");
-        let mut child = spawn_fake_xray(&config);
+        let reaper = spawn_fake_xray(&config);
 
-        let plat = RecordingPlatform::failing_disable_proxy();
+        let plat = RecordingPlatform {
+            fail_disable_proxy: true,
+            ..Default::default()
+        };
         let result = super::cmd_stop(&config, &plat);
 
-        child.wait().expect("failed to reap sleep child");
+        reaper.join().expect("failed to join reaper thread");
 
         let err = result.expect_err("cmd_stop must propagate disable_proxy error");
         assert!(err.to_string().contains("disable_proxy failed"));
-        assert_eq!(plat.count("disable_proxy"), 1);
+        assert_eq!(
+            *plat.calls.borrow(),
+            ["detect_active_service", "disable_proxy"]
+        );
     }
 
     fn format_xray_status(pid: Option<i32>) -> String {
@@ -1196,14 +1250,7 @@ mod tests {
     fn test_ensure_directories_creates_all_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
-        let config = crate::config::Config {
-            xray_bin: "xray".to_string(),
-            xray_config: base.join("xray/config.json"),
-            xray_log: base.join("logs/xray.log"),
-            xray_pid_file: base.join("xray/xray.pid"),
-            corvex_settings: base.join("corvex/corvex.json"),
-            corvex_log: base.join("state/corvex/corvex.log"),
-        };
+        let config = temp_config(base, "xray");
         let settings = crate::settings::CorvexSettings::default();
 
         super::ensure_directories(&config, &settings);
@@ -1218,14 +1265,7 @@ mod tests {
     fn test_ensure_directories_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
-        let config = crate::config::Config {
-            xray_bin: "xray".to_string(),
-            xray_config: base.join("xray/config.json"),
-            xray_log: base.join("logs/xray.log"),
-            xray_pid_file: base.join("xray/xray.pid"),
-            corvex_settings: base.join("corvex/corvex.json"),
-            corvex_log: base.join("state/corvex/corvex.log"),
-        };
+        let config = temp_config(base, "xray");
         let settings = crate::settings::CorvexSettings::default();
 
         super::ensure_directories(&config, &settings);
@@ -1239,14 +1279,7 @@ mod tests {
     fn test_ensure_directories_with_log_settings() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
-        let config = crate::config::Config {
-            xray_bin: "xray".to_string(),
-            xray_config: base.join("xray/config.json"),
-            xray_log: base.join("logs/xray.log"),
-            xray_pid_file: base.join("xray/xray.pid"),
-            corvex_settings: base.join("corvex/corvex.json"),
-            corvex_log: base.join("state/corvex/corvex.log"),
-        };
+        let config = temp_config(base, "xray");
         // Use forward slashes so the path is valid JSON on Windows too
         let base_str = base.display().to_string().replace('\\', "/");
         let json = format!(

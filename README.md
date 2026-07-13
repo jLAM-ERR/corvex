@@ -92,12 +92,14 @@ corvex status   # Show engine type, process state, ports, proxy settings
 | Command | Description |
 |---------|-------------|
 | `start` | Load `corvex.json`, resolve server, start xray (+ AWG tunnel if vpn://), enable system proxy |
-| `stop` | Stop xray first; only if that succeeds, disable system proxy and stop AWG tunnel if running. A failed stop (e.g. xray owned by another user) leaves the proxy untouched |
+| `stop` | Stop xray first; only if that succeeds, disable system proxy and stop AWG tunnel |
 | `restart` | Same flow as `start`: stops the running xray (and stale AWG tunnel), re-reads config, re-resolves server, re-applies system proxy |
 | `reload` | Validate config and send SIGHUP to xray |
 | `status` | Show engine type (xray / AWG+xray), process state, ports, proxy settings |
 | `logs` | Show last 20 log lines |
 | `logs -f` | Follow log output |
+
+A failed `stop` (e.g. xray owned by another user) leaves the system proxy untouched; if disabling the proxy fails after xray stopped, the AWG tunnel is likewise left running.
 
 ## Flags
 

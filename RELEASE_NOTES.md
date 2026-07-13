@@ -7,7 +7,7 @@
 
 Now, when stopping xray fails for any reason, corvex reports the error and changes nothing: no password prompts, proxy and AWG tunnel stay as they were.
 
-Trade-off: if xray is not running but the proxy is still enabled (for example, after a crash), `corvex stop` reports `xray is not running` and leaves the proxy on. To clean up, run `corvex start` followed by `corvex stop`, or `sudo corvex stop` for a root-owned instance.
+Trade-off: if xray is not running but the proxy is still enabled (for example, after a crash), `corvex stop` reports `xray is not running` and leaves the proxy on. To clean up, run `corvex start` followed by `corvex stop`, or `sudo corvex stop` for a root-owned instance. Likewise, if disabling the proxy fails after xray already stopped (for example, a cancelled password prompt), the AWG tunnel is left running; the same `corvex start` + `corvex stop` recovery applies.
 
 # Corvex v0.6.1 Release Notes
 

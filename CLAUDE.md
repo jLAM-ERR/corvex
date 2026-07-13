@@ -86,6 +86,7 @@ src/
 - Static proxy port from `proxy.port` in corvex.json (required)
 - EngineMode enum with match dispatch (Xray vs AWG)
 - Platform abstraction via cfg-gated concrete types (no dynamic dispatch)
+- Command functions take `&impl Platform` — unit-tested against the `RecordingPlatform` mock in `src/main.rs` tests (records calls, configurable failures, no real system calls)
 - Loopback and RFC1918 are short-circuited to `direct` at the top of `routing.rules` (see `traffic.rs::build_routing_rules`)
 
 ## Key paths
