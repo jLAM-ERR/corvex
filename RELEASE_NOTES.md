@@ -1,42 +1,34 @@
-# Corvex v0.6.0 Release Notes
+# Corvex v0.6.1 Release Notes
 
 ## Highlights
 
-One-command installation with `install.sh`, a new `restart` command, smarter subscriptions (panel-friendly request identity, JSON-array format support, opt-in routing merge), and the first Linux binaries.
+A bug-fix release. `corvex start` now works as a normal user on macOS again — corvex asks for your password with a graphical prompt when it needs to change system proxy settings, instead of failing with a blank error and pushing you toward `sudo`. It also no longer mistakes a copy of xray started by another user for a dead process.
 
-## What's New
+## Fixes
 
-### install.sh installer
-```bash
-curl -fsSL https://raw.githubusercontent.com/jLAM-ERR/corvex/main/install.sh | sh
-```
-Installs the latest corvex release and — as a dependency — the xray engine when it's missing, including xray's `geoip.dat`/`geosite.dat` (required for `geosite:`/`geoip:` routing rules). Re-runs upgrade corvex and top up missing geo data without touching an existing xray. Supports macOS (arm64/x86_64) and Linux (x86_64).
+### Rootless start on macOS works again
+On current macOS, `networksetup` reports "Command requires admin privileges." on standard output rather than the error channel. corvex only inspected the error channel, so it never recognized the message, skipped its built-in graphical password prompt, and stopped with an empty `networksetup … failed:` error. The most common reaction — re-running with `sudo` — then left an xray process owned by root, which set up the problem below.
 
-### No more auto-install at runtime
-corvex no longer silently runs `brew install` / `winget install` during `start`. Missing xray → a clear error pointing at install.sh. AmneziaWG is optional and never installed by corvex — install `amneziawg-tools` manually before using `vpn://` configs.
+corvex now inspects both output channels (and treats an `** Error` on standard output as a failure even when the exit code is zero). When macOS asks for administrator rights to change proxy settings, corvex shows the password dialog and continues. No `sudo` needed for `corvex start`.
 
-### restart command
-`corvex restart` runs the full start flow: stops the running xray (and a stale AWG tunnel — previously leaked when switching engine modes), re-reads corvex.json, re-resolves the server, regenerates the config, and re-applies the system proxy.
+### An xray started by another user is recognized as running
+corvex checks whether xray is already running by signalling the recorded process. When that process belongs to another user (for example, one started earlier with `sudo`), the operating system answers "not permitted" — the process is alive, just not yours to signal. corvex read that answer as "the process is dead", deleted its record, and started a second xray, which then failed to bind the proxy port with `address already in use`.
 
-### Subscriptions
-- **`subs-url` replaces `file-url`** (the old key still works as an alias).
-- **Request identity**: `subs-user-agent` (default `v2rayNG/1.10.2`) and `subs-headers` — subscription panels content-negotiate on User-Agent and may filter unknown clients; these keys make corvex look like a client your panel accepts.
-- **JSON-array subscription format**: panels that serve complete xray configs (the format sent to mobile clients such as Happ) are auto-detected; servers are extracted straight from the JSON and health-checked as usual.
-- **`routes.merge-subs`** (opt-in, default off, transitional): merges the subscription's own direct-routing domains/IPs into corvex routing. Local `proxy-traffic` always wins; the loopback/RFC1918 rule can never be displaced. See the README security warning before enabling.
+corvex now treats "not permitted" as "running":
 
-### Removed: `routes.direct-ru`
-Route .ru directly via `routes.corporate-traffic` or a subscription's direct rules instead. A leftover `direct-ru` key in old configs still parses and logs a warning.
+- `start` reports `xray is already running` instead of starting a duplicate.
+- `stop` and `reload` report `xray (PID: N) is running as another user - try again with sudo` and leave the record in place, instead of silently reporting success while the other xray keeps running.
 
-### Reliability fixes
-- Switching from an AWG session to an xray server no longer fails after tearing down the tunnel — an un-updatable config is regenerated from scratch.
-- Routing rules and the proxy outbound tag can no longer desync when an unnamed server replaces a named one.
+### `corvex --version`
+`corvex --version` now prints the version. It previously errored with "unexpected argument '--version'".
 
-### CI / packaging
-- First **Linux (x86_64, static musl)** release binaries.
-- Tests run on macOS, Linux, and Windows; CI triggers once per PR and once per version tag.
+### Installer retries downloads
+`install.sh` now retries each download up to three times with a connect timeout, so a single dropped connection to GitHub no longer aborts the whole install partway through. A failed checksum download can also no longer be mistaken for a failed archive download.
 
-## Migration from v0.5.x
+## Upgrading from a mixed sudo/user state
 
-- corvex.json needs no changes: `file-url` keeps working (renamed to `subs-url`), `direct-ru` is ignored with a warning.
-- If you relied on `direct-ru`, add the .ru entries you need to `routes.corporate-traffic` or enable `routes.merge-subs` with a subscription that carries them.
-- If you relied on xray being auto-installed by brew/winget: run `install.sh` once, or install xray yourself.
+If you had been starting corvex with `sudo` to work around the macOS proxy error, run `sudo corvex stop` once to retire the root-owned xray, then use plain `corvex start` from now on — a password dialog appears when corvex updates the system proxy.
+
+## Migration
+
+corvex.json needs no changes.
