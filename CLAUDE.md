@@ -20,7 +20,7 @@ cargo run -- --help   # Show CLI help
 
 ```bash
 cargo run -- start                              # Load corvex.json, resolve server, start
-cargo run -- stop                               # Disable system proxy + stop xray (+ AWG if active)
+cargo run -- stop                               # Stop xray first; system proxy is disabled (+ AWG stopped) only if the stop succeeded
 cargo run -- restart                            # Full stop + start: restarts xray, re-applies system proxy
 cargo run -- reload                             # Validate config, send SIGHUP
 cargo run -- status                             # Show engine type, xray process, ports, proxy settings
@@ -86,6 +86,7 @@ src/
 - Static proxy port from `proxy.port` in corvex.json (required)
 - EngineMode enum with match dispatch (Xray vs AWG)
 - Platform abstraction via cfg-gated concrete types (no dynamic dispatch)
+- Command functions take `&impl Platform` — unit-tested against the `RecordingPlatform` mock in `src/main.rs` tests (records calls, configurable failures, no real system calls)
 - Loopback and RFC1918 are short-circuited to `direct` at the top of `routing.rules` (see `traffic.rs::build_routing_rules`)
 
 ## Key paths
