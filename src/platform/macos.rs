@@ -12,31 +12,93 @@ impl MacOsPlatform {
     }
 }
 
-fn run_networksetup(args: &[&str]) -> Result<String> {
+/// Outcome of one `networksetup` invocation, with "needs admin" kept apart
+/// from a real failure so the caller decides when (and how widely) to escalate.
+#[derive(Debug, PartialEq)]
+enum NsOutcome {
+    Ok(String),
+    NeedsAdmin,
+    Failed(String),
+}
+
+/// Decide the outcome from already-captured process output, without spawning
+/// anything, so the decision itself is unit testable.
+fn classify_networksetup_output(exit_ok: bool, stdout: &str, stderr: &str) -> NsOutcome {
+    // networksetup reports errors inconsistently across macOS versions:
+    // sometimes on stderr, sometimes on stdout (e.g. "** Error: Command
+    // requires admin privileges."), and not always with a failing exit code.
+    if !exit_ok || stdout.contains("** Error") {
+        let detail = join_output(stdout, stderr);
+        if is_admin_required_error(&detail) {
+            return NsOutcome::NeedsAdmin;
+        }
+        return NsOutcome::Failed(detail);
+    }
+    NsOutcome::Ok(stdout.to_string())
+}
+
+/// Runs one `networksetup` invocation and classifies the result. Returns
+/// `Err` only when the process itself could not be spawned.
+fn try_networksetup(args: &[&str]) -> Result<NsOutcome> {
     let output = Command::new("networksetup")
         .args(args)
         .output()
         .with_context(|| format!("Failed to run: networksetup {}", args.join(" ")))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Ok(classify_networksetup_output(
+        output.status.success(),
+        &stdout,
+        &stderr,
+    ))
+}
 
-    // networksetup reports errors inconsistently across macOS versions:
-    // sometimes on stderr, sometimes on stdout (e.g. "** Error: Command
-    // requires admin privileges."), and not always with a failing exit code.
-    if !output.status.success() || stdout.contains("** Error") {
-        let detail = join_output(&stdout, &stderr);
-        if is_admin_required_error(&detail) {
+fn run_networksetup(args: &[&str]) -> Result<String> {
+    match try_networksetup(args)? {
+        NsOutcome::Ok(stdout) => Ok(stdout),
+        NsOutcome::NeedsAdmin => {
             debug!(
                 "admin required for networksetup {}, escalating via osascript",
                 args.join(" ")
             );
-            return run_networksetup_elevated(&[args.to_vec()]);
+            run_networksetup_elevated(&[args.to_vec()])
         }
-        anyhow::bail!("networksetup {} failed: {}", args.join(" "), detail);
+        NsOutcome::Failed(detail) => {
+            anyhow::bail!("networksetup {} failed: {}", args.join(" "), detail)
+        }
+    }
+}
+
+/// Runs a sequence of `networksetup` commands unelevated, in order. The
+/// moment one needs admin, the whole sequence is re-run through a single
+/// osascript prompt instead of escalating per command.
+// Wired up in Task 3 (enable_proxy / disable_proxy).
+#[allow(dead_code)]
+fn run_networksetup_all(commands: &[Vec<&str>]) -> Result<()> {
+    if commands.is_empty() {
+        return Ok(());
     }
 
-    Ok(stdout)
+    for args in commands {
+        match try_networksetup(args)? {
+            NsOutcome::Ok(_) => continue,
+            NsOutcome::NeedsAdmin => {
+                debug!(
+                    "admin required for networksetup {}, escalating {} commands into one osascript prompt",
+                    args.join(" "),
+                    commands.len()
+                );
+                run_networksetup_elevated(commands)?;
+                return Ok(());
+            }
+            NsOutcome::Failed(detail) => {
+                anyhow::bail!("networksetup {} failed: {}", args.join(" "), detail);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Combine stdout and stderr into one error detail string.
@@ -510,5 +572,50 @@ mod tests {
         let cmd = build_osascript_command(&commands);
         let escaped_service = "'Thunderbolt \\\"Pro\\\" Bridge'";
         assert_eq!(cmd.matches(escaped_service).count(), 3);
+    }
+
+    // classify_networksetup_output tests
+    #[test]
+    fn classify_success() {
+        let outcome = classify_networksetup_output(true, "Enabled: Yes\n", "");
+        assert_eq!(outcome, NsOutcome::Ok("Enabled: Yes\n".to_string()));
+    }
+
+    #[test]
+    fn classify_admin_required_on_stdout_with_zero_exit() {
+        let outcome = classify_networksetup_output(
+            true,
+            "** Error: Command requires admin privileges.\n",
+            "",
+        );
+        assert_eq!(outcome, NsOutcome::NeedsAdmin);
+    }
+
+    #[test]
+    fn classify_admin_required_on_stderr_with_nonzero_exit() {
+        let outcome = classify_networksetup_output(
+            false,
+            "",
+            "** Error: Command requires admin privileges.\n",
+        );
+        assert_eq!(outcome, NsOutcome::NeedsAdmin);
+    }
+
+    #[test]
+    fn classify_unrelated_failure() {
+        let outcome = classify_networksetup_output(false, "", "** Error: Invalid arguments.\n");
+        assert_eq!(
+            outcome,
+            NsOutcome::Failed("** Error: Invalid arguments.".to_string())
+        );
+    }
+
+    // run_networksetup_all tests
+    #[test]
+    fn run_networksetup_all_empty_slice_is_a_noop() {
+        // An empty batch must return before building any script; otherwise
+        // build_osascript_command would render `do shell script "" with
+        // administrator privileges`, popping a password dialog for a no-op.
+        assert!(run_networksetup_all(&[]).is_ok());
     }
 }
