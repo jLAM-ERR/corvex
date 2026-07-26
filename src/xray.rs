@@ -533,15 +533,28 @@ fn asset_dir_override(env_set: bool, both_dat_files_exist: bool) -> Option<&'sta
 /// unwritable `xray.pid` is caught here - before a freshly spawned xray keeps
 /// running untracked - rather than after (see the post-spawn `fs::write`
 /// below, which this narrows but cannot eliminate). Accepts a file that
-/// opens for writing directly, or, failing that, one that can be removed:
-/// the containing directory is normally still user-owned even when the file
-/// itself is root-owned (e.g. from a prior `sudo corvex start`), so unlink
-/// usually succeeds where truncate does not. Rejects only when neither
-/// works. A file that did not exist before this check and was created only
-/// to prove the path is writable is removed again immediately, so it does
-/// not sit there under the wrong permissions if `cmd.spawn()` never runs.
-fn preflight_pid_file(path: &Path) -> Result<()> {
-    let existed_before = path.exists();
+/// opens for writing directly, or, failing that, an *existing* file that is
+/// both readable and confirmed - by the same liveness check `is_running`
+/// already performs - not to track a live xray.
+///
+/// A file we cannot even read is never removed on a guess: `is_running`
+/// treats a read failure exactly like "no PID file" and returns `None`
+/// without deleting anything, so an unreadable root-owned `xray.pid` may
+/// still be tracking a live xray. An earlier version of this preflight
+/// unlinked any existing-but-unwritable file whenever the containing
+/// directory allowed it, regardless of whether the file could be read -
+/// which could delete a live xray's own PID file and let a second xray spawn
+/// in its place, orphaning the first. That is the exact inverse of the bug
+/// this preflight exists to prevent.
+///
+/// Existence is checked with `symlink_metadata`, not `Path::exists`: the
+/// latter follows symlinks, so a dangling PID symlink would read as "does
+/// not exist", the write-open below would then silently create the
+/// symlink's *target*, and the "newly created, clean it up" branch would
+/// delete the symlink itself instead of the file it had just created.
+fn preflight_pid_file(path: &Path, xray_bin: &str) -> Result<()> {
+    let existed_before = fs::symlink_metadata(path).is_ok();
+
     if fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -554,21 +567,72 @@ fn preflight_pid_file(path: &Path) -> Result<()> {
         }
         return Ok(());
     }
-    if existed_before && fs::remove_file(path).is_ok() {
-        return Ok(());
+
+    if !existed_before {
+        anyhow::bail!(pid_file_preflight_message(path));
     }
-    anyhow::bail!(pid_file_preflight_message(path));
+
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            if pid_file_tracks_live_xray(&contents, xray_bin) {
+                anyhow::bail!(pid_file_tracks_live_process_message(path));
+            }
+            if fs::remove_file(path).is_ok() {
+                return Ok(());
+            }
+            anyhow::bail!(pid_file_preflight_message(path));
+        }
+        Err(_) => anyhow::bail!(pid_file_unreadable_message(path)),
+    }
 }
 
-/// Message for a PID file that is neither writable nor removable. Names
-/// `sudo rm`, not `sudo corvex stop`: the file itself is the obstacle, not a
-/// running process, and `stop` cannot touch it either.
+/// Whether raw PID-file `contents` currently name a live xray process.
+/// Mirrors `is_running`'s liveness check with no side effect (no removal),
+/// so `preflight_pid_file` can decide whether an unwritable-but-readable
+/// file is safe to remove without ever guessing.
+fn pid_file_tracks_live_xray(contents: &str, xray_bin: &str) -> bool {
+    match contents.trim().parse::<i32>() {
+        Ok(pid) => is_process_alive(pid) && process_is_xray(pid, xray_bin),
+        Err(_) => false,
+    }
+}
+
+/// Message for a PID file that was read, shown not to track a live xray, and
+/// is still neither writable nor removable. Names `sudo rm`, not `sudo
+/// corvex stop`: the file itself is the obstacle, not a running process, and
+/// `stop` cannot touch it either.
 fn pid_file_preflight_message(path: &Path) -> String {
     format!(
         "PID file {} cannot be written and cannot be removed either (likely owned by another \
          user, e.g. from a prior `sudo corvex start`). Fix with: sudo rm -- {}",
         path.display(),
         config::shell_quote(&path.display().to_string())
+    )
+}
+
+/// Message for a PID file corvex cannot read at all, so it cannot rule out
+/// that it names a live xray. Deliberately never suggests removing it
+/// directly - only a manual check first, since deleting it on a guess could
+/// orphan a process that is actually still running.
+fn pid_file_unreadable_message(path: &Path) -> String {
+    format!(
+        "PID file {} cannot be read, so corvex cannot tell whether it tracks a running xray. \
+         Check with `ps` for a matching xray process before removing it manually - corvex will \
+         not remove a PID file it cannot read.",
+        path.display()
+    )
+}
+
+/// Message for a PID file that reads back as a genuinely live xray corvex
+/// cannot write to. `is_running` (called earlier in `start`) should already
+/// have turned this into `AlreadyRunning` before the preflight ever runs;
+/// this message exists so the preflight itself never removes a file naming
+/// a live process, regardless of what ran before it.
+fn pid_file_tracks_live_process_message(path: &Path) -> String {
+    format!(
+        "PID file {} names a running xray process that corvex cannot write to, and will not \
+         remove since that would orphan it. Stop that xray first, then retry.",
+        path.display()
     )
 }
 
@@ -587,6 +651,20 @@ fn pid_file_write_failed_message(pid: i32, path: &Path, err: &std::io::Error) ->
     )
 }
 
+/// Error text for the (practically unreachable on unix, but real on Windows,
+/// where native PIDs are `u32`) case where the spawned PID does not fit in
+/// the `i32` corvex tracks internally. xray is already running by this
+/// point, so - exactly like the post-spawn write failure above - this has to
+/// say so and name a command that reclaims it, using the original `u32`
+/// value since it never became an `i32`.
+fn pid_out_of_range_message(native_pid: u32) -> String {
+    format!(
+        "xray started with PID {native_pid}, but that PID does not fit in the range corvex \
+         tracks internally, so no PID file was written and corvex does not track this process. \
+         Stop it with: sudo kill {native_pid} (or `kill {native_pid}` if you own the process)"
+    )
+}
+
 /// Start the xray process.
 pub fn start(config: &Config) -> Result<i32> {
     if !config.xray_config.exists() {
@@ -597,7 +675,14 @@ pub fn start(config: &Config) -> Result<i32> {
         return Err(XrayError::AlreadyRunning(pid).into());
     }
 
-    preflight_pid_file(&config.xray_pid_file)?;
+    // The PID directory must exist before the preflight runs, not only
+    // before the post-spawn write: on a path whose directory does not exist
+    // yet, the preflight's create-if-missing open would otherwise fail with
+    // NotFound and refuse a start that used to work fine.
+    if let Some(pid_dir) = config.xray_pid_file.parent() {
+        let _ = fs::create_dir_all(pid_dir);
+    }
+    preflight_pid_file(&config.xray_pid_file, &config.xray_bin)?;
 
     if let Some(log_dir) = config.xray_log.parent() {
         let _ = fs::create_dir_all(log_dir);
@@ -640,12 +725,12 @@ pub fn start(config: &Config) -> Result<i32> {
         .spawn()
         .with_context(|| format!("Failed to spawn xray process via {}", xray_bin.display()))?;
 
-    let pid: i32 = child.id().try_into().context("PID exceeds i32 range")?;
+    let native_pid = child.id();
+    let pid: i32 = native_pid
+        .try_into()
+        .map_err(|_| anyhow::anyhow!(pid_out_of_range_message(native_pid)))?;
     debug!("xray spawned with PID {}", pid);
 
-    if let Some(pid_dir) = config.xray_pid_file.parent() {
-        let _ = fs::create_dir_all(pid_dir);
-    }
     fs::write(&config.xray_pid_file, pid.to_string()).map_err(|e| {
         anyhow::anyhow!(pid_file_write_failed_message(
             pid,
@@ -1167,7 +1252,7 @@ mod tests {
         assert_eq!(result.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![2, 3]);
     }
 
-    // -- preflight_pid_file / pid_file_preflight_message / pid_file_write_failed_message --
+    // -- preflight_pid_file and its message builders --
 
     #[test]
     fn test_pid_file_preflight_message_names_file_and_sudo_rm() {
@@ -1189,20 +1274,81 @@ mod tests {
     }
 
     #[test]
+    fn test_pid_out_of_range_message_names_pid_and_sudo_kill() {
+        let msg = pid_out_of_range_message(4_294_967_295);
+        assert!(msg.contains("4294967295"));
+        assert!(msg.contains("sudo kill 4294967295"));
+    }
+
+    /// Never a bare `sudo rm`: an unreadable PID file might still be tracking
+    /// a live xray, so corvex must not suggest deleting it outright.
+    #[test]
+    fn test_pid_file_unreadable_message_never_suggests_bare_rm() {
+        let msg = pid_file_unreadable_message(Path::new("/Users/alice/.config/xray/xray.pid"));
+        assert!(msg.contains("/Users/alice/.config/xray/xray.pid"));
+        assert!(!msg.contains("sudo rm"));
+    }
+
+    #[test]
+    fn test_pid_file_tracks_live_process_message_never_suggests_rm() {
+        let msg =
+            pid_file_tracks_live_process_message(Path::new("/Users/alice/.config/xray/xray.pid"));
+        assert!(msg.contains("/Users/alice/.config/xray/xray.pid"));
+        assert!(!msg.contains("sudo rm"));
+    }
+
+    #[test]
+    fn test_pid_file_tracks_live_xray_rejects_garbage_content() {
+        assert!(!pid_file_tracks_live_xray("not-a-pid", "xray"));
+    }
+
+    /// Spawn a trivial child and wait for it, giving a real PID that is
+    /// guaranteed dead - used instead of an arbitrary literal so these tests
+    /// never depend on which PIDs happen to be free on the test machine.
+    #[cfg(unix)]
+    fn definitely_dead_pid() -> i32 {
+        let mut child = Command::new("true")
+            .spawn()
+            .expect("failed to spawn test process");
+        let pid = child.id() as i32;
+        child.wait().expect("failed to wait for test process");
+        pid
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_pid_file_tracks_live_xray_false_for_dead_pid() {
+        assert!(!pid_file_tracks_live_xray(
+            &definitely_dead_pid().to_string(),
+            "xray"
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_pid_file_tracks_live_xray_false_for_alive_non_xray_process() {
+        // Our own test process is alive but is not xray.
+        assert!(!pid_file_tracks_live_xray(
+            &std::process::id().to_string(),
+            "xray"
+        ));
+    }
+
+    #[test]
     #[cfg(unix)]
     fn test_preflight_pid_file_accepts_readonly_file_in_writable_dir() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("xray.pid");
-        fs::write(&path, "999").unwrap();
+        fs::write(&path, definitely_dead_pid().to_string()).unwrap();
         let mut perms = fs::metadata(&path).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o400);
         fs::set_permissions(&path, perms).unwrap();
 
-        let result = preflight_pid_file(&path);
+        let result = preflight_pid_file(&path, "xray");
 
         assert!(
             result.is_ok(),
-            "a 0o400 file in a writable directory must be accepted as removable: {result:?}"
+            "a 0o400 file naming a dead PID in a writable directory must be accepted as removable: {result:?}"
         );
     }
 
@@ -1217,7 +1363,7 @@ mod tests {
         let sub = dir.path().join("pid_dir");
         fs::create_dir_all(&sub).unwrap();
         let path = sub.join("xray.pid");
-        fs::write(&path, "999").unwrap();
+        fs::write(&path, definitely_dead_pid().to_string()).unwrap();
 
         let mut file_perms = fs::metadata(&path).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut file_perms, 0o400);
@@ -1227,7 +1373,7 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut dir_perms, 0o500);
         fs::set_permissions(&sub, dir_perms).unwrap();
 
-        let result = preflight_pid_file(&path);
+        let result = preflight_pid_file(&path, "xray");
 
         // Restore before the temp dir drops, or cleanup fails.
         let mut dir_perms = fs::metadata(&sub).unwrap().permissions();
@@ -1238,6 +1384,57 @@ mod tests {
         assert!(err.to_string().contains(&path.display().to_string()));
     }
 
+    /// Critical regression guard: a PID file we cannot even read must never
+    /// be deleted, since it might still be tracking a live xray process -
+    /// deleting it and letting a duplicate spawn in its place is the exact
+    /// inverse of the bug this preflight exists to fix.
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_pid_file_rejects_unreadable_file_without_deleting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("xray.pid");
+        fs::write(&path, "12345").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o000);
+        fs::set_permissions(&path, perms).unwrap();
+
+        let result = preflight_pid_file(&path, "xray");
+
+        // Restore before the temp dir drops, or cleanup fails.
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+        fs::set_permissions(&path, perms).unwrap();
+
+        result.expect_err("an unreadable PID file must never be silently accepted");
+        assert!(
+            path.exists(),
+            "an unreadable PID file might still track a live xray and must not be deleted"
+        );
+    }
+
+    /// A dangling PID symlink must be accepted (the write-open follows it and
+    /// creates the target) without the symlink itself being deleted as if it
+    /// were a probe artifact this check created.
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_pid_file_accepts_dangling_symlink_without_deleting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nonexistent-target.pid");
+        let link = dir.path().join("xray.pid");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let result = preflight_pid_file(&link, "xray");
+
+        assert!(
+            result.is_ok(),
+            "a dangling symlink into a writable directory must be accepted: {result:?}"
+        );
+        assert!(
+            fs::symlink_metadata(&link).is_ok(),
+            "the symlink itself must not be deleted by the probe cleanup"
+        );
+    }
+
     #[test]
     #[cfg(unix)]
     fn test_preflight_pid_file_accepts_normal_writable_path() {
@@ -1245,7 +1442,7 @@ mod tests {
         let path = dir.path().join("xray.pid");
         fs::write(&path, "999").unwrap();
 
-        preflight_pid_file(&path).expect("a normal writable existing file must pass");
+        preflight_pid_file(&path, "xray").expect("a normal writable existing file must pass");
     }
 
     #[test]
@@ -1254,48 +1451,91 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("xray.pid");
 
-        preflight_pid_file(&path).expect("a nonexistent path in a writable directory must pass");
+        preflight_pid_file(&path, "xray")
+            .expect("a nonexistent path in a writable directory must pass");
         assert!(
             !path.exists(),
             "a probe file created only to check writability must be removed"
         );
     }
 
-    /// Writes an executable `#!/bin/sh` script at `path` that touches
-    /// `marker` and exits immediately - standing in for xray in the ordering
-    /// test below without leaving anything running to clean up.
+    /// Builds a real executable at `path` that ignores its arguments and
+    /// sleeps, standing in for a real, observable xray process in the tests
+    /// below. Deliberately not a `#!/bin/sh` script: a shebang script execs
+    /// through the interpreter, so both `ps -o comm=` (used by
+    /// `process_is_xray`) and argv[0] (used by `parse_xray_processes`) would
+    /// report `sh`, never the script's own name - `command_matches` would
+    /// then never recognize it as the configured `xray_bin`, regardless of
+    /// what that is set to. Compiling a tiny real binary avoids that
+    /// entirely; `rustc` is a hard dependency of this project's own build,
+    /// so it is always available wherever these tests run.
     #[cfg(unix)]
-    fn write_marker_script(path: &Path, marker: &Path) {
+    fn build_sleeping_fake_xray(path: &Path) {
+        let src = path.with_extension("rs");
         fs::write(
-            path,
-            format!(
-                "#!/bin/sh\ntouch {}\n",
-                config::shell_quote(&marker.display().to_string())
-            ),
+            &src,
+            "fn main() { std::thread::sleep(std::time::Duration::from_secs(5)); }",
         )
         .unwrap();
-        let mut perms = fs::metadata(path).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
-        fs::set_permissions(path, perms).unwrap();
+        let status = Command::new("rustc")
+            .args(["-O", "-o"])
+            .arg(path)
+            .arg(&src)
+            .status()
+            .expect("failed to invoke rustc to build the fake xray test binary");
+        assert!(
+            status.success(),
+            "rustc failed to build the fake xray test binary"
+        );
+    }
+
+    /// Poll briefly for a process matching `xray_bin` via the same
+    /// `list_xray_processes` corvex itself uses, returning its PID. Detects a
+    /// spawned child through its presence in the process table - visible
+    /// within milliseconds of `fork()` - rather than waiting for its script
+    /// body to actually execute, which made an earlier version of this poll
+    /// slow (300-400ms) and, under load, right at the edge of flaky.
+    #[cfg(unix)]
+    fn poll_for_process(xray_bin: &str) -> Option<i32> {
+        for _ in 0..10 {
+            if let Some(p) = list_xray_processes(xray_bin).first() {
+                return Some(p.pid);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    /// SIGKILL and reap `pid` if it is `Some`. `start()` never hands back a
+    /// `Child` on its error paths, so a test that provokes a real spawn (by
+    /// design, to prove one did or did not happen) has to identify and reap
+    /// the OS process directly - dropping a `std::process::Child` does not
+    /// reap it on Unix, and it would otherwise sit as a zombie for the rest
+    /// of the test run. Modeled on the `FakeProcess` RAII guard in
+    /// `main.rs`'s tests, adapted because there is no `Child` value here to
+    /// hang a `Drop` off.
+    #[cfg(unix)]
+    fn reap_if_spawned(pid: Option<i32>) {
+        if let Some(pid) = pid {
+            let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+            let _ = nix::sys::wait::waitpid(Pid::from_raw(pid), None);
+        }
     }
 
     /// Regression guard for the ordering guarantee itself: `start` must
     /// return the preflight failure *before* `cmd.spawn()` ever runs. Stands
-    /// in a real, spawnable "xray" binary that touches a marker file and
-    /// exits immediately, so a regression that moved the preflight after
-    /// `cmd.spawn()` would leave the marker behind - a plain error-message
-    /// assertion could not tell the two apart. The stand-in exits on its own
-    /// (no `sleep`), so there is nothing left running to reap even if the
-    /// regression this test guards against were reintroduced.
+    /// in a real, spawnable "xray" binary, so a regression that moved the
+    /// preflight after `cmd.spawn()` would actually spawn it - a plain
+    /// error-message assertion could not tell the two apart.
     #[test]
     #[cfg(unix)]
     fn test_start_returns_before_spawn_when_pid_file_preflight_fails() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
 
-        let marker = base.join("spawned.marker");
-        let script = base.join("fake_xray.sh");
-        write_marker_script(&script, &marker);
+        let script = base.join("fake_xray_ordering_test");
+        build_sleeping_fake_xray(&script);
+        let script_name = script.file_name().unwrap().to_str().unwrap();
 
         let xray_config = base.join("xray/config.json");
         fs::create_dir_all(xray_config.parent().unwrap()).unwrap();
@@ -1306,7 +1546,7 @@ mod tests {
         let pid_dir = base.join("pid_dir");
         fs::create_dir_all(&pid_dir).unwrap();
         let pid_file = pid_dir.join("xray.pid");
-        fs::write(&pid_file, "999").unwrap();
+        fs::write(&pid_file, definitely_dead_pid().to_string()).unwrap();
         let mut file_perms = fs::metadata(&pid_file).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut file_perms, 0o400);
         fs::set_permissions(&pid_file, file_perms).unwrap();
@@ -1326,16 +1566,10 @@ mod tests {
         let result = start(&config);
 
         // If the ordering regression this test guards against were present,
-        // `cmd.spawn()` would already have run by now, but the forked child
-        // needs a moment to actually execute its `touch` before the marker
-        // shows up - poll instead of a single fixed sleep, which was found
-        // to be flaky (the child can take 300-400ms to run under load).
-        for _ in 0..20 {
-            if marker.exists() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
+        // `cmd.spawn()` would already have run: detect that via `ps` instead
+        // of a fixed sleep, so the passing case (nothing to find) stays fast.
+        let spawned_pid = poll_for_process(script_name);
+        reap_if_spawned(spawned_pid);
 
         // Restore before the temp dir drops, or cleanup fails.
         let mut dir_perms = fs::metadata(&pid_dir).unwrap().permissions();
@@ -1346,8 +1580,48 @@ mod tests {
             .expect_err("start must fail when the PID file is neither writable nor removable");
         assert!(err.to_string().contains(&pid_file.display().to_string()));
         assert!(
-            !marker.exists(),
+            spawned_pid.is_none(),
             "xray must never be spawned when the PID-file preflight fails"
         );
+    }
+
+    /// Regression guard for Finding 2: a PID directory that does not exist
+    /// yet must not block `start` - the directory has to be created before
+    /// the preflight runs, not only before the post-spawn write.
+    #[test]
+    #[cfg(unix)]
+    fn test_start_succeeds_when_pid_directory_does_not_exist_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        let script = base.join("fake_xray_missing_dir_test");
+        build_sleeping_fake_xray(&script);
+
+        let xray_config = base.join("xray/config.json");
+        fs::create_dir_all(xray_config.parent().unwrap()).unwrap();
+        fs::write(&xray_config, "{}").unwrap();
+
+        let pid_file = base.join("newdir/xray.pid");
+        assert!(
+            !pid_file.parent().unwrap().exists(),
+            "the PID directory must not exist yet for this test to be meaningful"
+        );
+
+        let config = Config {
+            xray_bin: script.display().to_string(),
+            xray_config,
+            xray_log: base.join("logs/xray.log"),
+            xray_pid_file: pid_file.clone(),
+            corvex_settings: base.join("corvex/corvex.json"),
+            corvex_log: base.join("state/corvex/corvex.log"),
+        };
+
+        let result = start(&config);
+
+        let pid =
+            result.expect("start must succeed even when the PID directory does not exist yet");
+        reap_if_spawned(Some(pid));
+
+        assert!(pid_file.exists(), "the PID file must have been written");
     }
 }
