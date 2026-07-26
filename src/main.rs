@@ -365,11 +365,11 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         .and_then(|r| r.corporate_traffic.clone())
         .unwrap_or_default();
     let log_config = build_xray_log_config(&s);
-    preflight_log_paths(&[
-        config.xray_log.clone(),
-        std::path::PathBuf::from(&log_config.access),
-        std::path::PathBuf::from(&log_config.error),
-    ])?;
+    preflight_log_paths(&xray_log_preflight_targets(
+        &config.xray_log,
+        &log_config.access,
+        &log_config.error,
+    ))?;
     let merge_subs = s.routes.as_ref().and_then(|r| r.merge_subs) == Some(true);
     let routing = RoutingContext {
         corporate_traffic: &corporate_traffic,
@@ -588,6 +588,14 @@ fn ensure_directories(config: &Config, settings: &settings::CorvexSettings) {
     }
 }
 
+/// Single-quote `s` for safe embedding in a shell command line: wraps it in
+/// single quotes and escapes any embedded single quote as `'\''`. Without
+/// this, a path containing a space, a glob character, or a leading `-` would
+/// make the suggested `chown` command wrong or unsafe to paste.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// Message for a log target xray could not open. `PermissionDenied` with a
 /// known owner uid gets the `sudo chown` fix; every other case (a directory,
 /// a read-only filesystem, a symlink loop, an uncreatable parent, or an
@@ -601,11 +609,38 @@ fn log_open_error_message(
     let base = format!("cannot open log file {} for writing: {err}", path.display());
     match (err.kind(), owner_uid) {
         (std::io::ErrorKind::PermissionDenied, Some(uid)) => format!(
-            "{base} (owned by uid {uid}). Fix with: sudo chown $(id -un) {}",
-            path.display()
+            "{base} (owned by uid {uid}). Fix with: sudo chown -- \"$(id -un)\" {}",
+            shell_quote(&path.display().to_string())
         ),
         _ => base,
     }
+}
+
+/// True when an xray log-config value carries xray's own special meaning
+/// rather than naming a real file: empty means "log to stdout", `"none"`
+/// disables that log entirely. Matched case-sensitively, exactly as xray
+/// does. Neither should be preflighted as an openable file path.
+fn is_special_log_value(value: &str) -> bool {
+    value.is_empty() || value == "none"
+}
+
+/// Targets to preflight before spawning xray. `xray_log` is always a genuine
+/// file corvex itself opens for the child's stdout/stderr, so it is always
+/// checked. `access`/`error` come from xray's own log config and follow
+/// xray's special-value semantics (see `is_special_log_value`), so a special
+/// value is skipped - there is nothing to open.
+fn xray_log_preflight_targets(
+    xray_log: &std::path::Path,
+    access: &str,
+    error: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut targets = vec![xray_log.to_path_buf()];
+    for value in [access, error] {
+        if !is_special_log_value(value) {
+            targets.push(std::path::PathBuf::from(value));
+        }
+    }
+    targets
 }
 
 #[cfg(unix)]
@@ -628,6 +663,13 @@ fn log_target_owner_uid(_path: &std::path::Path) -> Option<u32> {
 /// fatal to xray, and `ensure_directories` above deliberately swallows those
 /// errors. The path list is deduplicated first, since `config.xray_log` is
 /// aliased to `log.xray.error` above whenever that setting is present.
+/// Failures are collected across every path rather than stopping at the
+/// first, so the user sees every actionable problem in one run instead of
+/// fixing them one at a time. A target that did not exist before the probe
+/// and was created only to check it is removed immediately after: a
+/// successful check must not leave a (potentially root-owned) empty file
+/// behind for a later, unrelated step to fail on. Removal failure is itself
+/// fatal - silently leaving that artifact defeats the point of the cleanup.
 fn preflight_log_paths(paths: &[std::path::PathBuf]) -> anyhow::Result<()> {
     let mut seen = std::collections::HashSet::new();
     let mut errors = Vec::new();
@@ -635,13 +677,27 @@ fn preflight_log_paths(paths: &[std::path::PathBuf]) -> anyhow::Result<()> {
         if !seen.insert(path.clone()) {
             continue;
         }
-        if let Err(e) = std::fs::OpenOptions::new()
+        let existed_before = path.exists();
+        match std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(path)
         {
-            let owner_uid = log_target_owner_uid(path);
-            errors.push(log_open_error_message(path, &e, owner_uid));
+            Ok(_) => {
+                if !existed_before {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        errors.push(format!(
+                            "created {} to verify it is writable, but could not remove it \
+                             afterwards: {e}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                let owner_uid = log_target_owner_uid(path);
+                errors.push(log_open_error_message(path, &e, owner_uid));
+            }
         }
     }
     if errors.is_empty() {
@@ -2057,7 +2113,17 @@ mod tests {
 
         assert!(msg.contains("/var/log/xray/access.log"));
         assert!(msg.contains("501"));
-        assert!(msg.contains("sudo chown $(id -un) /var/log/xray/access.log"));
+        assert!(msg.contains("sudo chown -- \"$(id -un)\" '/var/log/xray/access.log'"));
+    }
+
+    #[test]
+    fn test_log_open_error_message_chown_quotes_path_with_space() {
+        let path = std::path::Path::new("/var/log/xray dir/access.log");
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        let msg = super::log_open_error_message(path, &err, Some(501));
+
+        assert!(msg.contains("sudo chown -- \"$(id -un)\" '/var/log/xray dir/access.log'"));
     }
 
     #[test]
@@ -2137,7 +2203,28 @@ mod tests {
 
         super::preflight_log_paths(std::slice::from_ref(&path))
             .expect("a writable target must pass");
-        assert!(path.exists());
+        assert!(
+            !path.exists(),
+            "a target created only to probe it must be removed afterwards"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_preserves_preexisting_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        std::fs::write(&path, "existing content").unwrap();
+
+        super::preflight_log_paths(std::slice::from_ref(&path))
+            .expect("an already-writable existing file must pass");
+
+        assert!(path.exists(), "a pre-existing target must not be removed");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "existing content",
+            "a pre-existing target's content must be untouched"
+        );
     }
 
     #[test]
@@ -2186,6 +2273,65 @@ mod tests {
             result.is_err(),
             "a non-permission open failure must still be fatal"
         );
+    }
+
+    // -- is_special_log_value / xray_log_preflight_targets --
+
+    #[test]
+    fn test_is_special_log_value_empty_and_none() {
+        assert!(super::is_special_log_value(""));
+        assert!(super::is_special_log_value("none"));
+    }
+
+    #[test]
+    fn test_is_special_log_value_real_path_is_not_special() {
+        assert!(!super::is_special_log_value("/var/log/xray/access.log"));
+        assert!(!super::is_special_log_value("None")); // xray matches case-sensitively
+    }
+
+    #[test]
+    fn test_xray_log_preflight_targets_skips_empty_and_none() {
+        let targets = super::xray_log_preflight_targets(
+            std::path::Path::new("/state/xray/xray.log"),
+            "",
+            "none",
+        );
+
+        assert_eq!(
+            targets,
+            vec![std::path::PathBuf::from("/state/xray/xray.log")]
+        );
+    }
+
+    #[test]
+    fn test_xray_log_preflight_targets_keeps_real_paths() {
+        let targets = super::xray_log_preflight_targets(
+            std::path::Path::new("/state/xray/xray.log"),
+            "/state/xray/access.log",
+            "/state/xray/error.log",
+        );
+
+        assert_eq!(
+            targets,
+            vec![
+                std::path::PathBuf::from("/state/xray/xray.log"),
+                std::path::PathBuf::from("/state/xray/access.log"),
+                std::path::PathBuf::from("/state/xray/error.log"),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_accepts_empty_and_none_log_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let xray_log = dir.path().join("xray.log");
+
+        // "" (stdout) and "none" (disabled) are xray's own special values,
+        // never real files - the preflight must not try to open them.
+        let targets = super::xray_log_preflight_targets(&xray_log, "", "none");
+        super::preflight_log_paths(&targets)
+            .expect("empty and \"none\" log values must not be probed as files");
     }
 
     #[test]
