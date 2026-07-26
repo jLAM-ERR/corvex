@@ -371,9 +371,14 @@ pub(crate) fn parse_xray_processes(ps_output: &str, xray_bin: &str) -> Vec<XrayP
 }
 
 /// Processes whose `config_arg` matches corvex's own config path exactly.
+/// An empty `config_arg` (no ` -c ` on the command line) never matches, and
+/// an empty `config_path` matches nothing rather than every such process.
 pub(crate) fn managed_processes(all: &[XrayProcess], config_path: &str) -> Vec<XrayProcess> {
+    if config_path.is_empty() {
+        return Vec::new();
+    }
     all.iter()
-        .filter(|p| p.config_arg == config_path)
+        .filter(|p| !p.config_arg.is_empty() && p.config_arg == config_path)
         .cloned()
         .collect()
 }
@@ -758,8 +763,22 @@ mod tests {
         let config_path = "/Users/alice/My Configs/config.json";
         let ps_output = format!("100 alice   /opt/homebrew/bin/xray run -c {config_path}\n");
         let all = parse_xray_processes(&ps_output, "xray");
+        assert_eq!(all[0].config_arg, config_path);
         let managed = managed_processes(&all, config_path);
         assert_eq!(managed.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_xray_processes_padded_pid_and_tab_separated_columns() {
+        // real `ps -eww` right-justifies the pid column with leading spaces;
+        // this also checks tab works as a column separator (args themselves
+        // still use plain spaces, as any real command line does)
+        let ps_output = "   900\tfrank\t/opt/homebrew/bin/xray run -c /path/to/config.json\n";
+        let all = parse_xray_processes(ps_output, "xray");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].pid, 900);
+        assert_eq!(all[0].user, "frank");
+        assert_eq!(all[0].config_arg, "/path/to/config.json");
     }
 
     /// Regression guard for the first-vs-last ` -c ` split: a config path
@@ -805,6 +824,17 @@ mod tests {
         );
     }
 
+    /// An empty `config_arg` must never match, and an empty `config_path`
+    /// must match nothing rather than every no-`-c` process.
+    #[test]
+    fn test_managed_and_orphans_reject_empty_config_arg_and_empty_config_path() {
+        let ps_output = "301 alice   /opt/homebrew/bin/xray run\n";
+        let all = parse_xray_processes(ps_output, "xray");
+        assert_eq!(all[0].config_arg, "");
+        assert!(managed_processes(&all, "").is_empty());
+        assert!(orphans(&all, "", None).is_empty());
+    }
+
     #[test]
     fn test_parse_xray_processes_non_xray_process_excluded() {
         let ps_output = "400 carol   /usr/sbin/sshd -i\n";
@@ -812,18 +842,23 @@ mod tests {
     }
 
     /// A shell wrapper named `xray` shows up in `ps` as `/bin/sh /path/xray run
-    /// -c ...` - argv[0] is the interpreter, so it must not be counted.
+    /// -c ...` - argv[0] is the interpreter, so it must not be counted. The
+    /// line's trailing basename ("xray") itself contains "xray" so this fails
+    /// if `command_matches` is ever applied to the whole args string instead
+    /// of argv[0] alone.
     #[test]
     fn test_parse_xray_processes_shell_wrapper_not_counted() {
-        let ps_output = "500 dave    /bin/sh /usr/local/bin/xray run -c /path/config.json\n";
+        let ps_output = "500 dave    /bin/sh /usr/local/bin/xray run -c /etc/xray\n";
         assert!(parse_xray_processes(ps_output, "xray").is_empty());
     }
 
     /// argv[0]-only regression guard: a command line that merely mentions
-    /// "xray" in a later argument must not match.
+    /// "xray" in a later argument must not match. The trailing token's
+    /// basename is "xray" itself, so a buggy whole-args-string match would
+    /// wrongly pass this test; only an argv[0]-only match rejects it.
     #[test]
     fn test_parse_xray_processes_xray_mentioned_in_later_arg_not_matched() {
-        let ps_output = "600 eve     /usr/bin/tail -f /var/log/xray/error.log\n";
+        let ps_output = "600 eve     /usr/bin/tail -f /tmp/xray\n";
         assert!(parse_xray_processes(ps_output, "xray").is_empty());
     }
 
