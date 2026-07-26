@@ -62,7 +62,8 @@ fn run_networksetup(args: &[&str]) -> Result<String> {
                 "admin required for networksetup {}, escalating via osascript",
                 args.join(" ")
             );
-            run_networksetup_elevated(&[args.to_vec()])
+            // Nothing has been applied yet: this is the only command, and it just reported NeedsAdmin.
+            run_networksetup_elevated(&[args.to_vec()], false)
         }
         NsOutcome::Failed(detail) => {
             anyhow::bail!("networksetup {} failed: {}", args.join(" "), detail)
@@ -78,7 +79,7 @@ fn run_networksetup_all(commands: &[Vec<&str>]) -> Result<()> {
         return Ok(());
     }
 
-    for args in commands {
+    for (i, args) in commands.iter().enumerate() {
         match try_networksetup(args)? {
             NsOutcome::Ok(_) => continue,
             NsOutcome::NeedsAdmin => {
@@ -87,7 +88,10 @@ fn run_networksetup_all(commands: &[Vec<&str>]) -> Result<()> {
                     args.join(" "),
                     commands.len()
                 );
-                run_networksetup_elevated(commands)?;
+                // If an earlier command in this batch already ran unelevated, its
+                // effect already happened, regardless of what the user does next.
+                let already_applied = i > 0;
+                run_networksetup_elevated(commands, already_applied)?;
                 return Ok(());
             }
             NsOutcome::Failed(detail) => {
@@ -109,7 +113,11 @@ fn join_output(stdout: &str, stderr: &str) -> String {
         .join(" ")
 }
 
-fn run_networksetup_elevated(commands: &[Vec<&str>]) -> Result<String> {
+/// Runs `commands` through a single osascript elevation prompt.
+/// `already_applied` must be true if any of `commands` already ran
+/// unelevated and succeeded before this call, so a cancel here does not
+/// undo that: the caller knows this, `run_networksetup_elevated` does not.
+fn run_networksetup_elevated(commands: &[Vec<&str>], already_applied: bool) -> Result<String> {
     if commands.is_empty() {
         anyhow::bail!("run_networksetup_elevated called with no commands to run");
     }
@@ -122,6 +130,11 @@ fn run_networksetup_elevated(commands: &[Vec<&str>]) -> Result<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if is_user_cancel_error(&stderr) {
+            if already_applied {
+                anyhow::bail!(
+                    "Authorization denied — some proxy settings from earlier in this batch may already have been applied before you canceled"
+                );
+            }
             anyhow::bail!("Authorization denied — proxy settings were not changed");
         }
         if is_no_gui_error(&stderr) {
@@ -133,7 +146,7 @@ fn run_networksetup_elevated(commands: &[Vec<&str>]) -> Result<String> {
             .collect::<Vec<_>>()
             .join("; ");
         anyhow::bail!(
-            "networksetup batch failed (elevated): {}\ncommands: {}",
+            "networksetup batch failed (elevated): {}\ncommands run in order, stopped at the first failure above — earlier ones in this list may already be applied: {}",
             join_output(&String::from_utf8_lossy(&output.stdout), &stderr),
             commands_str
         );
@@ -564,8 +577,11 @@ mod tests {
         );
     }
 
+    // This only checks the generated script text has one elevation phrase.
+    // It does not prove osascript is spawned only once; that would need a
+    // process-runner seam, which this change does not add.
     #[test]
-    fn osascript_batch_has_administrator_privileges_exactly_once() {
+    fn osascript_batch_script_text_has_one_elevation_phrase() {
         let commands: Vec<Vec<&str>> = vec![
             vec!["-setsocksfirewallproxystate", "Wi-Fi", "off"],
             vec!["-setwebproxystate", "Wi-Fi", "off"],
@@ -586,6 +602,62 @@ mod tests {
         let cmd = build_osascript_command(&commands);
         let escaped_service = "'Thunderbolt \\\"Pro\\\" Bridge'";
         assert_eq!(cmd.matches(escaped_service).count(), 3);
+    }
+
+    // The service name comes from parsing `networksetup -listallhardwareports`
+    // output and ends up inside a shell string that runs with administrator
+    // privileges, so shell metacharacters in it must stay inert data: they
+    // must stay inside the single-quoted argument and never start a command
+    // substitution. Each case below asserts on the exact generated string.
+
+    #[test]
+    fn build_osascript_command_service_name_with_single_quote_stays_inert() {
+        let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", "O'Brien", "off"]]);
+        assert_eq!(
+            cmd,
+            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxystate' 'O'\\\\''Brien' 'off'\" with administrator privileges"
+        );
+    }
+
+    #[test]
+    fn build_osascript_command_service_name_with_backslash_stays_inert() {
+        let cmd = build_osascript_command(&[vec![
+            "-setsocksfirewallproxystate",
+            "Path\\to\\Bridge",
+            "off",
+        ]]);
+        assert_eq!(
+            cmd,
+            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxystate' 'Path\\\\to\\\\Bridge' 'off'\" with administrator privileges"
+        );
+    }
+
+    #[test]
+    fn build_osascript_command_service_name_with_command_substitution_stays_inert() {
+        let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", "$(id)", "off"]]);
+        assert_eq!(
+            cmd,
+            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxystate' '$(id)' 'off'\" with administrator privileges"
+        );
+    }
+
+    #[test]
+    fn build_osascript_command_service_name_with_backtick_stays_inert() {
+        let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", "`id`", "off"]]);
+        assert_eq!(
+            cmd,
+            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxystate' '`id`' 'off'\" with administrator privileges"
+        );
+    }
+
+    #[test]
+    fn build_osascript_command_service_name_with_combined_metacharacters_stays_inert() {
+        let service = "'\\\"$(id)`whoami`";
+        let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", service, "off"]]);
+        assert_eq!(
+            cmd,
+            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxystate' ''\\\\''\\\\\\\"$(id)`whoami`' 'off'\" with administrator privileges"
+        );
     }
 
     // classify_networksetup_output tests
@@ -624,12 +696,6 @@ mod tests {
         );
     }
 
-    // run_networksetup_all tests
-    #[test]
-    fn run_networksetup_all_empty_slice_is_a_noop() {
-        assert!(run_networksetup_all(&[]).is_ok());
-    }
-
     // run_networksetup_elevated tests
     #[test]
     fn run_networksetup_elevated_rejects_empty_batch() {
@@ -637,7 +703,7 @@ mod tests {
         // would render `do shell script "" with administrator privileges`,
         // popping a password dialog that runs nothing. This must be refused
         // before osascript is ever spawned.
-        let result = run_networksetup_elevated(&[]);
+        let result = run_networksetup_elevated(&[], false);
         assert_eq!(
             result.unwrap_err().to_string(),
             "run_networksetup_elevated called with no commands to run"
@@ -684,8 +750,10 @@ mod tests {
         );
     }
 
+    // Same caveat as osascript_batch_script_text_has_one_elevation_phrase: this
+    // checks script text, not how many osascript processes actually run.
     #[test]
-    fn enable_proxy_commands_into_osascript_prompts_once() {
+    fn enable_proxy_commands_script_text_has_one_elevation_phrase() {
         let commands = enable_proxy_commands("Wi-Fi", "127.0.0.1", "21080");
         let script = build_osascript_command(&commands);
         assert_eq!(script.matches("with administrator privileges").count(), 1);
