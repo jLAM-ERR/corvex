@@ -1306,12 +1306,30 @@ mod tests {
 
     #[cfg(unix)]
     impl FakeProcess {
+        /// Retries on `ExecutableFileBusy`. Cargo runs these tests as threads
+        /// of one process, and each writes its own fake executable just before
+        /// running it. If another thread forks in the window while that file
+        /// is still open for writing, the forked child inherits the descriptor
+        /// and Linux refuses to exec the file until it closes, with ETXTBSY.
+        /// The window is short (Rust marks the descriptor close-on-exec, so it
+        /// only lasts from fork to the child's own exec) but real: it failed a
+        /// CI run once while passing on macOS, which does not enforce this.
         fn spawn(cmd: &mut std::process::Command) -> Self {
             use std::os::unix::process::CommandExt;
-            let mut child = cmd
-                .process_group(0)
-                .spawn()
-                .expect("failed to spawn fake test process");
+            cmd.process_group(0);
+            let mut attempt = 0;
+            let mut child = loop {
+                match cmd.spawn() {
+                    Ok(child) => break child,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 50 =>
+                    {
+                        attempt += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    Err(e) => panic!("failed to spawn fake test process: {e}"),
+                }
+            };
             let pid = child.id() as i32;
             let reaper = std::thread::spawn(move || {
                 let _ = child.wait();
