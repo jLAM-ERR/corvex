@@ -27,8 +27,10 @@ fn classify_networksetup_output(exit_ok: bool, stdout: &str, stderr: &str) -> Ns
     // networksetup reports errors inconsistently across macOS versions:
     // sometimes on stderr, sometimes on stdout (e.g. "** Error: Command
     // requires admin privileges."), and not always with a failing exit code.
-    if !exit_ok || stdout.contains("** Error") {
-        let detail = join_output(stdout, stderr);
+    // Classify on the combined output so an error written to either stream
+    // is caught, even when the exit code is 0.
+    let detail = join_output(stdout, stderr);
+    if !exit_ok || detail.contains("** Error") {
         if is_admin_required_error(&detail) {
             return NsOutcome::NeedsAdmin;
         }
@@ -113,6 +115,33 @@ fn join_output(stdout: &str, stderr: &str) -> String {
         .join(" ")
 }
 
+/// Message for when the elevation prompt was denied or canceled.
+/// `already_applied` distinguishes a cancel on the very first command
+/// (nothing changed yet) from a cancel mid-batch (some earlier commands
+/// already ran unelevated and cannot be undone by canceling this one).
+fn authorization_denied_message(already_applied: bool) -> String {
+    if already_applied {
+        "Authorization denied — some proxy settings from earlier in this batch may already have been applied before you canceled"
+            .to_string()
+    } else {
+        "Authorization denied — proxy settings were not changed".to_string()
+    }
+}
+
+/// Message for a networksetup batch that failed while running elevated,
+/// once `detail` (the combined stdout/stderr of the failed run) is known.
+fn batch_failure_message(commands: &[Vec<&str>], detail: &str) -> String {
+    let commands_str = commands
+        .iter()
+        .map(|args| args.join(" "))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "networksetup batch failed (elevated): {}\ncommands run in order, stopped at the first failure above — earlier ones in this list may already be applied: {}",
+        detail, commands_str
+    )
+}
+
 /// Runs `commands` through a single osascript elevation prompt.
 /// `already_applied` must be true if any of `commands` already ran
 /// unelevated and succeeded before this call, so a cancel here does not
@@ -130,25 +159,17 @@ fn run_networksetup_elevated(commands: &[Vec<&str>], already_applied: bool) -> R
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if is_user_cancel_error(&stderr) {
-            if already_applied {
-                anyhow::bail!(
-                    "Authorization denied — some proxy settings from earlier in this batch may already have been applied before you canceled"
-                );
-            }
-            anyhow::bail!("Authorization denied — proxy settings were not changed");
+            anyhow::bail!("{}", authorization_denied_message(already_applied));
         }
         if is_no_gui_error(&stderr) {
             anyhow::bail!("No GUI session available — run with sudo instead");
         }
-        let commands_str = commands
-            .iter()
-            .map(|args| args.join(" "))
-            .collect::<Vec<_>>()
-            .join("; ");
         anyhow::bail!(
-            "networksetup batch failed (elevated): {}\ncommands run in order, stopped at the first failure above — earlier ones in this list may already be applied: {}",
-            join_output(&String::from_utf8_lossy(&output.stdout), &stderr),
-            commands_str
+            "{}",
+            batch_failure_message(
+                commands,
+                &join_output(&String::from_utf8_lossy(&output.stdout), &stderr)
+            )
         );
     }
 
@@ -693,6 +714,68 @@ mod tests {
         assert_eq!(
             outcome,
             NsOutcome::Failed("** Error: Invalid arguments.".to_string())
+        );
+    }
+
+    /// Exit code 0, empty stdout, admin error only on stderr: this is the
+    /// hole the combined-output classification closes.
+    #[test]
+    fn classify_admin_required_on_stderr_with_zero_exit() {
+        let outcome = classify_networksetup_output(
+            true,
+            "",
+            "** Error: Command requires admin privileges.\n",
+        );
+        assert_eq!(outcome, NsOutcome::NeedsAdmin);
+    }
+
+    #[test]
+    fn classify_unrelated_failure_on_stderr_with_zero_exit() {
+        let outcome = classify_networksetup_output(true, "", "** Error: Invalid arguments.\n");
+        assert_eq!(
+            outcome,
+            NsOutcome::Failed("** Error: Invalid arguments.".to_string())
+        );
+    }
+
+    // authorization_denied_message / batch_failure_message tests
+    #[test]
+    fn authorization_denied_message_nothing_applied_yet() {
+        assert_eq!(
+            authorization_denied_message(false),
+            "Authorization denied — proxy settings were not changed"
+        );
+    }
+
+    #[test]
+    fn authorization_denied_message_partial_batch_already_applied() {
+        assert_eq!(
+            authorization_denied_message(true),
+            "Authorization denied — some proxy settings from earlier in this batch may already have been applied before you canceled"
+        );
+    }
+
+    #[test]
+    fn authorization_denied_message_differs_by_already_applied() {
+        // Would fail if `already_applied` were collapsed to a constant.
+        assert_ne!(
+            authorization_denied_message(false),
+            authorization_denied_message(true)
+        );
+    }
+
+    #[test]
+    fn batch_failure_message_includes_detail_and_commands_in_order() {
+        let commands: Vec<Vec<&str>> = vec![
+            vec!["-setsocksfirewallproxy", "Wi-Fi", "127.0.0.1", "21080"],
+            vec!["-setsocksfirewallproxystate", "Wi-Fi", "on"],
+        ];
+        let msg = batch_failure_message(&commands, "** Error: Invalid arguments.");
+        assert_eq!(
+            msg,
+            "networksetup batch failed (elevated): ** Error: Invalid arguments.\n\
+             commands run in order, stopped at the first failure above — earlier ones in this list may already be applied: \
+             -setsocksfirewallproxy Wi-Fi 127.0.0.1 21080; -setsocksfirewallproxystate Wi-Fi on"
         );
     }
 
