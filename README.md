@@ -242,8 +242,8 @@ Setting system proxy on macOS requires admin privileges. When running without `s
 
 If xray has ever been started with `sudo`, a plain `corvex start` can fail because a root-owned xray is still around:
 
-- **A tracked root-owned xray is running** (`start` reports it's already running as another user): run `sudo corvex stop` once, then plain `corvex start`. Do **not** run `sudo corvex start` — that starts another root-owned xray and you're back where you started.
-- **An untracked xray is running** (an orphan, reported by `status` or a failed `start`): corvex only ever signals the process recorded in its own PID file, so it cannot stop this one for you. Stop it yourself with `sudo kill <pid>` (or plain `kill <pid>` if you own it) — check with `ps -p <pid>` first, since the report is a snapshot and PIDs get reused.
+- **A tracked root-owned xray is running** (`start` reports it's already running as another user): run `sudo corvex stop` once, then plain `corvex start`. Do **not** run `sudo corvex start` — that starts another root-owned xray and you're back where you started. If `sudo corvex stop` instead reports xray isn't running while `corvex status` still shows the root-owned process, `sudo` reset your environment (common on Linux) — use `sudo kill <pid>` directly, or `sudo -E corvex stop` to preserve it.
+- **An untracked xray is running** (an orphan, reported by `status` or a failed `start`): orphan detection and the lifecycle commands (`start`/`stop`/`reload`) only ever signal the daemon recorded in the PID file, so none of them can stop this one for you — corvex's own short-lived health-check processes are a separate matter, owned and cleaned up by the check itself. Stop the orphan yourself with `sudo kill <pid>` (or plain `kill <pid>` if you own it) — check with `ps -p <pid>` first, since the report is a snapshot and PIDs get reused.
 
 Going forward, avoid `sudo corvex start` entirely — corvex already prompts for a password via the graphical dialog above when it needs admin rights.
 

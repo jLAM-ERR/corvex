@@ -7,7 +7,7 @@ A bug-fix release that finishes the rootless-start work started in 0.6.1: `corve
 ### The sudo advice used to make things worse
 When `start` found an xray already running as another user (typically root, left over from an earlier `sudo corvex start`), it said "try again with sudo". Doing that started a second root-owned xray, so the next plain `corvex start` failed the exact same way — you were stuck running everything with `sudo`.
 
-corvex now tells you what actually fixes it: run `sudo corvex stop` once, then plain `corvex start`. It also says explicitly not to run `sudo corvex start` again, since that recreates the problem.
+corvex now tells you what actually fixes it: run `sudo corvex stop` once, then plain `corvex start`. It also says explicitly not to run `sudo corvex start` again, since that recreates the problem. (On Linux, `sudo` can reset `HOME` to `/root`, in which case `sudo corvex stop` looks at root's own state and reports xray isn't running while a root-owned one still is — if that happens, use `sudo kill <pid>` with the PID from `corvex status` instead.)
 
 When `start` fails for any reason, it now always names the configured port and the log file it checked, and lists any xray processes it found running (with PID, owner, and which config file each one uses) so you can tell whether one of them is already using your port.
 
@@ -30,7 +30,7 @@ Xray logs now default to your user state directory instead: `$XDG_STATE_HOME/xra
 
 ## Upgrading from a mixed sudo/user state
 
-Same recovery as 0.6.1, now backed by better diagnostics: run `sudo corvex stop` once to retire any root-owned xray, use `sudo kill <pid>` for any orphan that `corvex status` or a failed `start` reports, and go back to plain `corvex start` from now on — never `sudo corvex start`.
+Same recovery as 0.6.1, now backed by better diagnostics: run `sudo corvex stop` once to retire any root-owned xray, use `sudo kill <pid>` for any orphan that `corvex status` or a failed `start` reports, and go back to plain `corvex start` from now on — never `sudo corvex start`. If `sudo corvex stop` reports xray isn't running but `corvex status` still shows a root-owned process, `sudo` reset your environment — use `sudo kill <pid>` directly, or `sudo -E corvex stop`.
 
 ## Migration
 
