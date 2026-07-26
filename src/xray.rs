@@ -271,6 +271,12 @@ fn process_is_xray(_pid: i32, _xray_bin: &str) -> bool {
 /// Compares basenames so a full path like `/opt/.../xray` matches `xray`. The
 /// real binary is always named `xray` (short, never truncated by `ps`), so a
 /// substring match on the configured basename is reliable.
+///
+/// The truncation caveat is real, just not for the real binary: on Linux
+/// `ps -o comm=` reads /proc/<pid>/comm, which the kernel caps at 15
+/// characters, while macOS reports the full path. A configured binary whose
+/// name exceeds 15 characters therefore cannot match on Linux. Tests that
+/// stand in a fake xray must keep its file name under that limit.
 fn command_matches(process_comm: &str, xray_bin: &str) -> bool {
     let comm = process_comm.trim();
     let name = Path::new(comm)
@@ -853,6 +859,33 @@ mod tests {
 
     fn is_binary_in_path(bin: &str) -> bool {
         resolve_from_path(bin).is_some()
+    }
+
+    /// Linux caps /proc/<pid>/comm at 15 characters, so `ps -o comm=` there
+    /// reports a truncated name while macOS reports the full path. The real
+    /// binary is `xray` and is unaffected, but a fake xray with a long file
+    /// name matches on macOS and silently fails on Linux - which is exactly
+    /// how a green local run turned into a red ubuntu CI job. Encoded here so
+    /// the asymmetry is a test failure rather than a rediscovery.
+    #[test]
+    fn command_matches_is_defeated_by_linux_comm_truncation() {
+        const LINUX_COMM_CAP: usize = 15;
+        let truncate = |name: &str| name.chars().take(LINUX_COMM_CAP).collect::<String>();
+
+        let long = "fake_xray_missing_dir_test";
+        assert!(long.len() > LINUX_COMM_CAP);
+        assert!(
+            !command_matches(&truncate(long), &format!("/tmp/{long}")),
+            "a name over {LINUX_COMM_CAP} chars cannot match once Linux truncates comm"
+        );
+
+        for short in ["xray", "fake_xray_ord", "fake_xray_dir"] {
+            assert!(short.len() <= LINUX_COMM_CAP);
+            assert!(
+                command_matches(&truncate(short), &format!("/tmp/{short}")),
+                "{short} must still match after truncation"
+            );
+        }
     }
 
     #[test]
@@ -1533,7 +1566,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
 
-        let script = base.join("fake_xray_ordering_test");
+        // Name kept under 15 characters: on Linux `ps -o comm=` reads
+        // /proc/<pid>/comm, which the kernel caps at 15 chars, so a longer
+        // name is truncated and `command_matches` can never match it. macOS
+        // reports the full path and does not show the problem.
+        let script = base.join("fake_xray_ord");
         build_sleeping_fake_xray(&script);
         let script_name = script.file_name().unwrap().to_str().unwrap();
 
@@ -1594,7 +1631,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path();
 
-        let script = base.join("fake_xray_missing_dir_test");
+        // Under 15 characters - see the note in the ordering test above.
+        let script = base.join("fake_xray_dir");
         build_sleeping_fake_xray(&script);
 
         let xray_config = base.join("xray/config.json");
