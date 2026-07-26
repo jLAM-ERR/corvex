@@ -73,8 +73,6 @@ fn run_networksetup(args: &[&str]) -> Result<String> {
 /// Runs a sequence of `networksetup` commands unelevated, in order. The
 /// moment one needs admin, the whole sequence is re-run through a single
 /// osascript prompt instead of escalating per command.
-// Wired up in Task 3 (enable_proxy / disable_proxy).
-#[allow(dead_code)]
 fn run_networksetup_all(commands: &[Vec<&str>]) -> Result<()> {
     if commands.is_empty() {
         return Ok(());
@@ -112,6 +110,9 @@ fn join_output(stdout: &str, stderr: &str) -> String {
 }
 
 fn run_networksetup_elevated(commands: &[Vec<&str>]) -> Result<String> {
+    if commands.is_empty() {
+        anyhow::bail!("run_networksetup_elevated called with no commands to run");
+    }
     let script = build_osascript_command(commands);
     let output = Command::new("osascript")
         .args(["-e", &script])
@@ -139,6 +140,30 @@ fn run_networksetup_elevated(commands: &[Vec<&str>]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Ordered `networksetup` setters that enable socks, web, and secure web
+/// proxies for a service. Each host/port setter must precede its matching
+/// state-on command, or the proxy would flip on pointing at a stale address.
+fn enable_proxy_commands<'a>(service: &'a str, host: &'a str, port: &'a str) -> Vec<Vec<&'a str>> {
+    vec![
+        vec!["-setsocksfirewallproxy", service, host, port],
+        vec!["-setsocksfirewallproxystate", service, "on"],
+        vec!["-setwebproxy", service, host, port],
+        vec!["-setwebproxystate", service, "on"],
+        vec!["-setsecurewebproxy", service, host, port],
+        vec!["-setsecurewebproxystate", service, "on"],
+    ]
+}
+
+/// Ordered `networksetup` setters that turn off socks, web, and secure web
+/// proxies for a service.
+fn disable_proxy_commands(service: &str) -> Vec<Vec<&str>> {
+    vec![
+        vec!["-setsocksfirewallproxystate", service, "off"],
+        vec!["-setwebproxystate", service, "off"],
+        vec!["-setsecurewebproxystate", service, "off"],
+    ]
 }
 
 impl Platform for MacOsPlatform {
@@ -175,25 +200,14 @@ impl Platform for MacOsPlatform {
     fn enable_proxy(&self, service: &str, host: &str, port: u16) -> Result<()> {
         debug!("enabling proxies on '{}' -> {}:{}", service, host, port);
         let port_str = port.to_string();
-
-        run_networksetup(&["-setsocksfirewallproxy", service, host, &port_str])?;
-        run_networksetup(&["-setsocksfirewallproxystate", service, "on"])?;
-
-        run_networksetup(&["-setwebproxy", service, host, &port_str])?;
-        run_networksetup(&["-setwebproxystate", service, "on"])?;
-
-        run_networksetup(&["-setsecurewebproxy", service, host, &port_str])?;
-        run_networksetup(&["-setsecurewebproxystate", service, "on"])?;
-
-        Ok(())
+        let commands = enable_proxy_commands(service, host, &port_str);
+        run_networksetup_all(&commands)
     }
 
     fn disable_proxy(&self, service: &str) -> Result<()> {
         debug!("disabling proxies on '{}'", service);
-        run_networksetup(&["-setsocksfirewallproxystate", service, "off"])?;
-        run_networksetup(&["-setwebproxystate", service, "off"])?;
-        run_networksetup(&["-setsecurewebproxystate", service, "off"])?;
-        Ok(())
+        let commands = disable_proxy_commands(service);
+        run_networksetup_all(&commands)
     }
 
     fn proxy_status(&self, service: &str) -> Result<ProxyStatus> {
@@ -613,9 +627,67 @@ mod tests {
     // run_networksetup_all tests
     #[test]
     fn run_networksetup_all_empty_slice_is_a_noop() {
-        // An empty batch must return before building any script; otherwise
-        // build_osascript_command would render `do shell script "" with
-        // administrator privileges`, popping a password dialog for a no-op.
         assert!(run_networksetup_all(&[]).is_ok());
+    }
+
+    // run_networksetup_elevated tests
+    #[test]
+    fn run_networksetup_elevated_rejects_empty_batch() {
+        // The real guard against an empty batch: build_osascript_command(&[])
+        // would render `do shell script "" with administrator privileges`,
+        // popping a password dialog that runs nothing. This must be refused
+        // before osascript is ever spawned.
+        let result = run_networksetup_elevated(&[]);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "run_networksetup_elevated called with no commands to run"
+        );
+    }
+
+    // enable_proxy_commands / disable_proxy_commands tests
+    #[test]
+    fn enable_proxy_commands_order_and_substitution() {
+        let commands = enable_proxy_commands("Wi-Fi", "127.0.0.1", "21080");
+        assert_eq!(
+            commands,
+            vec![
+                vec!["-setsocksfirewallproxy", "Wi-Fi", "127.0.0.1", "21080"],
+                vec!["-setsocksfirewallproxystate", "Wi-Fi", "on"],
+                vec!["-setwebproxy", "Wi-Fi", "127.0.0.1", "21080"],
+                vec!["-setwebproxystate", "Wi-Fi", "on"],
+                vec!["-setsecurewebproxy", "Wi-Fi", "127.0.0.1", "21080"],
+                vec!["-setsecurewebproxystate", "Wi-Fi", "on"],
+            ]
+        );
+    }
+
+    #[test]
+    fn enable_proxy_commands_sets_host_before_state() {
+        let commands = enable_proxy_commands("Wi-Fi", "127.0.0.1", "21080");
+        let index_of = |setter: &str| commands.iter().position(|c| c[0] == setter).unwrap();
+
+        assert!(index_of("-setsocksfirewallproxy") < index_of("-setsocksfirewallproxystate"));
+        assert!(index_of("-setwebproxy") < index_of("-setwebproxystate"));
+        assert!(index_of("-setsecurewebproxy") < index_of("-setsecurewebproxystate"));
+    }
+
+    #[test]
+    fn disable_proxy_commands_order() {
+        let commands = disable_proxy_commands("Wi-Fi");
+        assert_eq!(
+            commands,
+            vec![
+                vec!["-setsocksfirewallproxystate", "Wi-Fi", "off"],
+                vec!["-setwebproxystate", "Wi-Fi", "off"],
+                vec!["-setsecurewebproxystate", "Wi-Fi", "off"],
+            ]
+        );
+    }
+
+    #[test]
+    fn enable_proxy_commands_into_osascript_prompts_once() {
+        let commands = enable_proxy_commands("Wi-Fi", "127.0.0.1", "21080");
+        let script = build_osascript_command(&commands);
+        assert_eq!(script.matches("with administrator privileges").count(), 1);
     }
 }
