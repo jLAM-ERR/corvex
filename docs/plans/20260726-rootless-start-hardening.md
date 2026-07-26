@@ -58,6 +58,7 @@ Per the answered design question, detected processes are **reported, never kille
 - **CRITICAL: all tests must pass before starting next task** - no exceptions
 - **CRITICAL: update this plan file when scope changes during implementation**
 - run tests after each change
+- **show the diff after each completed task**: once a task's tests pass and it is committed, present that task's diff for review before starting the next one. A task is not "done" until its diff has been shown
 - **every new module-level function must compile on Windows**: the test matrix includes `windows-latest`, so `ps`-based and permission-based code needs `#[cfg(unix)]` bodies with `#[cfg(windows)]` stubs, following the existing `process_is_xray` pattern
 - maintain backward compatibility: an explicit `log.xray.access` / `log.xray.error` in an existing `corvex.json` keeps working unchanged; only the built-in defaults move, and no existing log file is moved or deleted
 
@@ -156,6 +157,16 @@ pub fn orphans(all: &[XrayProcess], config_path: &str, tracked: Option<i32>) -> 
 **Matching rule (single, unambiguous).** For each `ps` line: field 1 is the PID, field 2 the user, and the entire remainder is the args string. `argv[0]` is the **first whitespace token of that remainder**, and a line belongs to xray when `command_matches(argv0, xray_bin)` holds. `config_arg` is the remainder after the **first** ` -c ` separator, trimmed. A process is *managed* when `config_arg == config_path`.
 
 `command_matches` must be applied to `argv[0]` alone, never to the whole args string: it runs `Path::file_name()` and then a substring test (`src/xray.rs:275-285`), so feeding it a full command line would test the basename of whatever the line happens to end with. That is why the parser extracts argv[0] explicitly.
+
+**Why `ps` and not the `sysinfo` crate.** Raised in review, and settled by experiment rather than preference — `sysinfo` would be the obvious choice, since it returns real `argv` as a `Vec<String>` (no text parsing, no truncation, no space-in-path problems) and works on Windows, removing the cfg stubs. It cannot do the job here. Probing `sysinfo` 0.32 on this Mac as a normal user, with `refresh_processes_specifics` and `ProcessRefreshKind::everything().with_cmd(Always).with_user(Always)`:
+
+| processes | argv available |
+|---|---|
+| owned by the current user | 500 of 500 |
+| owned by other users | 1 of 322 |
+| **the two root-owned xray processes** | **`argv=[]`, `owner=None`** |
+
+macOS restricts `KERN_PROCARGS2` to the process owner, so a normal-user Rust binary gets neither the command line nor the uid for a root-owned process. Both are exactly what this feature needs: `argv` carries the `-c` config path that defines ownership, and the owner decides whether the hint says `kill` or `sudo kill`. `/bin/ps` succeeds only because it is **setuid root** (`-rwsr-xr-x 1 root wheel`, verified). `sysinfo` does still expose `exe()` for root processes, so it could report "an xray is running" — but not which config it uses or who owns it, which is not enough to act on. Re-evaluate only if corvex ever ships a privileged helper.
 
 **Do not add `comm=` as a separate `ps` column for this.** `ps` truncates every non-final column to a fixed width, and on macOS `comm` is the full executable path: `ps -eww -o pid=,user=,comm=,args=` yields `/opt/homebrew/Ce` for a Homebrew xray (verified on the reporting machine), which `command_matches` then rejects. The existing `process_is_xray` escapes this only because `comm=` is its *only* column there. Keeping `args=` last and parsing argv[0] out of it is the form that survives both platforms.
 
