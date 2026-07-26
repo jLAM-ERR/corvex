@@ -26,6 +26,16 @@ pub fn write_restricted(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
+/// Single-quote `s` for safe embedding in a shell command line: wraps it in
+/// single quotes and escapes any embedded single quote as `'\''`. Without
+/// this, a path containing a space, a glob character, or a leading `-` would
+/// make a suggested recovery command (`chown`, `rm`, ...) wrong or unsafe to
+/// paste. Shared by main.rs and xray.rs, so it lives here rather than in
+/// either.
+pub(crate) fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub xray_bin: String,
@@ -106,7 +116,7 @@ fn xray_config_dir() -> PathBuf {
     config_base_dir().join("xray")
 }
 
-fn state_dir() -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     state_dir_inner(
         #[cfg(unix)]
         std::env::var("XDG_STATE_HOME").ok(),
@@ -137,14 +147,7 @@ fn state_dir_inner(local_appdata: Option<String>) -> PathBuf {
 }
 
 fn default_xray_log() -> PathBuf {
-    #[cfg(unix)]
-    {
-        PathBuf::from("/var/log/xray/xray.log")
-    }
-    #[cfg(windows)]
-    {
-        state_dir().join("xray").join("xray.log")
-    }
+    state_dir().join("xray").join("xray.log")
 }
 
 fn default_xray_pid_file(_xray_dir: &Path, _state: &Path) -> PathBuf {
@@ -168,10 +171,10 @@ mod tests {
         assert_eq!(config.xray_bin, "xray");
         assert!(config.xray_config.ends_with("xray/config.json"));
         assert!(config.xray_pid_file.ends_with("xray/xray.pid"));
-        #[cfg(unix)]
-        assert_eq!(config.xray_log, PathBuf::from("/var/log/xray/xray.log"));
-        #[cfg(windows)]
-        assert!(config.xray_log.ends_with("xray/xray.log"));
+        assert_eq!(
+            config.xray_log.strip_prefix(state_dir()).unwrap(),
+            Path::new("xray").join("xray.log")
+        );
     }
 
     #[test]
@@ -215,5 +218,26 @@ mod tests {
         assert!(dir.ends_with(".local/state"));
         #[cfg(windows)]
         assert_eq!(dir, PathBuf::from(r"C:\Users\Public\AppData\Local"));
+    }
+
+    #[test]
+    fn shell_quote_wraps_plain_string() {
+        assert_eq!(
+            shell_quote("/var/log/xray/access.log"),
+            "'/var/log/xray/access.log'"
+        );
+    }
+
+    #[test]
+    fn shell_quote_escapes_embedded_single_quote() {
+        assert_eq!(shell_quote("it's/here"), "'it'\\''s/here'");
+    }
+
+    #[test]
+    fn shell_quote_preserves_spaces() {
+        assert_eq!(
+            shell_quote("/var/log/xray dir/access.log"),
+            "'/var/log/xray dir/access.log'"
+        );
     }
 }

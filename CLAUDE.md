@@ -48,7 +48,7 @@ All configuration is in a single JSONC file at `$XDG_CONFIG_HOME/corvex/corvex.j
     "merge-subs": false                          // Merge the subscription's direct rules into routing; transitional (default off, security-sensitive; see README) — expected to become the default and be removed in a future release
   },
   "log": {
-    "xray": { "loglevel": "warning", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log" },
+    "xray": { "loglevel": "warning" },            // access/error default to $XDG_STATE_HOME/xray/{access,error}.log (%LOCALAPPDATA%\xray\ on Windows); override e.g. "/var/log/xray/access.log"
     "corvex": { "debug": false }
   }
 }
@@ -68,7 +68,7 @@ src/
 ├── subscription.rs      — subscription download (with configurable User-Agent + extra headers via subs-user-agent/subs-headers, default UA "v2rayNG/1.10.2"), base64 decode, protocol filter
 ├── jsonsubs.rs          — JSON-array subscription parser (JSON array of complete xray configs, one per server; the format panels serve to clients such as Happ) + direct-rule harvesting for routes.merge-subs
 ├── health.rs            — server health checks (TCP pre-filter + tunnel latency)
-├── xray.rs              — xray process lifecycle (cfg-gated: nix signals on unix, WinAPI on windows); presence check only, no auto-install — missing binary is a hard error pointing to install.sh; sets XRAY_LOCATION_ASSET to the install.sh-managed geo data dir only when the env var is unset and both geoip.dat and geosite.dat exist there
+├── xray.rs              — xray process lifecycle (cfg-gated: nix signals on unix, WinAPI on windows); presence check only, no auto-install — missing binary is a hard error pointing to install.sh; sets XRAY_LOCATION_ASSET to the install.sh-managed geo data dir only when the env var is unset and both geoip.dat and geosite.dat exist there; read-only process listing (`ps -eww -o pid=,user=,args=`) classifies every xray process by the `-c` config path it was launched with — managed (matches corvex's own config.json), orphan (managed but untracked), or other xray (different config) — and corvex never signals a process it does not track; known blind spot: sudo resets HOME, so a root-launched corvex may use a different config path and its own process then classifies as "other xray" instead of a detected orphan
 ├── engine/
 │   ├── mod.rs           — EngineMode enum (Xray | Awg)
 │   └── awg.rs           — vpn:// parser, .conf generator, awg-quick lifecycle; presence check only, no auto-install — missing awg-quick is a hard error pointing to manual amneziawg-tools install
@@ -96,12 +96,13 @@ src/
 - Xray config: `$XDG_CONFIG_HOME/xray/config.json`
 - PID file: `$XDG_CONFIG_HOME/xray/xray.pid`
 - Corvex log: `$XDG_STATE_HOME/corvex/corvex.log`
-- Xray logs: configurable via corvex.json `log.xray.*`, default `/var/log/xray/`
+- Xray logs: `$XDG_STATE_HOME/xray/{access,error}.log` by default; configurable via corvex.json `log.xray.*`
 
 ### Windows
 - corvex.json: `%APPDATA%\corvex\corvex.json`
 - Xray config: `%APPDATA%\xray\config.json`
 - Logs: `%LOCALAPPDATA%\corvex\corvex.log`
+- Xray logs: `%LOCALAPPDATA%\xray\{access,error}.log` by default; configurable via corvex.json `log.xray.*`
 
 ## Dependencies
 

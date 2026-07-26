@@ -365,6 +365,11 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         .and_then(|r| r.corporate_traffic.clone())
         .unwrap_or_default();
     let log_config = build_xray_log_config(&s);
+    preflight_log_paths(&xray_log_preflight_targets(
+        &config.xray_log,
+        &log_config.access,
+        &log_config.error,
+    ))?;
     let merge_subs = s.routes.as_ref().and_then(|r| r.merge_subs) == Some(true);
     let routing = RoutingContext {
         corporate_traffic: &corporate_traffic,
@@ -583,24 +588,216 @@ fn ensure_directories(config: &Config, settings: &settings::CorvexSettings) {
     }
 }
 
+/// Message for a log target xray could not open. `PermissionDenied` with a
+/// known owner uid gets the `sudo chown` fix; every other case (a directory,
+/// a read-only filesystem, a symlink loop, an uncreatable parent, or an
+/// unknown owner) only names the file and the underlying error - that advice
+/// would be wrong for those.
+fn log_open_error_message(
+    path: &std::path::Path,
+    err: &std::io::Error,
+    owner_uid: Option<u32>,
+) -> String {
+    let base = format!("cannot open log file {} for writing: {err}", path.display());
+    match (err.kind(), owner_uid) {
+        (std::io::ErrorKind::PermissionDenied, Some(uid)) => format!(
+            "{base} (owned by uid {uid}). Fix with: sudo chown -- \"$(id -un)\" {}",
+            config::shell_quote(&path.display().to_string())
+        ),
+        _ => base,
+    }
+}
+
+/// True when an xray log-config value carries xray's own special meaning
+/// rather than naming a real file: empty means "log to stdout", `"none"`
+/// disables that log entirely. Matched case-sensitively, exactly as xray
+/// does. Neither should be preflighted as an openable file path.
+fn is_special_log_value(value: &str) -> bool {
+    value.is_empty() || value == "none"
+}
+
+/// Targets to preflight before spawning xray. `xray_log` is always a genuine
+/// file corvex itself opens for the child's stdout/stderr, so it is always
+/// checked. `access`/`error` come from xray's own log config and follow
+/// xray's special-value semantics (see `is_special_log_value`), so a special
+/// value is skipped - there is nothing to open.
+fn xray_log_preflight_targets(
+    xray_log: &std::path::Path,
+    access: &str,
+    error: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut targets = vec![xray_log.to_path_buf()];
+    for value in [access, error] {
+        if !is_special_log_value(value) {
+            targets.push(std::path::PathBuf::from(value));
+        }
+    }
+    targets
+}
+
+#[cfg(unix)]
+fn log_target_owner_uid(path: &std::path::Path) -> Option<u32> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
+}
+
+#[cfg(windows)]
+fn log_target_owner_uid(_path: &std::path::Path) -> Option<u32> {
+    None
+}
+
+/// Verify every xray log target is writable before spawning xray, so an
+/// unwritable log fails loudly here, naming the file, instead of xray dying
+/// silently and corvex pointing at the log it just failed to write. Every
+/// open failure is fatal, not just `PermissionDenied`: a directory, a
+/// read-only filesystem, a symlink loop or an uncreatable parent are just as
+/// fatal to xray, and `ensure_directories` above deliberately swallows those
+/// errors. The path list is deduplicated first, since `config.xray_log` is
+/// aliased to `log.xray.error` above whenever that setting is present.
+/// Failures are collected across every path rather than stopping at the
+/// first, so the user sees every actionable problem in one run instead of
+/// fixing them one at a time. A target that did not exist before the probe
+/// and was created only to check it is removed immediately after: a
+/// successful check must not leave a (potentially root-owned) empty file
+/// behind for a later, unrelated step to fail on. Removal failure is itself
+/// fatal - silently leaving that artifact defeats the point of the cleanup.
+fn preflight_log_paths(paths: &[std::path::PathBuf]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    let mut errors = Vec::new();
+    for path in paths {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        // symlink_metadata, not exists(): exists() follows the link, so a
+        // dangling symlink would report "nothing here", the append-open would
+        // create its target, and the cleanup below would then delete the
+        // symlink itself - destroying the redirection the user set up and
+        // leaving a stray file at the target. Same reasoning as
+        // `preflight_pid_file`.
+        let existed_before = std::fs::symlink_metadata(path).is_ok();
+        match std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+        {
+            Ok(_) => {
+                if !existed_before {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        errors.push(format!(
+                            "created {} to verify it is writable, but could not remove it \
+                             afterwards: {e}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                let owner_uid = log_target_owner_uid(path);
+                errors.push(log_open_error_message(path, &e, owner_uid));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(errors.join("\n"))
+    }
+}
+
+/// Current OS user name, used to decide `kill` vs `sudo kill` in orphan
+/// advice. `ps` reports user names, so names are the right comparison axis;
+/// `nix::unistd::getuid` sits behind the `user` feature, which is not enabled.
+fn current_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default()
+}
+
+/// Translate an error from the pre-start `xray::stop` or from `xray::start`
+/// into a user-facing diagnostic, or `None` to let the error propagate
+/// unchanged. Kept pure (no IO, no process listing) so the *routing* - which
+/// error becomes which message, and where the owner lookup comes from - is
+/// itself tested, not just the message builders it calls into.
+fn start_error_message(
+    err: &anyhow::Error,
+    all: &[xray::XrayProcess],
+    tracked: Option<i32>,
+    port: u16,
+    config_path: &str,
+    log_path: &std::path::Path,
+) -> Option<String> {
+    match err.downcast_ref::<xray::XrayError>() {
+        Some(xray::XrayError::NotPermitted(pid)) => {
+            // Look the owner up in the *full* process list, not the managed
+            // subset: under the sudo/HOME blind spot the tracked PID can
+            // classify as "other xray", which is exactly this case.
+            let owner = all.iter().find(|p| p.pid == *pid).map(|p| p.user.as_str());
+            let orphans = xray::orphans(all, config_path, tracked);
+            Some(xray::start_blocked_message(*pid, owner, &orphans))
+        }
+        Some(xray::XrayError::StartFailed) => Some(xray::start_failure_diagnostics(
+            all,
+            port,
+            config_path,
+            log_path,
+        )),
+        _ => None,
+    }
+}
+
 /// Main algorithm: ensure xray installed, write port to config, start, enable proxy.
 fn main_algorithm(config: &Config, plat: &impl Platform, port: u16) -> anyhow::Result<()> {
     debug!("ensuring xray is installed");
     xray::ensure_installed(&config.xray_bin)?;
 
+    let config_path = config.xray_config.to_string_lossy().to_string();
+
     // Stop any running instance before starting a new one
-    if xray::is_running(config).is_some() {
+    if let Some(tracked_pid) = xray::is_running(config) {
         debug!("stopping existing xray instance");
-        xray::stop(config)?;
+        if let Err(e) = xray::stop(config) {
+            let all = xray::list_xray_processes(&config.xray_bin);
+            if let Some(msg) = start_error_message(
+                &e,
+                &all,
+                Some(tracked_pid),
+                port,
+                &config_path,
+                &config.xray_log,
+            ) {
+                anyhow::bail!(msg);
+            }
+            return Err(e);
+        }
     }
 
     // Write port into xray config.json inbound section
     debug!("writing port {} to config", port);
     update_config_port(&config.xray_config, port)?;
 
-    let pid = xray::start(config)?;
+    let pid = match xray::start(config) {
+        Ok(pid) => pid,
+        Err(e) => {
+            let all = xray::list_xray_processes(&config.xray_bin);
+            if let Some(msg) =
+                start_error_message(&e, &all, None, port, &config_path, &config.xray_log)
+            {
+                anyhow::bail!(msg);
+            }
+            return Err(e);
+        }
+    };
     debug!("xray process started with PID {}", pid);
     println!("{}", format!("xray started (PID: {pid})").green());
+
+    // Non-fatal: report any untracked corvex-managed xray processes still on
+    // the system. corvex never signals them - reporting only.
+    let all = xray::list_xray_processes(&config.xray_bin);
+    let orphans = xray::orphans(&all, &config_path, Some(pid));
+    for line in xray::orphan_lines(&orphans, &current_user()) {
+        println!("{}", line.yellow());
+    }
 
     let service = plat.detect_active_service()?;
     debug!(
@@ -650,7 +847,35 @@ fn stop_awg_if_running(config: &Config) {
     }
 }
 
+/// Lines printed once `stop` has actually stopped xray: a plain success line
+/// when no managed process survives, or a qualifying line plus the recovery
+/// advice for each survivor. `stop` is exactly where the new hints send
+/// users, so it must not claim a clean stop while a corvex-managed xray is
+/// still running. Reuses `xray::orphan_lines` for the recovery commands
+/// rather than duplicating that text.
+fn stop_outcome_lines(survivors: &[xray::XrayProcess], current_user: &str) -> Vec<String> {
+    if survivors.is_empty() {
+        return vec!["corvex stopped!".to_string()];
+    }
+    let mut lines = vec![
+        "corvex stopped, but other corvex-managed xray process(es) are still running:".to_string(),
+    ];
+    lines.extend(xray::orphan_lines(survivors, current_user));
+    lines
+}
+
 fn cmd_stop(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
+    cmd_stop_inner(config, plat, &mut std::io::stdout())
+}
+
+/// Takes the output writer as a parameter (defaulting to stdout via
+/// `cmd_stop`) so the qualified-vs-clean success message - not just
+/// `cmd_stop`'s side effects - can be asserted directly in tests.
+fn cmd_stop_inner<W: std::io::Write>(
+    config: &Config,
+    plat: &impl Platform,
+    out: &mut W,
+) -> anyhow::Result<()> {
     // Resolve the network service first: detection is read-only, so a
     // detection failure aborts before anything is touched. Then stop xray;
     // if that fails for any reason (not running, owned by another user, ...),
@@ -661,13 +886,30 @@ fn cmd_stop(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     debug!("stopping xray");
     xray::stop(config)?;
 
+    // The tracked process is gone (xray::stop just removed the PID file), so
+    // any managed process still in `ps` is an orphan `stop` cannot reach -
+    // report it instead of claiming a clean stop.
+    let config_path = config.xray_config.to_string_lossy().to_string();
+    let survivors = xray::orphans(
+        &xray::list_xray_processes(&config.xray_bin),
+        &config_path,
+        None,
+    );
+
     debug!("disabling system proxy");
     plat.disable_proxy(&service)?;
 
     // Also stop any AWG tunnel left running from a previous session
     stop_awg_if_running(config);
 
-    println!("{}", "corvex stopped!".green());
+    let lines = stop_outcome_lines(&survivors, &current_user());
+    if survivors.is_empty() {
+        writeln!(out, "{}", lines[0].green())?;
+    } else {
+        for line in &lines {
+            writeln!(out, "{}", line.yellow())?;
+        }
+    }
     Ok(())
 }
 
@@ -679,48 +921,82 @@ fn cmd_reload(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Orphan lines only - the tracked-process line printed by `cmd_status`
+/// itself is not re-rendered here, so an empty return means nothing changes
+/// versus today's output. Managed processes only: `ps` cannot show what port
+/// another process listens on, so "other xray" reporting stays in
+/// `start_failure_diagnostics`, where the port is already named.
+fn status_process_lines(
+    tracked: Option<i32>,
+    all: &[xray::XrayProcess],
+    config_path: &str,
+    current_user: &str,
+) -> Vec<String> {
+    let orphans = xray::orphans(all, config_path, tracked);
+    xray::orphan_lines(&orphans, current_user)
+}
+
 fn cmd_status(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
+    cmd_status_inner(config, plat, &mut std::io::stdout())
+}
+
+/// Takes the output writer as a parameter (defaulting to stdout via
+/// `cmd_status`) so the wiring of `status_process_lines` - not just its own
+/// content - can be asserted directly in tests: that it is called exactly
+/// once, and that its lines land after the tracked-process line rather than
+/// duplicating or replacing it.
+fn cmd_status_inner<W: std::io::Write>(
+    config: &Config,
+    plat: &impl Platform,
+    out: &mut W,
+) -> anyhow::Result<()> {
     debug!("checking status");
     let service = plat.detect_active_service()?;
-    println!("Network service: {}", service.yellow());
+    writeln!(out, "Network service: {}", service.yellow())?;
 
     // Config paths
-    println!("Settings: {}", config.corvex_settings.display());
-    println!("Xray config: {}", config.xray_config.display());
-    println!("Xray log: {}", config.xray_log.display());
+    writeln!(out, "Settings: {}", config.corvex_settings.display())?;
+    writeln!(out, "Xray config: {}", config.xray_config.display())?;
+    writeln!(out, "Xray log: {}", config.xray_log.display())?;
 
     // Engine type and AWG status
     if let Ok(awg_conf_path) = config.awg_conf_path() {
         let awg_iface = engine::awg::conf_interface_name(&awg_conf_path);
         if engine::awg::is_tunnel_running(&awg_iface) {
-            println!("Engine: {}", "AWG + xray".green());
-            println!("AWG tunnel: {} ({})", "running".green(), awg_iface);
+            writeln!(out, "Engine: {}", "AWG + xray".green())?;
+            writeln!(out, "AWG tunnel: {} ({})", "running".green(), awg_iface)?;
         } else {
-            println!("Engine: {}", "xray".green());
+            writeln!(out, "Engine: {}", "xray".green())?;
         }
     } else {
-        println!("Engine: {}", "xray".green());
+        writeln!(out, "Engine: {}", "xray".green())?;
     }
 
     // Xray process
-    match xray::is_running(config) {
-        Some(pid) => println!("xray: {} (PID: {})", "started".green(), pid),
-        None => println!("xray: {}", "stopped".red()),
+    let tracked_pid = xray::is_running(config);
+    match tracked_pid {
+        Some(pid) => writeln!(out, "xray: {} (PID: {})", "started".green(), pid)?,
+        None => writeln!(out, "xray: {}", "stopped".red())?,
+    }
+    let config_path = config.xray_config.to_string_lossy().to_string();
+    let all_processes = xray::list_xray_processes(&config.xray_bin);
+    for line in status_process_lines(tracked_pid, &all_processes, &config_path, &current_user()) {
+        writeln!(out, "{}", line.yellow())?;
     }
 
     // Proxy status from networksetup
     match plat.proxy_status(&service) {
         Ok(status) => {
-            print_proxy_status("socks", &status.socks);
-            print_proxy_status("http", &status.http);
-            print_proxy_status("https", &status.https);
+            write_proxy_status(out, "socks", &status.socks)?;
+            write_proxy_status(out, "http", &status.http)?;
+            write_proxy_status(out, "https", &status.https)?;
         }
-        Err(e) => println!("{}", format!("Failed to query proxy: {e}").red()),
+        Err(e) => writeln!(out, "{}", format!("Failed to query proxy: {e}").red())?,
     }
 
     // Last 5 log lines
     if config.xray_log.exists() {
-        println!();
+        writeln!(out)?;
         let _ = Command::new("tail")
             .args(["-5"])
             .arg(&config.xray_log)
@@ -730,11 +1006,15 @@ fn cmd_status(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_proxy_status(label: &str, info: &platform::ProxyInfo) {
+fn write_proxy_status<W: std::io::Write>(
+    out: &mut W,
+    label: &str,
+    info: &platform::ProxyInfo,
+) -> std::io::Result<()> {
     if info.enabled {
-        println!("{}: {}:{}", label, info.server, info.port);
+        writeln!(out, "{}: {}:{}", label, info.server, info.port)
     } else {
-        println!("{}: {}", label, "off".red());
+        writeln!(out, "{}: {}", label, "off".red())
     }
 }
 
@@ -996,6 +1276,312 @@ mod tests {
         );
     }
 
+    /// Writes an executable `#!/bin/sh\nsleep 30\n` script at `path`. Its `ps`
+    /// comm/argv0 is `/bin/sh`, so a test config with `xray_bin = "sh"`
+    /// classifies it as xray without needing a real xray binary.
+    #[cfg(unix)]
+    fn write_fake_process_script(path: &std::path::Path) {
+        std::fs::write(path, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// RAII guard around a spawned fake-xray test process. On drop it SIGKILLs
+    /// the whole process group (so a shell's descendants can't outlive the
+    /// test regardless of whether the shell execs its body or forks a child -
+    /// this differs across platforms) and joins the background reaper thread,
+    /// so a panicking assertion between spawn and the end of the test can
+    /// never leak a process. The reaper thread reaps the process the instant
+    /// it exits, following the same convention as `spawn_fake_xray` above:
+    /// without it a SIGTERM'd child stays a zombie (`is_process_alive` still
+    /// reports a zombie as alive) until something calls `wait()`, and
+    /// `xray::stop`'s liveness loop would burn its full ~2s timeout waiting
+    /// for that to happen.
+    #[cfg(unix)]
+    struct FakeProcess {
+        pid: i32,
+        reaper: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl FakeProcess {
+        fn spawn(cmd: &mut std::process::Command) -> Self {
+            use std::os::unix::process::CommandExt;
+            let mut child = cmd
+                .process_group(0)
+                .spawn()
+                .expect("failed to spawn fake test process");
+            let pid = child.id() as i32;
+            let reaper = std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            FakeProcess {
+                pid,
+                reaper: Some(reaper),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeProcess {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-self.pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            if let Some(reaper) = self.reaper.take() {
+                let _ = reaper.join();
+            }
+        }
+    }
+
+    // -- status_process_lines --
+
+    #[test]
+    fn test_status_process_lines_tracked_only_no_orphans_is_empty() {
+        let all = vec![crate::xray::XrayProcess {
+            pid: 100,
+            user: "alice".to_string(),
+            config_arg: "/Users/alice/.config/xray/config.json".to_string(),
+        }];
+        let lines = super::status_process_lines(
+            Some(100),
+            &all,
+            "/Users/alice/.config/xray/config.json",
+            "alice",
+        );
+        assert!(
+            lines.is_empty(),
+            "a lone tracked process must not be re-rendered here: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_status_process_lines_tracked_plus_root_orphan_lists_sudo_kill() {
+        let config_path = "/Users/alice/.config/xray/config.json";
+        let all = vec![
+            crate::xray::XrayProcess {
+                pid: 100,
+                user: "alice".to_string(),
+                config_arg: config_path.to_string(),
+            },
+            crate::xray::XrayProcess {
+                pid: 7597,
+                user: "root".to_string(),
+                config_arg: config_path.to_string(),
+            },
+        ];
+        let lines = super::status_process_lines(Some(100), &all, config_path, "alice");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("sudo kill 7597"));
+    }
+
+    #[test]
+    fn test_status_process_lines_orphan_with_no_tracked_pid() {
+        let config_path = "/Users/alice/.config/xray/config.json";
+        let all = vec![crate::xray::XrayProcess {
+            pid: 7597,
+            user: "root".to_string(),
+            config_arg: config_path.to_string(),
+        }];
+        let lines = super::status_process_lines(None, &all, config_path, "alice");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("sudo kill 7597"));
+    }
+
+    #[test]
+    fn test_status_process_lines_no_processes_is_empty() {
+        let lines = super::status_process_lines(
+            None,
+            &[],
+            "/Users/alice/.config/xray/config.json",
+            "alice",
+        );
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn test_status_process_lines_never_lists_other_config_xray() {
+        let all = vec![crate::xray::XrayProcess {
+            pid: 999,
+            user: "bob".to_string(),
+            config_arg: "/opt/homebrew/etc/xray/config.json".to_string(),
+        }];
+        let lines = super::status_process_lines(
+            None,
+            &all,
+            "/Users/alice/.config/xray/config.json",
+            "alice",
+        );
+        assert!(
+            lines.is_empty(),
+            "an xray running against a different config must never be listed by status: {lines:?}"
+        );
+    }
+
+    // -- cmd_status wiring: pure status_process_lines tests above cover
+    // *content*; these cover that `cmd_status_inner` actually calls it once,
+    // in the right place - a pure-function test alone would still pass if
+    // the helper were never called, called twice, or called somewhere that
+    // duplicates the tracked line.
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_status_inner_healthy_output_has_single_tracked_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "sh");
+        std::fs::create_dir_all(config.xray_pid_file.parent().unwrap()).unwrap();
+
+        let tracked_script = dir.path().join("tracked.sh");
+        write_fake_process_script(&tracked_script);
+        let tracked = FakeProcess::spawn(&mut std::process::Command::new(&tracked_script));
+        std::fs::write(&config.xray_pid_file, tracked.pid.to_string()).unwrap();
+
+        let plat = RecordingPlatform::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let result = super::cmd_status_inner(&config, &plat, &mut buf);
+
+        result.expect("cmd_status must succeed");
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            output.matches("xray: started (PID:").count(),
+            1,
+            "the tracked line must appear exactly once: {output}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_status_inner_orphan_line_appears_after_tracked_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "sh");
+        std::fs::create_dir_all(config.xray_pid_file.parent().unwrap()).unwrap();
+
+        let scripts_dir = dir.path().join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+
+        let tracked_script = scripts_dir.join("tracked.sh");
+        write_fake_process_script(&tracked_script);
+        let tracked = FakeProcess::spawn(&mut std::process::Command::new(&tracked_script));
+        std::fs::write(&config.xray_pid_file, tracked.pid.to_string()).unwrap();
+
+        let config_path = config.xray_config.to_string_lossy().to_string();
+        let orphan_script = scripts_dir.join("orphan.sh");
+        write_fake_process_script(&orphan_script);
+        let mut orphan_cmd = std::process::Command::new(&orphan_script);
+        orphan_cmd.args(["run", "-c", &config_path]);
+        let orphan = FakeProcess::spawn(&mut orphan_cmd);
+
+        let plat = RecordingPlatform::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let result = super::cmd_status_inner(&config, &plat, &mut buf);
+
+        result.expect("cmd_status must succeed");
+        let output = String::from_utf8(buf).unwrap();
+        let tracked_at = output
+            .find("xray: started (PID:")
+            .expect("tracked line must be present");
+        let orphan_at = output
+            .find(&format!("kill {}", orphan.pid))
+            .expect("orphan recovery line must be present");
+        assert!(
+            orphan_at > tracked_at,
+            "orphan line must appear after the tracked line: {output}"
+        );
+    }
+
+    // -- stop_outcome_lines / cmd_stop qualified success --
+
+    #[test]
+    fn test_stop_outcome_lines_no_survivors_is_plain_success() {
+        let lines = super::stop_outcome_lines(&[], "alice");
+        assert_eq!(lines, vec!["corvex stopped!".to_string()]);
+    }
+
+    #[test]
+    fn test_stop_outcome_lines_survivor_qualifies_and_reuses_orphan_lines() {
+        let survivors = vec![crate::xray::XrayProcess {
+            pid: 7597,
+            user: "root".to_string(),
+            config_arg: "/Users/alice/.config/xray/config.json".to_string(),
+        }];
+        let lines = super::stop_outcome_lines(&survivors, "alice");
+        assert_eq!(lines.len(), 2);
+        assert_ne!(lines[0], "corvex stopped!", "must not claim a clean stop");
+        assert!(lines[1].contains("sudo kill 7597"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_stop_qualifies_success_when_managed_process_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "sh");
+        std::fs::create_dir_all(config.xray_pid_file.parent().unwrap()).unwrap();
+
+        let scripts_dir = dir.path().join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+
+        // Tracked process: `xray::stop` signals this one, and its process
+        // group is force-killed (harmless if already gone) when `tracked`
+        // drops at the end of this function, panic or not.
+        let tracked_script = scripts_dir.join("tracked.sh");
+        write_fake_process_script(&tracked_script);
+        let tracked = FakeProcess::spawn(&mut std::process::Command::new(&tracked_script));
+        std::fs::write(&config.xray_pid_file, tracked.pid.to_string()).unwrap();
+
+        // Orphan: same config path, but never written to xray.pid, so `stop`
+        // cannot reach it and must report it as a survivor instead.
+        let config_path = config.xray_config.to_string_lossy().to_string();
+        let orphan_script = scripts_dir.join("orphan.sh");
+        write_fake_process_script(&orphan_script);
+        let mut orphan_cmd = std::process::Command::new(&orphan_script);
+        orphan_cmd.args(["run", "-c", &config_path]);
+        let orphan = FakeProcess::spawn(&mut orphan_cmd);
+
+        let plat = RecordingPlatform::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let result = super::cmd_stop_inner(&config, &plat, &mut buf);
+
+        result.expect("cmd_stop must still succeed when a survivor remains");
+        let output = String::from_utf8(buf).unwrap();
+        // The test process itself owns the orphan, so the advice is bare
+        // `kill`, not `sudo kill` (that only applies to another user's PID).
+        assert!(
+            output.contains(&format!("kill {}", orphan.pid)),
+            "qualified message must carry the survivor's recovery command: {output}"
+        );
+        assert!(
+            !output.contains("corvex stopped!"),
+            "must not claim a clean stop while a survivor remains: {output}"
+        );
+        assert_eq!(
+            *plat.calls.borrow(),
+            ["detect_active_service", "disable_proxy"]
+        );
+        // `tracked` and `orphan` drop here: their `Drop` impls SIGKILL each
+        // process group and join the reaper threads unconditionally.
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_stop_clean_path_prints_unqualified_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "sleep");
+        let reaper = spawn_fake_xray(&config);
+
+        let plat = RecordingPlatform::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let result = super::cmd_stop_inner(&config, &plat, &mut buf);
+
+        reaper.join().expect("failed to join reaper thread");
+
+        result.expect("cmd_stop must succeed when xray stops cleanly");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("corvex stopped!"));
+        assert!(!output.contains("sudo kill"));
+    }
+
     fn format_xray_status(pid: Option<i32>) -> String {
         match pid {
             Some(pid) => format!("xray: started (PID: {})", pid),
@@ -1053,6 +1639,106 @@ mod tests {
         // Other fields untouched
         assert_eq!(updated["inbounds"][0]["listen"], "127.0.0.1");
         assert_eq!(updated["inbounds"][0]["protocol"], "socks");
+    }
+
+    // -- start_error_message --
+
+    #[test]
+    fn test_start_error_message_not_permitted_names_pid_and_owner() {
+        // Owner name deliberately avoids "root": ROOT_XRAY_ON_START_HINT's own
+        // text contains "root-owned", so asserting on that substring would
+        // pass even if the owner lookup were broken.
+        let err: anyhow::Error = crate::xray::XrayError::NotPermitted(5556).into();
+        let all = vec![crate::xray::XrayProcess {
+            pid: 5556,
+            user: "carol".to_string(),
+            config_arg: "/Users/alice/.config/xray/config.json".to_string(),
+        }];
+        let msg = super::start_error_message(
+            &err,
+            &all,
+            Some(5556),
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            std::path::Path::new("/Users/alice/.local/state/xray/xray.log"),
+        )
+        .expect("NotPermitted must produce a message");
+        assert!(msg.contains("5556"));
+        assert!(msg.contains("'carol'"));
+    }
+
+    /// Regression guard: the owner must be looked up in the *full* process
+    /// list, not `managed_processes`. Here the tracked PID's `config_arg`
+    /// does NOT match `config_path` - the documented sudo/HOME blind spot,
+    /// where a root-launched xray's PID file lives under a different HOME and
+    /// so the tracked PID classifies as "other xray" rather than managed.
+    /// The owner must still be reported; a `managed_processes`-based lookup
+    /// would filter this process out first and render the owner unknown.
+    /// Owner name is "carol", not "root": the hint text itself contains
+    /// "root-owned", which would make a `.contains("root")` assertion pass
+    /// even with a broken (managed-subset) owner lookup.
+    #[test]
+    fn test_start_error_message_not_permitted_owner_from_full_list_not_managed_subset() {
+        let err: anyhow::Error = crate::xray::XrayError::NotPermitted(5556).into();
+        let all = vec![crate::xray::XrayProcess {
+            pid: 5556,
+            user: "carol".to_string(),
+            config_arg: "/root/.config/xray/config.json".to_string(),
+        }];
+        let msg = super::start_error_message(
+            &err,
+            &all,
+            Some(5556),
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            std::path::Path::new("/Users/alice/.local/state/xray/xray.log"),
+        )
+        .expect("NotPermitted must produce a message");
+        assert!(
+            msg.contains("'carol'"),
+            "owner must be resolved from the full process list even when config_arg mismatches"
+        );
+    }
+
+    #[test]
+    fn test_start_error_message_start_failed_names_port_and_log_path() {
+        let err: anyhow::Error = crate::xray::XrayError::StartFailed.into();
+        let msg = super::start_error_message(
+            &err,
+            &[],
+            None,
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            std::path::Path::new("/Users/alice/.local/state/xray/xray.log"),
+        )
+        .expect("StartFailed must produce a message");
+        assert!(msg.contains("21080"));
+        assert!(msg.contains("xray.log"));
+    }
+
+    #[test]
+    fn test_start_error_message_unrelated_error_returns_none() {
+        let not_running: anyhow::Error = crate::xray::XrayError::NotRunning.into();
+        assert!(super::start_error_message(
+            &not_running,
+            &[],
+            None,
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            std::path::Path::new("/Users/alice/.local/state/xray/xray.log"),
+        )
+        .is_none());
+
+        let plain = anyhow::anyhow!("boom");
+        assert!(super::start_error_message(
+            &plain,
+            &[],
+            None,
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            std::path::Path::new("/Users/alice/.local/state/xray/xray.log"),
+        )
+        .is_none());
     }
 
     #[test]
@@ -1121,11 +1807,17 @@ mod tests {
         let s = crate::settings::CorvexSettings::default();
         let log_config = super::build_xray_log_config(&s);
         assert_eq!(log_config.loglevel, "warning");
-        #[cfg(unix)]
-        {
-            assert_eq!(log_config.access, "/var/log/xray/access.log");
-            assert_eq!(log_config.error, "/var/log/xray/error.log");
-        }
+        let state = crate::config::state_dir();
+        let access = std::path::PathBuf::from(&log_config.access);
+        let error = std::path::PathBuf::from(&log_config.error);
+        assert_eq!(
+            access.strip_prefix(&state).unwrap(),
+            std::path::Path::new("xray").join("access.log")
+        );
+        assert_eq!(
+            error.strip_prefix(&state).unwrap(),
+            std::path::Path::new("xray").join("error.log")
+        );
     }
 
     #[test]
@@ -1148,6 +1840,74 @@ mod tests {
         assert_eq!(log_config.loglevel, "debug");
         assert_eq!(log_config.access, "/custom/access.log");
         assert_eq!(log_config.error, "/custom/error.log");
+    }
+
+    #[test]
+    fn test_build_xray_log_config_access_only() {
+        let json = r#"{
+            "uri": "vless://x@y:1",
+            "log": { "xray": { "access": "/custom/access.log" } }
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvex.json");
+        std::fs::write(&path, json).unwrap();
+        let s = crate::settings::load(&path).unwrap();
+        let log_config = super::build_xray_log_config(&s);
+        let defaults = crate::protocol::XrayLogConfig::default();
+        assert_eq!(log_config.loglevel, defaults.loglevel);
+        assert_eq!(log_config.access, "/custom/access.log");
+        assert_eq!(log_config.error, defaults.error);
+    }
+
+    #[test]
+    fn test_build_xray_log_config_error_only() {
+        let json = r#"{
+            "uri": "vless://x@y:1",
+            "log": { "xray": { "error": "/custom/error.log" } }
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvex.json");
+        std::fs::write(&path, json).unwrap();
+        let s = crate::settings::load(&path).unwrap();
+        let log_config = super::build_xray_log_config(&s);
+        let defaults = crate::protocol::XrayLogConfig::default();
+        assert_eq!(log_config.loglevel, defaults.loglevel);
+        assert_eq!(log_config.access, defaults.access);
+        assert_eq!(log_config.error, "/custom/error.log");
+    }
+
+    #[test]
+    fn test_build_xray_log_config_loglevel_only() {
+        let json = r#"{
+            "uri": "vless://x@y:1",
+            "log": { "xray": { "loglevel": "debug" } }
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvex.json");
+        std::fs::write(&path, json).unwrap();
+        let s = crate::settings::load(&path).unwrap();
+        let log_config = super::build_xray_log_config(&s);
+        let defaults = crate::protocol::XrayLogConfig::default();
+        assert_eq!(log_config.loglevel, "debug");
+        assert_eq!(log_config.access, defaults.access);
+        assert_eq!(log_config.error, defaults.error);
+    }
+
+    #[test]
+    fn test_build_xray_log_config_empty_xray_object_uses_all_defaults() {
+        let json = r#"{
+            "uri": "vless://x@y:1",
+            "log": { "xray": {} }
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvex.json");
+        std::fs::write(&path, json).unwrap();
+        let s = crate::settings::load(&path).unwrap();
+        let log_config = super::build_xray_log_config(&s);
+        let defaults = crate::protocol::XrayLogConfig::default();
+        assert_eq!(log_config.loglevel, defaults.loglevel);
+        assert_eq!(log_config.access, defaults.access);
+        assert_eq!(log_config.error, defaults.error);
     }
 
     #[test]
@@ -1338,6 +2098,260 @@ mod tests {
         let settings = crate::settings::CorvexSettings::default();
         // Should not panic
         super::ensure_directories(&config, &settings);
+    }
+
+    // -- log_open_error_message --
+
+    #[test]
+    fn test_log_open_error_message_permission_denied_names_uid_and_chown() {
+        let path = std::path::Path::new("/var/log/xray/access.log");
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        let msg = super::log_open_error_message(path, &err, Some(501));
+
+        assert!(msg.contains("/var/log/xray/access.log"));
+        assert!(msg.contains("501"));
+        assert!(msg.contains("sudo chown -- \"$(id -un)\" '/var/log/xray/access.log'"));
+    }
+
+    #[test]
+    fn test_log_open_error_message_chown_quotes_path_with_space() {
+        let path = std::path::Path::new("/var/log/xray dir/access.log");
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        let msg = super::log_open_error_message(path, &err, Some(501));
+
+        assert!(msg.contains("sudo chown -- \"$(id -un)\" '/var/log/xray dir/access.log'"));
+    }
+
+    #[test]
+    fn test_log_open_error_message_other_error_has_no_chown_line() {
+        let path = std::path::Path::new("/var/log/xray/access.log");
+        let err = std::io::Error::other("read-only file system");
+
+        let msg = super::log_open_error_message(path, &err, None);
+
+        assert!(msg.contains("/var/log/xray/access.log"));
+        assert!(msg.contains("read-only file system"));
+        assert!(!msg.contains("chown"));
+    }
+
+    #[test]
+    fn test_log_open_error_message_permission_denied_without_known_owner_has_no_chown_line() {
+        // The Windows case: MetadataExt is unix-only, so owner_uid is always
+        // None there even on a PermissionDenied error.
+        let path = std::path::Path::new("/var/log/xray/access.log");
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        let msg = super::log_open_error_message(path, &err, None);
+
+        assert!(!msg.contains("chown"));
+    }
+
+    // -- preflight_log_paths --
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_rejects_readonly_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        std::fs::write(&path, "").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o400);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let result = super::preflight_log_paths(std::slice::from_ref(&path));
+
+        // Restore before the temp dir is dropped.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let err = result.expect_err("a 0o400 existing file must be rejected");
+        assert!(err.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_rejects_creation_in_readonly_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("logs");
+        std::fs::create_dir_all(&sub).unwrap();
+        let path = sub.join("access.log");
+        let mut perms = std::fs::metadata(&sub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(&sub, perms).unwrap();
+
+        let result = super::preflight_log_paths(std::slice::from_ref(&path));
+
+        // Restore before the temp dir is dropped.
+        let mut perms = std::fs::metadata(&sub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(&sub, perms).unwrap();
+
+        let err = result.expect_err("creating a new file in a 0o500 directory must be rejected");
+        assert!(err.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_accepts_writable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+
+        super::preflight_log_paths(std::slice::from_ref(&path))
+            .expect("a writable target must pass");
+        assert!(
+            !path.exists(),
+            "a target created only to probe it must be removed afterwards"
+        );
+    }
+
+    /// A dangling symlink is a pre-existing entry even though `exists()` says
+    /// otherwise, because it follows the link. Probing must not delete it: the
+    /// user pointed the log somewhere deliberately, and removing the link
+    /// would send xray's output to a fresh regular file instead.
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_preserves_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere.log");
+        let link = dir.path().join("access.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!link.exists(), "the link must dangle for this test to bite");
+
+        super::preflight_log_paths(std::slice::from_ref(&link))
+            .expect("a writable dangling symlink must pass");
+
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the symlink itself must survive the probe"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_preserves_preexisting_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        std::fs::write(&path, "existing content").unwrap();
+
+        super::preflight_log_paths(std::slice::from_ref(&path))
+            .expect("an already-writable existing file must pass");
+
+        assert!(path.exists(), "a pre-existing target must not be removed");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "existing content",
+            "a pre-existing target's content must be untouched"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_dedupes_duplicate_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        std::fs::write(&path, "").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o400);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        // config.xray_log aliases to log.xray.error in real usage, so the
+        // same failing path can appear twice in the input.
+        let result = super::preflight_log_paths(&[path.clone(), path.clone()]);
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let err = result.expect_err("a 0o400 existing file must be rejected");
+        // The message names the path twice on its own (once in "cannot open
+        // log file X", once in the chown hint), so count failure entries via
+        // a marker that appears exactly once per checked path, not raw path
+        // occurrences.
+        let occurrences = err.to_string().matches("cannot open log file").count();
+        assert_eq!(
+            occurrences, 1,
+            "a duplicated path must be reported once, not once per occurrence: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_rejects_non_permission_error() {
+        // A directory target fails to open as a file with ErrorKind::IsADirectory
+        // or ErrorKind::Other, never PermissionDenied - every failure must still
+        // be fatal, not just permission errors.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("access.log");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let result = super::preflight_log_paths(std::slice::from_ref(&target));
+
+        assert!(
+            result.is_err(),
+            "a non-permission open failure must still be fatal"
+        );
+    }
+
+    // -- is_special_log_value / xray_log_preflight_targets --
+
+    #[test]
+    fn test_is_special_log_value_empty_and_none() {
+        assert!(super::is_special_log_value(""));
+        assert!(super::is_special_log_value("none"));
+    }
+
+    #[test]
+    fn test_is_special_log_value_real_path_is_not_special() {
+        assert!(!super::is_special_log_value("/var/log/xray/access.log"));
+        assert!(!super::is_special_log_value("None")); // xray matches case-sensitively
+    }
+
+    #[test]
+    fn test_xray_log_preflight_targets_skips_empty_and_none() {
+        let targets = super::xray_log_preflight_targets(
+            std::path::Path::new("/state/xray/xray.log"),
+            "",
+            "none",
+        );
+
+        assert_eq!(
+            targets,
+            vec![std::path::PathBuf::from("/state/xray/xray.log")]
+        );
+    }
+
+    #[test]
+    fn test_xray_log_preflight_targets_keeps_real_paths() {
+        let targets = super::xray_log_preflight_targets(
+            std::path::Path::new("/state/xray/xray.log"),
+            "/state/xray/access.log",
+            "/state/xray/error.log",
+        );
+
+        assert_eq!(
+            targets,
+            vec![
+                std::path::PathBuf::from("/state/xray/xray.log"),
+                std::path::PathBuf::from("/state/xray/access.log"),
+                std::path::PathBuf::from("/state/xray/error.log"),
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_accepts_empty_and_none_log_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let xray_log = dir.path().join("xray.log");
+
+        // "" (stdout) and "none" (disabled) are xray's own special values,
+        // never real files - the preflight must not try to open them.
+        let targets = super::xray_log_preflight_targets(&xray_log, "", "none");
+        super::preflight_log_paths(&targets)
+            .expect("empty and \"none\" log values must not be probed as files");
     }
 
     #[test]

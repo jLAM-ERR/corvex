@@ -752,21 +752,11 @@ pub struct XrayLogConfig {
 
 impl Default for XrayLogConfig {
     fn default() -> Self {
-        #[cfg(unix)]
+        let base = crate::config::state_dir().join("xray");
         let (access, error) = (
-            "/var/log/xray/access.log".to_string(),
-            "/var/log/xray/error.log".to_string(),
+            base.join("access.log").to_string_lossy().to_string(),
+            base.join("error.log").to_string_lossy().to_string(),
         );
-        #[cfg(windows)]
-        let (access, error) = {
-            let state = std::env::var("LOCALAPPDATA")
-                .unwrap_or_else(|_| r"C:\Users\Public\AppData\Local".to_string());
-            let base = std::path::PathBuf::from(state).join("xray");
-            (
-                base.join("access.log").to_string_lossy().to_string(),
-                base.join("error.log").to_string_lossy().to_string(),
-            )
-        };
 
         Self {
             loglevel: "warning".to_string(),
@@ -1682,18 +1672,17 @@ mod tests {
 
         let config = create_config(&params, 1080, &[], &XrayLogConfig::default());
         assert_eq!(config["log"]["loglevel"], "warning");
-        #[cfg(unix)]
-        {
-            assert_eq!(config["log"]["access"], "/var/log/xray/access.log");
-            assert_eq!(config["log"]["error"], "/var/log/xray/error.log");
-        }
-        #[cfg(windows)]
-        {
-            let access = config["log"]["access"].as_str().unwrap();
-            let error = config["log"]["error"].as_str().unwrap();
-            assert!(access.ends_with("access.log"), "got: {access}");
-            assert!(error.ends_with("error.log"), "got: {error}");
-        }
+        let state = crate::config::state_dir();
+        let access = std::path::PathBuf::from(config["log"]["access"].as_str().unwrap());
+        let error = std::path::PathBuf::from(config["log"]["error"].as_str().unwrap());
+        assert_eq!(
+            access.strip_prefix(&state).unwrap(),
+            Path::new("xray").join("access.log")
+        );
+        assert_eq!(
+            error.strip_prefix(&state).unwrap(),
+            Path::new("xray").join("error.log")
+        );
     }
 
     #[test]

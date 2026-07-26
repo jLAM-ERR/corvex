@@ -145,9 +145,11 @@ All settings live in a single JSONC file (comments allowed) at `$XDG_CONFIG_HOME
   // Logging
   "log": {
     "xray": {
-      "loglevel": "warning",
-      "access": "/var/log/xray/access.log",
-      "error": "/var/log/xray/error.log"
+      "loglevel": "warning"
+      // "access"/"error" default to $XDG_STATE_HOME/xray/{access,error}.log
+      // (%LOCALAPPDATA%\xray\ on Windows); set them here to log elsewhere,
+      // e.g. "/var/log/xray/access.log" (needs the directory to be
+      // user-writable)
     },
     "corvex": { "debug": false }
   }
@@ -215,7 +217,7 @@ AmneziaWG is an optional alternative engine and corvex never installs it. **If y
 | `$XDG_CONFIG_HOME/xray/config.json` | Xray daemon config (auto-generated) |
 | `$XDG_CONFIG_HOME/xray/xray.pid` | PID file for running xray process |
 | `$XDG_STATE_HOME/corvex/corvex.log` | Corvex log (default `~/.local/state/corvex/corvex.log`) |
-| Xray logs | Configurable via `log.xray` in corvex.json |
+| `$XDG_STATE_HOME/xray/{access,error}.log` | Xray logs (default; `%LOCALAPPDATA%\xray\` on Windows); override via `log.xray` in corvex.json |
 
 ## How it works
 
@@ -235,4 +237,17 @@ Setting system proxy on macOS requires admin privileges. When running without `s
 - `sudo corvex start` — bypasses the dialog entirely
 - SSH (no GUI) — falls back to a clear error message suggesting `sudo`
 - Canceling the dialog — reports "Authorization denied" without partial changes
+
+## Recovering from a mixed sudo/user state
+
+If xray has ever been started with `sudo`, a plain `corvex start` can fail because a root-owned xray is still around:
+
+- **A tracked root-owned xray is running** (`start` reports it's already running as another user): run `sudo corvex stop` once, then plain `corvex start`. Do **not** run `sudo corvex start` — that starts another root-owned xray and you're back where you started. If `sudo corvex stop` instead reports xray isn't running while `corvex status` still shows the root-owned process, `sudo` reset your environment (common on Linux) — use `sudo kill <pid>` directly, or `sudo -E corvex stop` to preserve it.
+- **An untracked xray is running** (an orphan, reported by `status` or a failed `start`): orphan detection and the lifecycle commands (`start`/`stop`/`reload`) only ever signal the daemon recorded in the PID file, so none of them can stop this one for you — corvex's own short-lived health-check processes are a separate matter, owned and cleaned up by the check itself. Stop the orphan yourself with `sudo kill <pid>` (or plain `kill <pid>` if you own it) — check with `ps -p <pid>` first, since the report is a snapshot and PIDs get reused.
+
+**Killing a process leaves the system proxy enabled.** `kill` stops xray and nothing else, so the proxy still points at `127.0.0.1:<port>`. If the process you killed was the one serving that port, everything using the system proxy fails with connection errors until you run `corvex start` again. Note that `corvex stop` will not clear it either: with no xray running it reports `xray is not running` and returns before disabling the proxy, so run `corvex start` (then `corvex stop`, if you wanted it off) to get back to a consistent state.
+
+In practice an orphan is usually *not* the process serving your port — two xray instances cannot both bind it, which is why a failed `start` reporting a port conflict means the orphan holds it and the tracked process never came up. Killing the orphan there frees the port with nothing to interrupt. `sudo corvex stop` remains the right command for a tracked process, precisely because it disables the proxy as well.
+
+Going forward, avoid `sudo corvex start` entirely — corvex already prompts for a password via the graphical dialog above when it needs admin rights.
 
