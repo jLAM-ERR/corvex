@@ -583,24 +583,77 @@ fn ensure_directories(config: &Config, settings: &settings::CorvexSettings) {
     }
 }
 
+/// Current OS user name, used to decide `kill` vs `sudo kill` in orphan
+/// advice. `ps` reports user names, so names are the right comparison axis;
+/// `nix::unistd::getuid` sits behind the `user` feature, which is not enabled.
+fn current_user() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default()
+}
+
 /// Main algorithm: ensure xray installed, write port to config, start, enable proxy.
 fn main_algorithm(config: &Config, plat: &impl Platform, port: u16) -> anyhow::Result<()> {
     debug!("ensuring xray is installed");
     xray::ensure_installed(&config.xray_bin)?;
 
+    let config_path = config.xray_config.to_string_lossy().to_string();
+
     // Stop any running instance before starting a new one
-    if xray::is_running(config).is_some() {
+    if let Some(tracked_pid) = xray::is_running(config) {
         debug!("stopping existing xray instance");
-        xray::stop(config)?;
+        if let Err(e) = xray::stop(config) {
+            if matches!(
+                e.downcast_ref::<xray::XrayError>(),
+                Some(xray::XrayError::NotPermitted(_))
+            ) {
+                // Look the owner up in the *full* process list, not the managed
+                // subset: under the sudo/HOME blind spot the tracked PID can
+                // classify as "other xray", which is exactly this case.
+                let all = xray::list_xray_processes(&config.xray_bin);
+                let owner = all
+                    .iter()
+                    .find(|p| p.pid == tracked_pid)
+                    .map(|p| p.user.as_str());
+                let orphans = xray::orphans(&all, &config_path, Some(tracked_pid));
+                anyhow::bail!(xray::start_blocked_message(tracked_pid, owner, &orphans));
+            }
+            return Err(e);
+        }
     }
 
     // Write port into xray config.json inbound section
     debug!("writing port {} to config", port);
     update_config_port(&config.xray_config, port)?;
 
-    let pid = xray::start(config)?;
+    let pid = match xray::start(config) {
+        Ok(pid) => pid,
+        Err(e) => {
+            if matches!(
+                e.downcast_ref::<xray::XrayError>(),
+                Some(xray::XrayError::StartFailed)
+            ) {
+                let all = xray::list_xray_processes(&config.xray_bin);
+                anyhow::bail!(xray::start_failure_diagnostics(
+                    &all,
+                    port,
+                    &config_path,
+                    &config.xray_log,
+                ));
+            }
+            return Err(e);
+        }
+    };
     debug!("xray process started with PID {}", pid);
     println!("{}", format!("xray started (PID: {pid})").green());
+
+    // Non-fatal: report any untracked corvex-managed xray processes still on
+    // the system. corvex never signals them - reporting only.
+    let all = xray::list_xray_processes(&config.xray_bin);
+    let orphans = xray::orphans(&all, &config_path, Some(pid));
+    for line in xray::orphan_lines(&orphans, &current_user()) {
+        println!("{}", line.yellow());
+    }
 
     let service = plat.detect_active_service()?;
     debug!(

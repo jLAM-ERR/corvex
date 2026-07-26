@@ -252,13 +252,13 @@ Sites asserting or documenting the old values, all of which must change with the
 - Modify: `src/xray.rs`
 - Modify: `src/main.rs`
 
-- [ ] add `ROOT_XRAY_ON_START_HINT` / `ORPHAN_XRAY_HINT` const templates plus builders `start_blocked_message(pid, owner, orphans)`, `orphan_lines(orphans, current_user)` (emitting `sudo kill N`, or `kill N` when the owner is the current user, worded as a snapshot with "re-check with `ps` first"), and `start_failure_diagnostics(all, port, config_path, log_path)`; resolve `current_user` from `std::env::var("USER")` with a `LOGNAME` fallback, and look the blocked PID's owner up in the **full** process list, not the managed subset
-- [ ] keep `XrayError::NotPermitted`'s existing text for `stop`/`reload` (there "try again with sudo" is correct advice) and surface `start_blocked_message` instead when the pre-start `xray::stop` fails with `NotPermitted` in `main_algorithm`
-- [ ] surface `start_failure_diagnostics` when `xray::start` returns `StartFailed`, passing `config.xray_log` explicitly so the message can always name the port *and* the log path, and listing running xray processes with the port-conflict sentence **only when that list is non-empty** — `StartFailed` also fires on an invalid config, missing geo assets, or an unwritable log
-- [ ] print orphan lines as a non-fatal warning on an otherwise successful start
-- [ ] write tests for the builders (success cases): `start_blocked_message` names the PID, the owner, `sudo corvex stop` and `corvex start`; `orphan_lines` emits `sudo kill` for another user's PID and bare `kill` for the current user's; `start_failure_diagnostics` lists each process's config path and the port
-- [ ] write tests for error/edge cases: `start_blocked_message` with no orphans emits no orphan text; **`orphan_lines` output never contains the substring `corvex stop`** (regression guard for the looping-advice defect); `start_failure_diagnostics` with an empty process list names the port and log path but claims no conflict
-- [ ] run `cargo test` - must pass before task 3
+- [x] add `ROOT_XRAY_ON_START_HINT` / `ORPHAN_XRAY_HINT` const templates plus builders `start_blocked_message(pid, owner, orphans)`, `orphan_lines(orphans, current_user)` (emitting `sudo kill N`, or `kill N` when the owner is the current user, worded as a snapshot with "re-check with `ps` first"), and `start_failure_diagnostics(all, port, config_path, log_path)`; resolve `current_user` from `std::env::var("USER")` with a `LOGNAME` fallback, and look the blocked PID's owner up in the **full** process list, not the managed subset
+- [x] keep `XrayError::NotPermitted`'s existing text for `stop`/`reload` (there "try again with sudo" is correct advice) and surface `start_blocked_message` instead when the pre-start `xray::stop` fails with `NotPermitted` in `main_algorithm`
+- [x] surface `start_failure_diagnostics` when `xray::start` returns `StartFailed`, passing `config.xray_log` explicitly so the message can always name the port *and* the log path, and listing running xray processes with the port-conflict sentence **only when that list is non-empty** — `StartFailed` also fires on an invalid config, missing geo assets, or an unwritable log
+- [x] print orphan lines as a non-fatal warning on an otherwise successful start
+- [x] write tests for the builders (success cases): `start_blocked_message` names the PID, the owner, `sudo corvex stop` and `corvex start`; `orphan_lines` emits `sudo kill` for another user's PID and bare `kill` for the current user's; `start_failure_diagnostics` lists each process's config path and the port
+- [x] write tests for error/edge cases: `start_blocked_message` with no orphans emits no orphan text; **`orphan_lines` output never contains the substring `corvex stop`** (regression guard for the looping-advice defect); `start_failure_diagnostics` with an empty process list names the port and log path but claims no conflict
+- [x] run `cargo test` - must pass before task 3
 
 ### Task 3: Report surviving processes in `status` and `stop`
 

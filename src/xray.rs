@@ -416,6 +416,103 @@ pub(crate) fn list_xray_processes(_xray_bin: &str) -> Vec<XrayProcess> {
     Vec::new()
 }
 
+/// Shown when the tracked xray is owned by another user and `stop` cannot
+/// signal it. The only working recovery is a one-time privileged stop
+/// followed by a plain start - `sudo corvex start` just recreates the problem
+/// with a new root-owned process.
+const ROOT_XRAY_ON_START_HINT: &str = "run `sudo corvex stop`, then `corvex start`. \
+    Do not run `sudo corvex start` - it starts another root-owned xray and the problem repeats.";
+
+/// Shown for an untracked corvex-managed xray (an orphan). `xray::stop` only
+/// ever signals the PID recorded in `xray.pid`, so it cannot touch these -
+/// telling the user to run it here would recreate the looping-advice defect.
+const ORPHAN_XRAY_HINT: &str =
+    "corvex does not track this process (it is not the PID in xray.pid) and cannot stop it.";
+
+/// Message shown when `start` cannot proceed because the tracked xray is
+/// owned by another user. `owner` must come from the *full* process list
+/// (`list_xray_processes`), not `managed_processes` - under the sudo/HOME
+/// blind spot the tracked PID can classify as "other xray", which is exactly
+/// the case this message exists for.
+pub(crate) fn start_blocked_message(
+    pid: i32,
+    owner: Option<&str>,
+    orphans: &[XrayProcess],
+) -> String {
+    let owner_desc = match owner {
+        Some(user) => format!("as user '{user}'"),
+        None => "as another user".to_string(),
+    };
+    let mut msg =
+        format!("xray (PID: {pid}) is already running {owner_desc}; {ROOT_XRAY_ON_START_HINT}");
+    if !orphans.is_empty() {
+        let listed = orphans
+            .iter()
+            .map(|p| format!("{} (owner: {})", p.pid, p.user))
+            .collect::<Vec<_>>()
+            .join(", ");
+        msg.push_str(&format!(
+            "\nAlso found {} other untracked corvex xray process(es), not affected by \
+             `sudo corvex stop`: {listed}.",
+            orphans.len()
+        ));
+    }
+    msg
+}
+
+/// One line per orphan, each naming the command that removes it: `kill <pid>`
+/// when the orphan is owned by the current user, `sudo kill <pid>` otherwise.
+/// Worded as a snapshot ("as of now") since `ps` output can be stale by the
+/// time the user acts on it and PIDs get reused.
+pub(crate) fn orphan_lines(orphans: &[XrayProcess], current_user: &str) -> Vec<String> {
+    orphans
+        .iter()
+        .map(|p| {
+            let kill_cmd = if p.user == current_user {
+                format!("kill {}", p.pid)
+            } else {
+                format!("sudo kill {}", p.pid)
+            };
+            format!(
+                "xray (PID: {}, owner: {}) is an untracked corvex-managed process; {ORPHAN_XRAY_HINT} \
+                 As of now, this looks safe to stop with `{kill_cmd}` - re-check with `ps -p {}` \
+                 first, since this is a snapshot and PIDs can be reused.",
+                p.pid, p.user, p.pid
+            )
+        })
+        .collect()
+}
+
+/// Diagnostics shown when `xray::start` returns `StartFailed`. Always names
+/// the configured port and log path; `StartFailed` also fires on an invalid
+/// config, a missing geo asset, or an unwritable log, so the "another xray is
+/// holding your port" sentence and the process listing appear only when
+/// `all` is non-empty - never asserting a conflict that was not observed.
+pub(crate) fn start_failure_diagnostics(
+    all: &[XrayProcess],
+    port: u16,
+    config_path: &str,
+    log_path: &Path,
+) -> String {
+    let mut msg = format!(
+        "xray failed to start using config {config_path} on port {port}. Check the log at {}.",
+        log_path.display()
+    );
+    if !all.is_empty() {
+        msg.push_str(&format!(
+            "\nAnother xray process may already be holding port {port}:\n"
+        ));
+        for p in all {
+            msg.push_str(&format!(
+                "  PID {} (owner: {}, config: {})\n",
+                p.pid, p.user, p.config_arg
+            ));
+        }
+        msg.pop();
+    }
+    msg
+}
+
 /// Directory where install.sh places geoip.dat/geosite.dat for non-brew setups.
 const INSTALLED_ASSET_DIR: &str = "/usr/local/share/xray";
 
@@ -860,6 +957,116 @@ mod tests {
     fn test_parse_xray_processes_xray_mentioned_in_later_arg_not_matched() {
         let ps_output = "600 eve     /usr/bin/tail -f /tmp/xray\n";
         assert!(parse_xray_processes(ps_output, "xray").is_empty());
+    }
+
+    // -- start_blocked_message / orphan_lines / start_failure_diagnostics --
+
+    #[test]
+    fn test_start_blocked_message_names_pid_owner_and_recovery_commands() {
+        let msg = start_blocked_message(5556, Some("root"), &[]);
+        assert!(msg.contains("5556"));
+        assert!(msg.contains("root"));
+        assert!(msg.contains("sudo corvex stop"));
+        assert!(msg.contains("corvex start"));
+    }
+
+    #[test]
+    fn test_start_blocked_message_no_orphans_emits_no_orphan_text() {
+        let msg = start_blocked_message(5556, Some("root"), &[]);
+        assert!(!msg.contains("untracked"));
+        assert!(!msg.contains("Also found"));
+    }
+
+    #[test]
+    fn test_start_blocked_message_lists_orphans_when_present() {
+        let orphans = vec![XrayProcess {
+            pid: 7597,
+            user: "root".to_string(),
+            config_arg: "/Users/alice/.config/xray/config.json".to_string(),
+        }];
+        let msg = start_blocked_message(5556, Some("root"), &orphans);
+        assert!(msg.contains("7597"));
+    }
+
+    #[test]
+    fn test_orphan_lines_sudo_kill_for_another_user() {
+        let orphans = vec![XrayProcess {
+            pid: 7597,
+            user: "root".to_string(),
+            config_arg: "/Users/alice/.config/xray/config.json".to_string(),
+        }];
+        let lines = orphan_lines(&orphans, "alice");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("sudo kill 7597"));
+    }
+
+    #[test]
+    fn test_orphan_lines_bare_kill_for_current_user() {
+        let orphans = vec![XrayProcess {
+            pid: 7597,
+            user: "alice".to_string(),
+            config_arg: "/Users/alice/.config/xray/config.json".to_string(),
+        }];
+        let lines = orphan_lines(&orphans, "alice");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("kill 7597"));
+        assert!(!lines[0].contains("sudo kill"));
+    }
+
+    /// Regression guard for the looping-advice defect: an orphan hint must
+    /// never send the user to `corvex stop`, since `xray::stop` only signals
+    /// the tracked PID and cannot touch an orphan. Uses a real orphan (one
+    /// owned by another user, so recovery text is actually produced) so an
+    /// implementation that wrongly emitted "corvex stop" here would fail.
+    #[test]
+    fn test_orphan_lines_never_says_corvex_stop() {
+        let orphans = vec![XrayProcess {
+            pid: 7597,
+            user: "root".to_string(),
+            config_arg: "/Users/alice/.config/xray/config.json".to_string(),
+        }];
+        let lines = orphan_lines(&orphans, "alice");
+        assert!(!lines.is_empty());
+        assert!(!lines.join("\n").contains("corvex stop"));
+    }
+
+    #[test]
+    fn test_start_failure_diagnostics_lists_processes_and_port() {
+        let all = vec![
+            XrayProcess {
+                pid: 1,
+                user: "alice".to_string(),
+                config_arg: "/Users/alice/.config/xray/config.json".to_string(),
+            },
+            XrayProcess {
+                pid: 2,
+                user: "root".to_string(),
+                config_arg: "/opt/homebrew/etc/xray/config.json".to_string(),
+            },
+        ];
+        let msg = start_failure_diagnostics(
+            &all,
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            Path::new("/Users/alice/.local/state/xray/xray.log"),
+        );
+        assert!(msg.contains("21080"));
+        assert!(msg.contains("/Users/alice/.config/xray/config.json"));
+        assert!(msg.contains("/opt/homebrew/etc/xray/config.json"));
+        assert!(msg.contains("xray.log"));
+    }
+
+    #[test]
+    fn test_start_failure_diagnostics_empty_list_names_port_and_log_no_conflict_claim() {
+        let msg = start_failure_diagnostics(
+            &[],
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            Path::new("/Users/alice/.local/state/xray/xray.log"),
+        );
+        assert!(msg.contains("21080"));
+        assert!(msg.contains("xray.log"));
+        assert!(!msg.contains("Another xray process"));
     }
 
     #[test]
