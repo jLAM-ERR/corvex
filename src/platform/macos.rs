@@ -31,7 +31,7 @@ fn run_networksetup(args: &[&str]) -> Result<String> {
                 "admin required for networksetup {}, escalating via osascript",
                 args.join(" ")
             );
-            return run_networksetup_elevated(args);
+            return run_networksetup_elevated(&[args.to_vec()]);
         }
         anyhow::bail!("networksetup {} failed: {}", args.join(" "), detail);
     }
@@ -49,8 +49,8 @@ fn join_output(stdout: &str, stderr: &str) -> String {
         .join(" ")
 }
 
-fn run_networksetup_elevated(args: &[&str]) -> Result<String> {
-    let script = build_osascript_command(args);
+fn run_networksetup_elevated(commands: &[Vec<&str>]) -> Result<String> {
+    let script = build_osascript_command(commands);
     let output = Command::new("osascript")
         .args(["-e", &script])
         .output()
@@ -64,10 +64,15 @@ fn run_networksetup_elevated(args: &[&str]) -> Result<String> {
         if is_no_gui_error(&stderr) {
             anyhow::bail!("No GUI session available — run with sudo instead");
         }
+        let commands_str = commands
+            .iter()
+            .map(|args| args.join(" "))
+            .collect::<Vec<_>>()
+            .join("; ");
         anyhow::bail!(
-            "networksetup {} failed (elevated): {}",
-            args.join(" "),
-            join_output(&String::from_utf8_lossy(&output.stdout), &stderr)
+            "networksetup batch failed (elevated): {}\ncommands: {}",
+            join_output(&String::from_utf8_lossy(&output.stdout), &stderr),
+            commands_str
         );
     }
 
@@ -256,9 +261,15 @@ fn is_no_gui_error(stderr: &str) -> bool {
     stderr.contains("connection is invalid")
 }
 
-fn build_osascript_command(args: &[&str]) -> String {
-    let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
-    let shell_cmd = format!("/usr/sbin/networksetup {}", escaped_args.join(" "));
+fn build_osascript_command(commands: &[Vec<&str>]) -> String {
+    let rendered: Vec<String> = commands
+        .iter()
+        .map(|args| {
+            let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
+            format!("/usr/sbin/networksetup {}", escaped_args.join(" "))
+        })
+        .collect();
+    let shell_cmd = rendered.join(" && ");
     let as_escaped = applescript_escape(&shell_cmd);
     format!(
         "do shell script \"{}\" with administrator privileges",
@@ -420,7 +431,7 @@ mod tests {
     // build_osascript_command tests
     #[test]
     fn osascript_single_arg() {
-        let cmd = build_osascript_command(&["-getwebproxy"]);
+        let cmd = build_osascript_command(&[vec!["-getwebproxy"]]);
         assert_eq!(
             cmd,
             "do shell script \"/usr/sbin/networksetup '-getwebproxy'\" with administrator privileges"
@@ -429,8 +440,12 @@ mod tests {
 
     #[test]
     fn osascript_multiple_args() {
-        let cmd =
-            build_osascript_command(&["-setsocksfirewallproxy", "Wi-Fi", "127.0.0.1", "1080"]);
+        let cmd = build_osascript_command(&[vec![
+            "-setsocksfirewallproxy",
+            "Wi-Fi",
+            "127.0.0.1",
+            "1080",
+        ]]);
         assert_eq!(
             cmd,
             "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxy' 'Wi-Fi' '127.0.0.1' '1080'\" with administrator privileges"
@@ -439,15 +454,61 @@ mod tests {
 
     #[test]
     fn osascript_args_with_special_chars() {
-        let cmd = build_osascript_command(&[
+        let cmd = build_osascript_command(&[vec![
             "-setsocksfirewallproxy",
             "Thunderbolt \"Pro\" Bridge",
             "127.0.0.1",
             "1080",
-        ]);
+        ]]);
         assert_eq!(
             cmd,
             "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxy' 'Thunderbolt \\\"Pro\\\" Bridge' '127.0.0.1' '1080'\" with administrator privileges"
         );
+    }
+
+    #[test]
+    fn osascript_batch_of_six_joined_with_and() {
+        let commands: Vec<Vec<&str>> = vec![
+            vec!["-setsocksfirewallproxy", "Wi-Fi", "127.0.0.1", "21080"],
+            vec!["-setsocksfirewallproxystate", "Wi-Fi", "on"],
+            vec!["-setwebproxy", "Wi-Fi", "127.0.0.1", "21080"],
+            vec!["-setwebproxystate", "Wi-Fi", "on"],
+            vec!["-setsecurewebproxy", "Wi-Fi", "127.0.0.1", "21080"],
+            vec!["-setsecurewebproxystate", "Wi-Fi", "on"],
+        ];
+        let cmd = build_osascript_command(&commands);
+        assert_eq!(
+            cmd,
+            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxy' 'Wi-Fi' '127.0.0.1' '21080' && \
+/usr/sbin/networksetup '-setsocksfirewallproxystate' 'Wi-Fi' 'on' && \
+/usr/sbin/networksetup '-setwebproxy' 'Wi-Fi' '127.0.0.1' '21080' && \
+/usr/sbin/networksetup '-setwebproxystate' 'Wi-Fi' 'on' && \
+/usr/sbin/networksetup '-setsecurewebproxy' 'Wi-Fi' '127.0.0.1' '21080' && \
+/usr/sbin/networksetup '-setsecurewebproxystate' 'Wi-Fi' 'on'\" with administrator privileges"
+        );
+    }
+
+    #[test]
+    fn osascript_batch_has_administrator_privileges_exactly_once() {
+        let commands: Vec<Vec<&str>> = vec![
+            vec!["-setsocksfirewallproxystate", "Wi-Fi", "off"],
+            vec!["-setwebproxystate", "Wi-Fi", "off"],
+            vec!["-setsecurewebproxystate", "Wi-Fi", "off"],
+        ];
+        let cmd = build_osascript_command(&commands);
+        assert_eq!(cmd.matches("with administrator privileges").count(), 1);
+    }
+
+    #[test]
+    fn osascript_batch_escapes_special_service_name_in_every_position() {
+        let service = "Thunderbolt \"Pro\" Bridge";
+        let commands: Vec<Vec<&str>> = vec![
+            vec!["-setsocksfirewallproxystate", service, "off"],
+            vec!["-setwebproxystate", service, "off"],
+            vec!["-setsecurewebproxystate", service, "off"],
+        ];
+        let cmd = build_osascript_command(&commands);
+        let escaped_service = "'Thunderbolt \\\"Pro\\\" Bridge'";
+        assert_eq!(cmd.matches(escaped_service).count(), 3);
     }
 }
