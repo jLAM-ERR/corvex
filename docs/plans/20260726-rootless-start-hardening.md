@@ -309,12 +309,12 @@ Sites asserting or documenting the old values, all of which must change with the
 
 corvex has its own orphan-production path, and it is almost certainly how the reporting machine ended up with an untracked xray from Jul 19. `xray::start` spawns the child at `src/xray.rs:375-377`, then writes the PID file at line 385 with `fs::write(...)?`. `fs::write` opens with truncate, which fails with `EACCES` on a **root-owned `xray.pid`** — exactly the state on that machine (`-rw-r--r-- root staff`). The `?` returns immediately and the freshly spawned xray keeps running, untracked, forever. Detection alone would only report the mess this creates; this task stops making it.
 
-- [ ] before spawning, verify `config.xray_pid_file` is writable — openable write+create, or removable when it exists and is owned by another user (its directory is user-owned, so unlink generally succeeds where truncate fails) — and fail with a clear message naming the file and `sudo rm <path>` if not
-- [ ] on that pre-spawn failure, return before `cmd.spawn()` so no untracked process can be created
-- [ ] keep the existing post-spawn `fs::write` and its `?`, but make the error text say that an xray was started and is now untracked, naming the PID and `sudo kill <pid>` — the window is much smaller after the preflight but is not zero (TOCTOU)
-- [ ] write tests for the pure message builders (success: preflight message names the pid file and `sudo rm`; post-spawn message names the PID and `sudo kill`)
-- [ ] write `#[cfg(unix)]`-gated tests: a `0o400` PID file in a writable directory is accepted (removable), a PID file in a `0o500` directory is rejected, a normal writable path passes
-- [ ] run `cargo test` - must pass before task 7
+- [x] before spawning, verify `config.xray_pid_file` is writable — openable write+create, or removable when it exists and is owned by another user (its directory is user-owned, so unlink generally succeeds where truncate fails) — and fail with a clear message naming the file and `sudo rm <path>` if not
+- [x] on that pre-spawn failure, return before `cmd.spawn()` so no untracked process can be created
+- [x] keep the existing post-spawn `fs::write` and its `?`, but make the error text say that an xray was started and is now untracked, naming the PID and `sudo kill <pid>` — the window is much smaller after the preflight but is not zero (TOCTOU)
+- [x] write tests for the pure message builders (success: preflight message names the pid file and `sudo rm`; post-spawn message names the PID and `sudo kill`)
+- [x] write `#[cfg(unix)]`-gated tests: a `0o400` PID file in a writable directory is accepted (removable), a PID file in a `0o500` directory is rejected, a normal writable path passes
+- [x] run `cargo test` - must pass before task 7
 
 ### Task 7: Verify acceptance criteria
 

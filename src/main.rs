@@ -588,14 +588,6 @@ fn ensure_directories(config: &Config, settings: &settings::CorvexSettings) {
     }
 }
 
-/// Single-quote `s` for safe embedding in a shell command line: wraps it in
-/// single quotes and escapes any embedded single quote as `'\''`. Without
-/// this, a path containing a space, a glob character, or a leading `-` would
-/// make the suggested `chown` command wrong or unsafe to paste.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// Message for a log target xray could not open. `PermissionDenied` with a
 /// known owner uid gets the `sudo chown` fix; every other case (a directory,
 /// a read-only filesystem, a symlink loop, an uncreatable parent, or an
@@ -610,7 +602,7 @@ fn log_open_error_message(
     match (err.kind(), owner_uid) {
         (std::io::ErrorKind::PermissionDenied, Some(uid)) => format!(
             "{base} (owned by uid {uid}). Fix with: sudo chown -- \"$(id -un)\" {}",
-            shell_quote(&path.display().to_string())
+            config::shell_quote(&path.display().to_string())
         ),
         _ => base,
     }

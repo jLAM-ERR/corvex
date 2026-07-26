@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{self, Config};
 use anyhow::{Context, Result};
 use log::debug;
 #[cfg(unix)]
@@ -529,6 +529,64 @@ fn asset_dir_override(env_set: bool, both_dat_files_exist: bool) -> Option<&'sta
     }
 }
 
+/// Verify the PID file can actually be written before spawning xray, so an
+/// unwritable `xray.pid` is caught here - before a freshly spawned xray keeps
+/// running untracked - rather than after (see the post-spawn `fs::write`
+/// below, which this narrows but cannot eliminate). Accepts a file that
+/// opens for writing directly, or, failing that, one that can be removed:
+/// the containing directory is normally still user-owned even when the file
+/// itself is root-owned (e.g. from a prior `sudo corvex start`), so unlink
+/// usually succeeds where truncate does not. Rejects only when neither
+/// works. A file that did not exist before this check and was created only
+/// to prove the path is writable is removed again immediately, so it does
+/// not sit there under the wrong permissions if `cmd.spawn()` never runs.
+fn preflight_pid_file(path: &Path) -> Result<()> {
+    let existed_before = path.exists();
+    if fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .is_ok()
+    {
+        if !existed_before {
+            let _ = fs::remove_file(path);
+        }
+        return Ok(());
+    }
+    if existed_before && fs::remove_file(path).is_ok() {
+        return Ok(());
+    }
+    anyhow::bail!(pid_file_preflight_message(path));
+}
+
+/// Message for a PID file that is neither writable nor removable. Names
+/// `sudo rm`, not `sudo corvex stop`: the file itself is the obstacle, not a
+/// running process, and `stop` cannot touch it either.
+fn pid_file_preflight_message(path: &Path) -> String {
+    format!(
+        "PID file {} cannot be written and cannot be removed either (likely owned by another \
+         user, e.g. from a prior `sudo corvex start`). Fix with: sudo rm -- {}",
+        path.display(),
+        config::shell_quote(&path.display().to_string())
+    )
+}
+
+/// Error text for the post-spawn PID-file write. By this point xray is
+/// already running, so simply returning here - like the bug this preflight
+/// fixes - would leave it orphaned. Names the PID and the command that
+/// reclaims it. The preflight above shrinks this window a lot but cannot
+/// close it (a genuine TOCTOU), so the message has to stay honest about what
+/// already happened.
+fn pid_file_write_failed_message(pid: i32, path: &Path, err: &std::io::Error) -> String {
+    format!(
+        "xray (PID: {pid}) started, but its PID file {} could not be written ({err}), so corvex \
+         does not track it and cannot manage it. Stop it with: sudo kill {pid} (or `kill {pid}` \
+         if you own the process)",
+        path.display()
+    )
+}
+
 /// Start the xray process.
 pub fn start(config: &Config) -> Result<i32> {
     if !config.xray_config.exists() {
@@ -538,6 +596,8 @@ pub fn start(config: &Config) -> Result<i32> {
     if let Some(pid) = is_running(config) {
         return Err(XrayError::AlreadyRunning(pid).into());
     }
+
+    preflight_pid_file(&config.xray_pid_file)?;
 
     if let Some(log_dir) = config.xray_log.parent() {
         let _ = fs::create_dir_all(log_dir);
@@ -586,7 +646,13 @@ pub fn start(config: &Config) -> Result<i32> {
     if let Some(pid_dir) = config.xray_pid_file.parent() {
         let _ = fs::create_dir_all(pid_dir);
     }
-    fs::write(&config.xray_pid_file, pid.to_string()).context("Failed to write PID file")?;
+    fs::write(&config.xray_pid_file, pid.to_string()).map_err(|e| {
+        anyhow::anyhow!(pid_file_write_failed_message(
+            pid,
+            &config.xray_pid_file,
+            &e
+        ))
+    })?;
 
     debug!("waiting 1s for xray to stabilize");
     thread::sleep(Duration::from_secs(1));
@@ -1099,5 +1165,189 @@ mod tests {
         ];
         let result = orphans(&all, config_path, Some(1));
         assert_eq!(result.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![2, 3]);
+    }
+
+    // -- preflight_pid_file / pid_file_preflight_message / pid_file_write_failed_message --
+
+    #[test]
+    fn test_pid_file_preflight_message_names_file_and_sudo_rm() {
+        let msg = pid_file_preflight_message(Path::new("/Users/alice/.config/xray/xray.pid"));
+        assert!(msg.contains("/Users/alice/.config/xray/xray.pid"));
+        assert!(msg.contains("sudo rm"));
+    }
+
+    #[test]
+    fn test_pid_file_write_failed_message_names_pid_and_sudo_kill() {
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = pid_file_write_failed_message(
+            5556,
+            Path::new("/Users/alice/.config/xray/xray.pid"),
+            &err,
+        );
+        assert!(msg.contains("5556"));
+        assert!(msg.contains("sudo kill 5556"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_pid_file_accepts_readonly_file_in_writable_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("xray.pid");
+        fs::write(&path, "999").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o400);
+        fs::set_permissions(&path, perms).unwrap();
+
+        let result = preflight_pid_file(&path);
+
+        assert!(
+            result.is_ok(),
+            "a 0o400 file in a writable directory must be accepted as removable: {result:?}"
+        );
+    }
+
+    /// A file we cannot open for writing (0o400) inside a directory that
+    /// disallows unlink too (0o500): neither path to acceptance works, so
+    /// this must be rejected. This is the case a writable-but-not-user-owned
+    /// directory does not cover - see the "removable" test above for that.
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_pid_file_rejects_neither_writable_nor_removable() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("pid_dir");
+        fs::create_dir_all(&sub).unwrap();
+        let path = sub.join("xray.pid");
+        fs::write(&path, "999").unwrap();
+
+        let mut file_perms = fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut file_perms, 0o400);
+        fs::set_permissions(&path, file_perms).unwrap();
+
+        let mut dir_perms = fs::metadata(&sub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut dir_perms, 0o500);
+        fs::set_permissions(&sub, dir_perms).unwrap();
+
+        let result = preflight_pid_file(&path);
+
+        // Restore before the temp dir drops, or cleanup fails.
+        let mut dir_perms = fs::metadata(&sub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut dir_perms, 0o700);
+        fs::set_permissions(&sub, dir_perms).unwrap();
+
+        let err = result.expect_err("neither writable nor removable must be rejected");
+        assert!(err.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_pid_file_accepts_normal_writable_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("xray.pid");
+        fs::write(&path, "999").unwrap();
+
+        preflight_pid_file(&path).expect("a normal writable existing file must pass");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_pid_file_accepts_nonexistent_path_in_writable_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("xray.pid");
+
+        preflight_pid_file(&path).expect("a nonexistent path in a writable directory must pass");
+        assert!(
+            !path.exists(),
+            "a probe file created only to check writability must be removed"
+        );
+    }
+
+    /// Writes an executable `#!/bin/sh` script at `path` that touches
+    /// `marker` and exits immediately - standing in for xray in the ordering
+    /// test below without leaving anything running to clean up.
+    #[cfg(unix)]
+    fn write_marker_script(path: &Path, marker: &Path) {
+        fs::write(
+            path,
+            format!(
+                "#!/bin/sh\ntouch {}\n",
+                config::shell_quote(&marker.display().to_string())
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// Regression guard for the ordering guarantee itself: `start` must
+    /// return the preflight failure *before* `cmd.spawn()` ever runs. Stands
+    /// in a real, spawnable "xray" binary that touches a marker file and
+    /// exits immediately, so a regression that moved the preflight after
+    /// `cmd.spawn()` would leave the marker behind - a plain error-message
+    /// assertion could not tell the two apart. The stand-in exits on its own
+    /// (no `sleep`), so there is nothing left running to reap even if the
+    /// regression this test guards against were reintroduced.
+    #[test]
+    #[cfg(unix)]
+    fn test_start_returns_before_spawn_when_pid_file_preflight_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+
+        let marker = base.join("spawned.marker");
+        let script = base.join("fake_xray.sh");
+        write_marker_script(&script, &marker);
+
+        let xray_config = base.join("xray/config.json");
+        fs::create_dir_all(xray_config.parent().unwrap()).unwrap();
+        fs::write(&xray_config, "{}").unwrap();
+
+        // A PID file that is neither writable nor removable, as in
+        // test_preflight_pid_file_rejects_neither_writable_nor_removable.
+        let pid_dir = base.join("pid_dir");
+        fs::create_dir_all(&pid_dir).unwrap();
+        let pid_file = pid_dir.join("xray.pid");
+        fs::write(&pid_file, "999").unwrap();
+        let mut file_perms = fs::metadata(&pid_file).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut file_perms, 0o400);
+        fs::set_permissions(&pid_file, file_perms).unwrap();
+        let mut dir_perms = fs::metadata(&pid_dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut dir_perms, 0o500);
+        fs::set_permissions(&pid_dir, dir_perms).unwrap();
+
+        let config = Config {
+            xray_bin: script.display().to_string(),
+            xray_config,
+            xray_log: base.join("logs/xray.log"),
+            xray_pid_file: pid_file.clone(),
+            corvex_settings: base.join("corvex/corvex.json"),
+            corvex_log: base.join("state/corvex/corvex.log"),
+        };
+
+        let result = start(&config);
+
+        // If the ordering regression this test guards against were present,
+        // `cmd.spawn()` would already have run by now, but the forked child
+        // needs a moment to actually execute its `touch` before the marker
+        // shows up - poll instead of a single fixed sleep, which was found
+        // to be flaky (the child can take 300-400ms to run under load).
+        for _ in 0..20 {
+            if marker.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        // Restore before the temp dir drops, or cleanup fails.
+        let mut dir_perms = fs::metadata(&pid_dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut dir_perms, 0o700);
+        fs::set_permissions(&pid_dir, dir_perms).unwrap();
+
+        let err = result
+            .expect_err("start must fail when the PID file is neither writable nor removable");
+        assert!(err.to_string().contains(&pid_file.display().to_string()));
+        assert!(
+            !marker.exists(),
+            "xray must never be spawned when the PID-file preflight fails"
+        );
     }
 }
