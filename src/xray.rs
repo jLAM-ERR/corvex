@@ -309,6 +309,108 @@ fn is_process_alive(pid: i32) -> bool {
     }
 }
 
+/// An xray process found via `ps`, together with the config it was started
+/// against. Read-only detection data - never used to signal a process.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct XrayProcess {
+    pub(crate) pid: i32,
+    pub(crate) user: String,
+    pub(crate) config_arg: String,
+}
+
+/// Split a `ps -eww -o pid=,user=,args=` line into (pid, user, args), or
+/// `None` if it does not have at least a pid and a user field. `args` keeps
+/// its original spacing verbatim (only leading whitespace is trimmed) so a
+/// config path containing spaces round-trips unchanged.
+fn split_ps_line(line: &str) -> Option<(&str, &str, &str)> {
+    let line = line.trim_start();
+    if line.is_empty() {
+        return None;
+    }
+    let pid_end = line.find(char::is_whitespace)?;
+    let (pid, rest) = line.split_at(pid_end);
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    let user_end = rest.find(char::is_whitespace)?;
+    let (user, rest) = rest.split_at(user_end);
+    let args = rest.trim_start();
+    Some((pid, user, args))
+}
+
+/// Pure: parse `ps -eww -o pid=,user=,args=` output into every xray process,
+/// with the `-c` config argument each one is running. `command_matches` is
+/// applied to argv[0] only (the first whitespace token of args) - never to
+/// the whole args string, or a later argument that merely mentions the xray
+/// binary name would falsely match. `config_arg` is the trimmed remainder
+/// after the *first* " -c " separator, so a config path that itself contains
+/// the literal " -c " is still captured whole; a line with no " -c " gets an
+/// empty `config_arg` and can never be managed.
+pub(crate) fn parse_xray_processes(ps_output: &str, xray_bin: &str) -> Vec<XrayProcess> {
+    ps_output
+        .lines()
+        .filter_map(split_ps_line)
+        .filter_map(|(pid_str, user, args)| {
+            let pid: i32 = pid_str.parse().ok()?;
+            let argv0 = args.split_whitespace().next().unwrap_or("");
+            if !command_matches(argv0, xray_bin) {
+                return None;
+            }
+            let config_arg = match args.find(" -c ") {
+                Some(idx) => args[idx + " -c ".len()..].trim().to_string(),
+                None => String::new(),
+            };
+            Some(XrayProcess {
+                pid,
+                user: user.to_string(),
+                config_arg,
+            })
+        })
+        .collect()
+}
+
+/// Processes whose `config_arg` matches corvex's own config path exactly.
+pub(crate) fn managed_processes(all: &[XrayProcess], config_path: &str) -> Vec<XrayProcess> {
+    all.iter()
+        .filter(|p| p.config_arg == config_path)
+        .cloned()
+        .collect()
+}
+
+/// Managed processes other than the tracked PID.
+pub(crate) fn orphans(
+    all: &[XrayProcess],
+    config_path: &str,
+    tracked: Option<i32>,
+) -> Vec<XrayProcess> {
+    managed_processes(all, config_path)
+        .into_iter()
+        .filter(|p| Some(p.pid) != tracked)
+        .collect()
+}
+
+/// Lists every xray process on the system, read-only - never signals. Fails
+/// closed: any `ps` failure yields an empty vec, since an unavailable `ps`
+/// must never invent a phantom orphan.
+#[cfg(unix)]
+pub(crate) fn list_xray_processes(xray_bin: &str) -> Vec<XrayProcess> {
+    let output = Command::new("ps")
+        .args(["-eww", "-o", "pid=,user=,args="])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            parse_xray_processes(&String::from_utf8_lossy(&o.stdout), xray_bin)
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn list_xray_processes(_xray_bin: &str) -> Vec<XrayProcess> {
+    Vec::new()
+}
+
 /// Directory where install.sh places geoip.dat/geosite.dat for non-brew setups.
 const INSTALLED_ASSET_DIR: &str = "/usr/local/share/xray";
 
@@ -614,5 +716,138 @@ mod tests {
     #[test]
     fn test_asset_dir_override_env_set_dat_files_missing() {
         assert_eq!(asset_dir_override(true, false), None);
+    }
+
+    // -- parse_xray_processes / managed_processes / orphans --
+
+    #[test]
+    fn test_parse_xray_processes_corvex_own_line_is_managed() {
+        let ps_output =
+            "12345 alice   /opt/homebrew/bin/xray run -c /Users/alice/.config/xray/config.json\n";
+        let all = parse_xray_processes(ps_output, "xray");
+        assert_eq!(all.len(), 1);
+        let managed = managed_processes(&all, "/Users/alice/.config/xray/config.json");
+        assert_eq!(managed.len(), 1);
+        assert_eq!(managed[0].pid, 12345);
+        assert_eq!(managed[0].user, "alice");
+    }
+
+    #[test]
+    fn test_parse_xray_processes_health_probe_parsed_but_not_managed() {
+        let ps_output =
+            "23456 alice   /opt/homebrew/bin/xray run -c /var/folders/xx/yy/tmpABC123.json\n";
+        let all = parse_xray_processes(ps_output, "xray");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].config_arg, "/var/folders/xx/yy/tmpABC123.json");
+        let managed = managed_processes(&all, "/Users/alice/.config/xray/config.json");
+        assert!(managed.is_empty());
+    }
+
+    #[test]
+    fn test_parse_xray_processes_third_party_config_not_managed() {
+        let ps_output =
+            "34567 root    /opt/homebrew/bin/xray run -c /opt/homebrew/etc/xray/config.json\n";
+        let all = parse_xray_processes(ps_output, "xray");
+        let managed = managed_processes(&all, "/Users/alice/.config/xray/config.json");
+        assert!(managed.is_empty());
+        assert_eq!(all[0].user, "root");
+    }
+
+    #[test]
+    fn test_parse_xray_processes_config_path_with_space_is_matched() {
+        let config_path = "/Users/alice/My Configs/config.json";
+        let ps_output = format!("100 alice   /opt/homebrew/bin/xray run -c {config_path}\n");
+        let all = parse_xray_processes(&ps_output, "xray");
+        let managed = managed_processes(&all, config_path);
+        assert_eq!(managed.len(), 1);
+    }
+
+    /// Regression guard for the first-vs-last ` -c ` split: a config path
+    /// that itself contains the literal " -c " must still be captured whole.
+    #[test]
+    fn test_parse_xray_processes_config_path_containing_literal_dash_c_is_matched() {
+        let config_path = "/Users/alice/my -c dir/config.json";
+        let ps_output = format!("200 alice   /opt/homebrew/bin/xray run -c {config_path}\n");
+        let all = parse_xray_processes(&ps_output, "xray");
+        let managed = managed_processes(&all, config_path);
+        assert_eq!(managed.len(), 1);
+        assert_eq!(managed[0].config_arg, config_path);
+    }
+
+    #[test]
+    fn test_parse_xray_processes_empty_output() {
+        assert!(parse_xray_processes("", "xray").is_empty());
+    }
+
+    #[test]
+    fn test_parse_xray_processes_skips_header_line() {
+        let ps_output = "  PID USER             ARGS\n";
+        assert!(parse_xray_processes(ps_output, "xray").is_empty());
+    }
+
+    #[test]
+    fn test_parse_xray_processes_skips_malformed_line_no_pid() {
+        // fields shifted left - no numeric pid present at all
+        let ps_output = "   alice   /opt/homebrew/bin/xray run -c /path/config.json\n";
+        assert!(parse_xray_processes(ps_output, "xray").is_empty());
+    }
+
+    #[test]
+    fn test_parse_xray_processes_no_dash_c_yields_empty_config_arg() {
+        let ps_output = "300 alice   /opt/homebrew/bin/xray run\n";
+        let all = parse_xray_processes(ps_output, "xray");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].config_arg, "");
+        let managed = managed_processes(&all, "/Users/alice/.config/xray/config.json");
+        assert!(
+            managed.is_empty(),
+            "empty config_arg must never be treated as managed"
+        );
+    }
+
+    #[test]
+    fn test_parse_xray_processes_non_xray_process_excluded() {
+        let ps_output = "400 carol   /usr/sbin/sshd -i\n";
+        assert!(parse_xray_processes(ps_output, "xray").is_empty());
+    }
+
+    /// A shell wrapper named `xray` shows up in `ps` as `/bin/sh /path/xray run
+    /// -c ...` - argv[0] is the interpreter, so it must not be counted.
+    #[test]
+    fn test_parse_xray_processes_shell_wrapper_not_counted() {
+        let ps_output = "500 dave    /bin/sh /usr/local/bin/xray run -c /path/config.json\n";
+        assert!(parse_xray_processes(ps_output, "xray").is_empty());
+    }
+
+    /// argv[0]-only regression guard: a command line that merely mentions
+    /// "xray" in a later argument must not match.
+    #[test]
+    fn test_parse_xray_processes_xray_mentioned_in_later_arg_not_matched() {
+        let ps_output = "600 eve     /usr/bin/tail -f /var/log/xray/error.log\n";
+        assert!(parse_xray_processes(ps_output, "xray").is_empty());
+    }
+
+    #[test]
+    fn test_orphans_excludes_tracked_keeps_others_in_order() {
+        let config_path = "/Users/alice/.config/xray/config.json";
+        let all = vec![
+            XrayProcess {
+                pid: 1,
+                user: "alice".to_string(),
+                config_arg: config_path.to_string(),
+            },
+            XrayProcess {
+                pid: 2,
+                user: "root".to_string(),
+                config_arg: config_path.to_string(),
+            },
+            XrayProcess {
+                pid: 3,
+                user: "root".to_string(),
+                config_arg: config_path.to_string(),
+            },
+        ];
+        let result = orphans(&all, config_path, Some(1));
+        assert_eq!(result.iter().map(|p| p.pid).collect::<Vec<_>>(), vec![2, 3]);
     }
 }
