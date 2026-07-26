@@ -815,53 +815,66 @@ fn status_process_lines(
 }
 
 fn cmd_status(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
+    cmd_status_inner(config, plat, &mut std::io::stdout())
+}
+
+/// Takes the output writer as a parameter (defaulting to stdout via
+/// `cmd_status`) so the wiring of `status_process_lines` - not just its own
+/// content - can be asserted directly in tests: that it is called exactly
+/// once, and that its lines land after the tracked-process line rather than
+/// duplicating or replacing it.
+fn cmd_status_inner<W: std::io::Write>(
+    config: &Config,
+    plat: &impl Platform,
+    out: &mut W,
+) -> anyhow::Result<()> {
     debug!("checking status");
     let service = plat.detect_active_service()?;
-    println!("Network service: {}", service.yellow());
+    writeln!(out, "Network service: {}", service.yellow())?;
 
     // Config paths
-    println!("Settings: {}", config.corvex_settings.display());
-    println!("Xray config: {}", config.xray_config.display());
-    println!("Xray log: {}", config.xray_log.display());
+    writeln!(out, "Settings: {}", config.corvex_settings.display())?;
+    writeln!(out, "Xray config: {}", config.xray_config.display())?;
+    writeln!(out, "Xray log: {}", config.xray_log.display())?;
 
     // Engine type and AWG status
     if let Ok(awg_conf_path) = config.awg_conf_path() {
         let awg_iface = engine::awg::conf_interface_name(&awg_conf_path);
         if engine::awg::is_tunnel_running(&awg_iface) {
-            println!("Engine: {}", "AWG + xray".green());
-            println!("AWG tunnel: {} ({})", "running".green(), awg_iface);
+            writeln!(out, "Engine: {}", "AWG + xray".green())?;
+            writeln!(out, "AWG tunnel: {} ({})", "running".green(), awg_iface)?;
         } else {
-            println!("Engine: {}", "xray".green());
+            writeln!(out, "Engine: {}", "xray".green())?;
         }
     } else {
-        println!("Engine: {}", "xray".green());
+        writeln!(out, "Engine: {}", "xray".green())?;
     }
 
     // Xray process
     let tracked_pid = xray::is_running(config);
     match tracked_pid {
-        Some(pid) => println!("xray: {} (PID: {})", "started".green(), pid),
-        None => println!("xray: {}", "stopped".red()),
+        Some(pid) => writeln!(out, "xray: {} (PID: {})", "started".green(), pid)?,
+        None => writeln!(out, "xray: {}", "stopped".red())?,
     }
     let config_path = config.xray_config.to_string_lossy().to_string();
     let all_processes = xray::list_xray_processes(&config.xray_bin);
     for line in status_process_lines(tracked_pid, &all_processes, &config_path, &current_user()) {
-        println!("{}", line.yellow());
+        writeln!(out, "{}", line.yellow())?;
     }
 
     // Proxy status from networksetup
     match plat.proxy_status(&service) {
         Ok(status) => {
-            print_proxy_status("socks", &status.socks);
-            print_proxy_status("http", &status.http);
-            print_proxy_status("https", &status.https);
+            write_proxy_status(out, "socks", &status.socks)?;
+            write_proxy_status(out, "http", &status.http)?;
+            write_proxy_status(out, "https", &status.https)?;
         }
-        Err(e) => println!("{}", format!("Failed to query proxy: {e}").red()),
+        Err(e) => writeln!(out, "{}", format!("Failed to query proxy: {e}").red())?,
     }
 
     // Last 5 log lines
     if config.xray_log.exists() {
-        println!();
+        writeln!(out)?;
         let _ = Command::new("tail")
             .args(["-5"])
             .arg(&config.xray_log)
@@ -871,11 +884,15 @@ fn cmd_status(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_proxy_status(label: &str, info: &platform::ProxyInfo) {
+fn write_proxy_status<W: std::io::Write>(
+    out: &mut W,
+    label: &str,
+    info: &platform::ProxyInfo,
+) -> std::io::Result<()> {
     if info.enabled {
-        println!("{}: {}:{}", label, info.server, info.port);
+        writeln!(out, "{}: {}:{}", label, info.server, info.port)
     } else {
-        println!("{}: {}", label, "off".red());
+        writeln!(out, "{}: {}", label, "off".red())
     }
 }
 
@@ -1148,6 +1165,55 @@ mod tests {
         std::fs::set_permissions(path, perms).unwrap();
     }
 
+    /// RAII guard around a spawned fake-xray test process. On drop it SIGKILLs
+    /// the whole process group (so a shell's descendants can't outlive the
+    /// test regardless of whether the shell execs its body or forks a child -
+    /// this differs across platforms) and joins the background reaper thread,
+    /// so a panicking assertion between spawn and the end of the test can
+    /// never leak a process. The reaper thread reaps the process the instant
+    /// it exits, following the same convention as `spawn_fake_xray` above:
+    /// without it a SIGTERM'd child stays a zombie (`is_process_alive` still
+    /// reports a zombie as alive) until something calls `wait()`, and
+    /// `xray::stop`'s liveness loop would burn its full ~2s timeout waiting
+    /// for that to happen.
+    #[cfg(unix)]
+    struct FakeProcess {
+        pid: i32,
+        reaper: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl FakeProcess {
+        fn spawn(cmd: &mut std::process::Command) -> Self {
+            use std::os::unix::process::CommandExt;
+            let mut child = cmd
+                .process_group(0)
+                .spawn()
+                .expect("failed to spawn fake test process");
+            let pid = child.id() as i32;
+            let reaper = std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            FakeProcess {
+                pid,
+                reaper: Some(reaper),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for FakeProcess {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-self.pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+            if let Some(reaper) = self.reaper.take() {
+                let _ = reaper.join();
+            }
+        }
+    }
+
     // -- status_process_lines --
 
     #[test]
@@ -1232,6 +1298,77 @@ mod tests {
         );
     }
 
+    // -- cmd_status wiring: pure status_process_lines tests above cover
+    // *content*; these cover that `cmd_status_inner` actually calls it once,
+    // in the right place - a pure-function test alone would still pass if
+    // the helper were never called, called twice, or called somewhere that
+    // duplicates the tracked line.
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_status_inner_healthy_output_has_single_tracked_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "sh");
+        std::fs::create_dir_all(config.xray_pid_file.parent().unwrap()).unwrap();
+
+        let tracked_script = dir.path().join("tracked.sh");
+        write_fake_process_script(&tracked_script);
+        let tracked = FakeProcess::spawn(&mut std::process::Command::new(&tracked_script));
+        std::fs::write(&config.xray_pid_file, tracked.pid.to_string()).unwrap();
+
+        let plat = RecordingPlatform::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let result = super::cmd_status_inner(&config, &plat, &mut buf);
+
+        result.expect("cmd_status must succeed");
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            output.matches("xray: started (PID:").count(),
+            1,
+            "the tracked line must appear exactly once: {output}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_status_inner_orphan_line_appears_after_tracked_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "sh");
+        std::fs::create_dir_all(config.xray_pid_file.parent().unwrap()).unwrap();
+
+        let scripts_dir = dir.path().join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+
+        let tracked_script = scripts_dir.join("tracked.sh");
+        write_fake_process_script(&tracked_script);
+        let tracked = FakeProcess::spawn(&mut std::process::Command::new(&tracked_script));
+        std::fs::write(&config.xray_pid_file, tracked.pid.to_string()).unwrap();
+
+        let config_path = config.xray_config.to_string_lossy().to_string();
+        let orphan_script = scripts_dir.join("orphan.sh");
+        write_fake_process_script(&orphan_script);
+        let mut orphan_cmd = std::process::Command::new(&orphan_script);
+        orphan_cmd.args(["run", "-c", &config_path]);
+        let orphan = FakeProcess::spawn(&mut orphan_cmd);
+
+        let plat = RecordingPlatform::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let result = super::cmd_status_inner(&config, &plat, &mut buf);
+
+        result.expect("cmd_status must succeed");
+        let output = String::from_utf8(buf).unwrap();
+        let tracked_at = output
+            .find("xray: started (PID:")
+            .expect("tracked line must be present");
+        let orphan_at = output
+            .find(&format!("kill {}", orphan.pid))
+            .expect("orphan recovery line must be present");
+        assert!(
+            orphan_at > tracked_at,
+            "orphan line must appear after the tracked line: {output}"
+        );
+    }
+
     // -- stop_outcome_lines / cmd_stop qualified success --
 
     #[test]
@@ -1263,38 +1400,33 @@ mod tests {
         let scripts_dir = dir.path().join("scripts");
         std::fs::create_dir_all(&scripts_dir).unwrap();
 
-        // Tracked process: `xray::stop` signals this one and it goes away.
+        // Tracked process: `xray::stop` signals this one, and its process
+        // group is force-killed (harmless if already gone) when `tracked`
+        // drops at the end of this function, panic or not.
         let tracked_script = scripts_dir.join("tracked.sh");
         write_fake_process_script(&tracked_script);
-        let mut tracked_child = std::process::Command::new(&tracked_script)
-            .spawn()
-            .expect("failed to spawn tracked fake process");
-        std::fs::write(&config.xray_pid_file, tracked_child.id().to_string()).unwrap();
+        let tracked = FakeProcess::spawn(&mut std::process::Command::new(&tracked_script));
+        std::fs::write(&config.xray_pid_file, tracked.pid.to_string()).unwrap();
 
         // Orphan: same config path, but never written to xray.pid, so `stop`
         // cannot reach it and must report it as a survivor instead.
         let config_path = config.xray_config.to_string_lossy().to_string();
         let orphan_script = scripts_dir.join("orphan.sh");
         write_fake_process_script(&orphan_script);
-        let mut orphan_child = std::process::Command::new(&orphan_script)
-            .args(["run", "-c", &config_path])
-            .spawn()
-            .expect("failed to spawn orphan fake process");
+        let mut orphan_cmd = std::process::Command::new(&orphan_script);
+        orphan_cmd.args(["run", "-c", &config_path]);
+        let orphan = FakeProcess::spawn(&mut orphan_cmd);
 
         let plat = RecordingPlatform::default();
         let mut buf: Vec<u8> = Vec::new();
         let result = super::cmd_stop_inner(&config, &plat, &mut buf);
-
-        let _ = tracked_child.wait();
-        let _ = orphan_child.kill();
-        let _ = orphan_child.wait();
 
         result.expect("cmd_stop must still succeed when a survivor remains");
         let output = String::from_utf8(buf).unwrap();
         // The test process itself owns the orphan, so the advice is bare
         // `kill`, not `sudo kill` (that only applies to another user's PID).
         assert!(
-            output.contains(&format!("kill {}", orphan_child.id())),
+            output.contains(&format!("kill {}", orphan.pid)),
             "qualified message must carry the survivor's recovery command: {output}"
         );
         assert!(
@@ -1305,6 +1437,8 @@ mod tests {
             *plat.calls.borrow(),
             ["detect_active_service", "disable_proxy"]
         );
+        // `tracked` and `orphan` drop here: their `Drop` impls SIGKILL each
+        // process group and join the reaper threads unconditionally.
     }
 
     #[test]
