@@ -669,7 +669,13 @@ fn preflight_log_paths(paths: &[std::path::PathBuf]) -> anyhow::Result<()> {
         if !seen.insert(path.clone()) {
             continue;
         }
-        let existed_before = path.exists();
+        // symlink_metadata, not exists(): exists() follows the link, so a
+        // dangling symlink would report "nothing here", the append-open would
+        // create its target, and the cleanup below would then delete the
+        // symlink itself - destroying the redirection the user set up and
+        // leaving a stray file at the target. Same reasoning as
+        // `preflight_pid_file`.
+        let existed_before = std::fs::symlink_metadata(path).is_ok();
         match std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -2198,6 +2204,28 @@ mod tests {
         assert!(
             !path.exists(),
             "a target created only to probe it must be removed afterwards"
+        );
+    }
+
+    /// A dangling symlink is a pre-existing entry even though `exists()` says
+    /// otherwise, because it follows the link. Probing must not delete it: the
+    /// user pointed the log somewhere deliberately, and removing the link
+    /// would send xray's output to a fresh regular file instead.
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_preserves_dangling_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere.log");
+        let link = dir.path().join("access.log");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(!link.exists(), "the link must dangle for this test to bite");
+
+        super::preflight_log_paths(std::slice::from_ref(&link))
+            .expect("a writable dangling symlink must pass");
+
+        assert!(
+            std::fs::symlink_metadata(&link).is_ok(),
+            "the symlink itself must survive the probe"
         );
     }
 
