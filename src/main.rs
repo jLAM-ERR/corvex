@@ -1685,9 +1685,17 @@ mod tests {
         let s = crate::settings::CorvexSettings::default();
         let log_config = super::build_xray_log_config(&s);
         assert_eq!(log_config.loglevel, "warning");
-        let base = crate::config::state_dir().join("xray");
-        assert_eq!(log_config.access, base.join("access.log").to_string_lossy());
-        assert_eq!(log_config.error, base.join("error.log").to_string_lossy());
+        let state = crate::config::state_dir();
+        let access = std::path::PathBuf::from(&log_config.access);
+        let error = std::path::PathBuf::from(&log_config.error);
+        assert_eq!(
+            access.strip_prefix(&state).unwrap(),
+            std::path::Path::new("xray").join("access.log")
+        );
+        assert_eq!(
+            error.strip_prefix(&state).unwrap(),
+            std::path::Path::new("xray").join("error.log")
+        );
     }
 
     #[test]
@@ -1710,6 +1718,74 @@ mod tests {
         assert_eq!(log_config.loglevel, "debug");
         assert_eq!(log_config.access, "/custom/access.log");
         assert_eq!(log_config.error, "/custom/error.log");
+    }
+
+    #[test]
+    fn test_build_xray_log_config_access_only() {
+        let json = r#"{
+            "uri": "vless://x@y:1",
+            "log": { "xray": { "access": "/custom/access.log" } }
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvex.json");
+        std::fs::write(&path, json).unwrap();
+        let s = crate::settings::load(&path).unwrap();
+        let log_config = super::build_xray_log_config(&s);
+        let defaults = crate::protocol::XrayLogConfig::default();
+        assert_eq!(log_config.loglevel, defaults.loglevel);
+        assert_eq!(log_config.access, "/custom/access.log");
+        assert_eq!(log_config.error, defaults.error);
+    }
+
+    #[test]
+    fn test_build_xray_log_config_error_only() {
+        let json = r#"{
+            "uri": "vless://x@y:1",
+            "log": { "xray": { "error": "/custom/error.log" } }
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvex.json");
+        std::fs::write(&path, json).unwrap();
+        let s = crate::settings::load(&path).unwrap();
+        let log_config = super::build_xray_log_config(&s);
+        let defaults = crate::protocol::XrayLogConfig::default();
+        assert_eq!(log_config.loglevel, defaults.loglevel);
+        assert_eq!(log_config.access, defaults.access);
+        assert_eq!(log_config.error, "/custom/error.log");
+    }
+
+    #[test]
+    fn test_build_xray_log_config_loglevel_only() {
+        let json = r#"{
+            "uri": "vless://x@y:1",
+            "log": { "xray": { "loglevel": "debug" } }
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvex.json");
+        std::fs::write(&path, json).unwrap();
+        let s = crate::settings::load(&path).unwrap();
+        let log_config = super::build_xray_log_config(&s);
+        let defaults = crate::protocol::XrayLogConfig::default();
+        assert_eq!(log_config.loglevel, "debug");
+        assert_eq!(log_config.access, defaults.access);
+        assert_eq!(log_config.error, defaults.error);
+    }
+
+    #[test]
+    fn test_build_xray_log_config_empty_xray_object_uses_all_defaults() {
+        let json = r#"{
+            "uri": "vless://x@y:1",
+            "log": { "xray": {} }
+        }"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corvex.json");
+        std::fs::write(&path, json).unwrap();
+        let s = crate::settings::load(&path).unwrap();
+        let log_config = super::build_xray_log_config(&s);
+        let defaults = crate::protocol::XrayLogConfig::default();
+        assert_eq!(log_config.loglevel, defaults.loglevel);
+        assert_eq!(log_config.access, defaults.access);
+        assert_eq!(log_config.error, defaults.error);
     }
 
     #[test]

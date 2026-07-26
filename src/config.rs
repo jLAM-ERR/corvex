@@ -137,14 +137,7 @@ fn state_dir_inner(local_appdata: Option<String>) -> PathBuf {
 }
 
 fn default_xray_log() -> PathBuf {
-    #[cfg(unix)]
-    {
-        state_dir().join("xray").join("xray.log")
-    }
-    #[cfg(windows)]
-    {
-        state_dir().join("xray").join("xray.log")
-    }
+    state_dir().join("xray").join("xray.log")
 }
 
 fn default_xray_pid_file(_xray_dir: &Path, _state: &Path) -> PathBuf {
@@ -168,7 +161,10 @@ mod tests {
         assert_eq!(config.xray_bin, "xray");
         assert!(config.xray_config.ends_with("xray/config.json"));
         assert!(config.xray_pid_file.ends_with("xray/xray.pid"));
-        assert_eq!(config.xray_log, state_dir().join("xray").join("xray.log"));
+        assert_eq!(
+            config.xray_log.strip_prefix(state_dir()).unwrap(),
+            Path::new("xray").join("xray.log")
+        );
     }
 
     #[test]

@@ -40,9 +40,11 @@
   "log": {
     "xray": {
       "loglevel": "warning"
-      // "access" and "error" default to $XDG_STATE_HOME/xray/{access,error}.log
-      // (e.g. ~/.local/state/xray/access.log). Set them here to log elsewhere,
-      // e.g. "/var/log/xray/access.log" (needs the directory to be user-writable).
+      // "access" and "error" default to {access,error}.log under the user
+      // state directory: on Unix $XDG_STATE_HOME/xray (e.g.
+      // ~/.local/state/xray/access.log), on Windows %LOCALAPPDATA%\xray.
+      // Set them here to log elsewhere, e.g. "/var/log/xray/access.log"
+      // (needs the directory to be user-writable).
     },
     "corvex": {
       "debug": false

@@ -1672,14 +1672,16 @@ mod tests {
 
         let config = create_config(&params, 1080, &[], &XrayLogConfig::default());
         assert_eq!(config["log"]["loglevel"], "warning");
-        let base = crate::config::state_dir().join("xray");
+        let state = crate::config::state_dir();
+        let access = std::path::PathBuf::from(config["log"]["access"].as_str().unwrap());
+        let error = std::path::PathBuf::from(config["log"]["error"].as_str().unwrap());
         assert_eq!(
-            config["log"]["access"],
-            base.join("access.log").to_string_lossy().to_string()
+            access.strip_prefix(&state).unwrap(),
+            Path::new("xray").join("access.log")
         );
         assert_eq!(
-            config["log"]["error"],
-            base.join("error.log").to_string_lossy().to_string()
+            error.strip_prefix(&state).unwrap(),
+            Path::new("xray").join("error.log")
         );
     }
 
