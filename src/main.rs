@@ -592,6 +592,38 @@ fn current_user() -> String {
         .unwrap_or_default()
 }
 
+/// Translate an error from the pre-start `xray::stop` or from `xray::start`
+/// into a user-facing diagnostic, or `None` to let the error propagate
+/// unchanged. Kept pure (no IO, no process listing) so the *routing* - which
+/// error becomes which message, and where the owner lookup comes from - is
+/// itself tested, not just the message builders it calls into.
+fn start_error_message(
+    err: &anyhow::Error,
+    all: &[xray::XrayProcess],
+    tracked: Option<i32>,
+    port: u16,
+    config_path: &str,
+    log_path: &std::path::Path,
+) -> Option<String> {
+    match err.downcast_ref::<xray::XrayError>() {
+        Some(xray::XrayError::NotPermitted(pid)) => {
+            // Look the owner up in the *full* process list, not the managed
+            // subset: under the sudo/HOME blind spot the tracked PID can
+            // classify as "other xray", which is exactly this case.
+            let owner = all.iter().find(|p| p.pid == *pid).map(|p| p.user.as_str());
+            let orphans = xray::orphans(all, config_path, tracked);
+            Some(xray::start_blocked_message(*pid, owner, &orphans))
+        }
+        Some(xray::XrayError::StartFailed) => Some(xray::start_failure_diagnostics(
+            all,
+            port,
+            config_path,
+            log_path,
+        )),
+        _ => None,
+    }
+}
+
 /// Main algorithm: ensure xray installed, write port to config, start, enable proxy.
 fn main_algorithm(config: &Config, plat: &impl Platform, port: u16) -> anyhow::Result<()> {
     debug!("ensuring xray is installed");
@@ -603,20 +635,16 @@ fn main_algorithm(config: &Config, plat: &impl Platform, port: u16) -> anyhow::R
     if let Some(tracked_pid) = xray::is_running(config) {
         debug!("stopping existing xray instance");
         if let Err(e) = xray::stop(config) {
-            if matches!(
-                e.downcast_ref::<xray::XrayError>(),
-                Some(xray::XrayError::NotPermitted(_))
+            let all = xray::list_xray_processes(&config.xray_bin);
+            if let Some(msg) = start_error_message(
+                &e,
+                &all,
+                Some(tracked_pid),
+                port,
+                &config_path,
+                &config.xray_log,
             ) {
-                // Look the owner up in the *full* process list, not the managed
-                // subset: under the sudo/HOME blind spot the tracked PID can
-                // classify as "other xray", which is exactly this case.
-                let all = xray::list_xray_processes(&config.xray_bin);
-                let owner = all
-                    .iter()
-                    .find(|p| p.pid == tracked_pid)
-                    .map(|p| p.user.as_str());
-                let orphans = xray::orphans(&all, &config_path, Some(tracked_pid));
-                anyhow::bail!(xray::start_blocked_message(tracked_pid, owner, &orphans));
+                anyhow::bail!(msg);
             }
             return Err(e);
         }
@@ -629,17 +657,11 @@ fn main_algorithm(config: &Config, plat: &impl Platform, port: u16) -> anyhow::R
     let pid = match xray::start(config) {
         Ok(pid) => pid,
         Err(e) => {
-            if matches!(
-                e.downcast_ref::<xray::XrayError>(),
-                Some(xray::XrayError::StartFailed)
-            ) {
-                let all = xray::list_xray_processes(&config.xray_bin);
-                anyhow::bail!(xray::start_failure_diagnostics(
-                    &all,
-                    port,
-                    &config_path,
-                    &config.xray_log,
-                ));
+            let all = xray::list_xray_processes(&config.xray_bin);
+            if let Some(msg) =
+                start_error_message(&e, &all, None, port, &config_path, &config.xray_log)
+            {
+                anyhow::bail!(msg);
             }
             return Err(e);
         }
@@ -1106,6 +1128,106 @@ mod tests {
         // Other fields untouched
         assert_eq!(updated["inbounds"][0]["listen"], "127.0.0.1");
         assert_eq!(updated["inbounds"][0]["protocol"], "socks");
+    }
+
+    // -- start_error_message --
+
+    #[test]
+    fn test_start_error_message_not_permitted_names_pid_and_owner() {
+        // Owner name deliberately avoids "root": ROOT_XRAY_ON_START_HINT's own
+        // text contains "root-owned", so asserting on that substring would
+        // pass even if the owner lookup were broken.
+        let err: anyhow::Error = crate::xray::XrayError::NotPermitted(5556).into();
+        let all = vec![crate::xray::XrayProcess {
+            pid: 5556,
+            user: "carol".to_string(),
+            config_arg: "/Users/alice/.config/xray/config.json".to_string(),
+        }];
+        let msg = super::start_error_message(
+            &err,
+            &all,
+            Some(5556),
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            std::path::Path::new("/Users/alice/.local/state/xray/xray.log"),
+        )
+        .expect("NotPermitted must produce a message");
+        assert!(msg.contains("5556"));
+        assert!(msg.contains("'carol'"));
+    }
+
+    /// Regression guard: the owner must be looked up in the *full* process
+    /// list, not `managed_processes`. Here the tracked PID's `config_arg`
+    /// does NOT match `config_path` - the documented sudo/HOME blind spot,
+    /// where a root-launched xray's PID file lives under a different HOME and
+    /// so the tracked PID classifies as "other xray" rather than managed.
+    /// The owner must still be reported; a `managed_processes`-based lookup
+    /// would filter this process out first and render the owner unknown.
+    /// Owner name is "carol", not "root": the hint text itself contains
+    /// "root-owned", which would make a `.contains("root")` assertion pass
+    /// even with a broken (managed-subset) owner lookup.
+    #[test]
+    fn test_start_error_message_not_permitted_owner_from_full_list_not_managed_subset() {
+        let err: anyhow::Error = crate::xray::XrayError::NotPermitted(5556).into();
+        let all = vec![crate::xray::XrayProcess {
+            pid: 5556,
+            user: "carol".to_string(),
+            config_arg: "/root/.config/xray/config.json".to_string(),
+        }];
+        let msg = super::start_error_message(
+            &err,
+            &all,
+            Some(5556),
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            std::path::Path::new("/Users/alice/.local/state/xray/xray.log"),
+        )
+        .expect("NotPermitted must produce a message");
+        assert!(
+            msg.contains("'carol'"),
+            "owner must be resolved from the full process list even when config_arg mismatches"
+        );
+    }
+
+    #[test]
+    fn test_start_error_message_start_failed_names_port_and_log_path() {
+        let err: anyhow::Error = crate::xray::XrayError::StartFailed.into();
+        let msg = super::start_error_message(
+            &err,
+            &[],
+            None,
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            std::path::Path::new("/Users/alice/.local/state/xray/xray.log"),
+        )
+        .expect("StartFailed must produce a message");
+        assert!(msg.contains("21080"));
+        assert!(msg.contains("xray.log"));
+    }
+
+    #[test]
+    fn test_start_error_message_unrelated_error_returns_none() {
+        let not_running: anyhow::Error = crate::xray::XrayError::NotRunning.into();
+        assert!(super::start_error_message(
+            &not_running,
+            &[],
+            None,
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            std::path::Path::new("/Users/alice/.local/state/xray/xray.log"),
+        )
+        .is_none());
+
+        let plain = anyhow::anyhow!("boom");
+        assert!(super::start_error_message(
+            &plain,
+            &[],
+            None,
+            21080,
+            "/Users/alice/.config/xray/config.json",
+            std::path::Path::new("/Users/alice/.local/state/xray/xray.log"),
+        )
+        .is_none());
     }
 
     #[test]

@@ -963,11 +963,19 @@ mod tests {
 
     #[test]
     fn test_start_blocked_message_names_pid_owner_and_recovery_commands() {
-        let msg = start_blocked_message(5556, Some("root"), &[]);
+        // Owner name deliberately avoids "root": the hint text itself contains
+        // "root-owned", so a plain `.contains("root")` would pass even if the
+        // owner argument were ignored entirely.
+        let msg = start_blocked_message(5556, Some("carol"), &[]);
         assert!(msg.contains("5556"));
-        assert!(msg.contains("root"));
+        assert!(msg.contains("'carol'"));
         assert!(msg.contains("sudo corvex stop"));
-        assert!(msg.contains("corvex start"));
+        // Assert the positive recovery clause and the negative warning
+        // separately: `msg.contains("corvex start")` alone is also satisfied
+        // by the warning text ("Do not run `sudo corvex start`"), so it would
+        // still pass if the positive "then `corvex start`" clause were lost.
+        assert!(msg.contains("then `corvex start`"));
+        assert!(msg.contains("Do not run `sudo corvex start`"));
     }
 
     #[test]
