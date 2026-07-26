@@ -16,6 +16,8 @@ corvex only ever tracked the one xray process recorded in its own PID file. If a
 
 corvex now looks for other xray processes running against its own config file. This is read-only: it only ever signals the one process it tracks, never anything else. `status` lists any it finds, a successful `stop` now warns if one survives instead of claiming a clean stop, and each one comes with the exact command to remove it — `sudo kill <pid>`, or plain `kill <pid>` if you own it.
 
+One thing to know before using those commands: `kill` stops the process and nothing else, so your system proxy stays switched on and still points at `127.0.0.1:<port>`. If the process you killed was the one serving that port, everything using the system proxy fails with connection errors until you run `corvex start` again — and `corvex stop` will not clear it either, since with no xray running it reports `xray is not running` and returns before disabling the proxy. Usually this does not arise, because an orphan is normally not the process holding your port (two xray instances cannot both bind it). For a tracked process, prefer `sudo corvex stop`, which disables the proxy as part of stopping.
+
 ### corvex could create an orphan itself
 `start` used to launch xray first and write its PID file second. If the PID file could not be written — for example a root-owned `xray.pid` left over from an earlier `sudo` run — the xray that had just started kept running, untracked, forever. This is very likely how orphaned processes were appearing in the first place.
 
