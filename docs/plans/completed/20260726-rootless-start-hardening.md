@@ -332,10 +332,10 @@ corvex has its own orphan-production path, and it is almost certainly how the re
 - Modify: `CLAUDE.md`
 - Modify: `RELEASE_NOTES.md`
 
-- [ ] update `README.md:149-150` and the key-paths table to the new log defaults; add a short "recovering from a mixed sudo/user state" section covering `sudo corvex stop` for a tracked process and `sudo kill <pid>` for an orphan
-- [ ] update `CLAUDE.md:51` and `CLAUDE.md:99` for the new defaults, and the `xray.rs` architecture note (process listing is read-only, classification is by `-c` config path, sudo/HOME blind spot documented)
-- [ ] **prepend** `# Corvex v0.6.3 Release Notes` as line 1 of `RELEASE_NOTES.md` (the `release-guard` job reads `head -1`), covering all four fixes and stating explicitly that existing logs under `/var/log/xray/` are left in place — nothing is moved or deleted, and explicit `log.xray.*` settings still win
-- [ ] move this plan to `docs/plans/completed/`
+- [x] update `README.md:149-150` and the key-paths table to the new log defaults; add a short "recovering from a mixed sudo/user state" section covering `sudo corvex stop` for a tracked process and `sudo kill <pid>` for an orphan
+- [x] update `CLAUDE.md:51` and `CLAUDE.md:99` for the new defaults, and the `xray.rs` architecture note (process listing is read-only, classification is by `-c` config path, sudo/HOME blind spot documented)
+- [x] **prepend** `# Corvex v0.6.3 Release Notes` as line 1 of `RELEASE_NOTES.md` (the `release-guard` job reads `head -1`), covering all four fixes and stating explicitly that existing logs under `/var/log/xray/` are left in place — nothing is moved or deleted, and explicit `log.xray.*` settings still win
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 

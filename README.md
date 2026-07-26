@@ -145,9 +145,11 @@ All settings live in a single JSONC file (comments allowed) at `$XDG_CONFIG_HOME
   // Logging
   "log": {
     "xray": {
-      "loglevel": "warning",
-      "access": "/var/log/xray/access.log",
-      "error": "/var/log/xray/error.log"
+      "loglevel": "warning"
+      // "access"/"error" default to $XDG_STATE_HOME/xray/{access,error}.log
+      // (%LOCALAPPDATA%\xray\ on Windows); set them here to log elsewhere,
+      // e.g. "/var/log/xray/access.log" (needs the directory to be
+      // user-writable)
     },
     "corvex": { "debug": false }
   }
@@ -215,7 +217,7 @@ AmneziaWG is an optional alternative engine and corvex never installs it. **If y
 | `$XDG_CONFIG_HOME/xray/config.json` | Xray daemon config (auto-generated) |
 | `$XDG_CONFIG_HOME/xray/xray.pid` | PID file for running xray process |
 | `$XDG_STATE_HOME/corvex/corvex.log` | Corvex log (default `~/.local/state/corvex/corvex.log`) |
-| Xray logs | Configurable via `log.xray` in corvex.json |
+| `$XDG_STATE_HOME/xray/{access,error}.log` | Xray logs (default; `%LOCALAPPDATA%\xray\` on Windows); override via `log.xray` in corvex.json |
 
 ## How it works
 
@@ -235,4 +237,13 @@ Setting system proxy on macOS requires admin privileges. When running without `s
 - `sudo corvex start` — bypasses the dialog entirely
 - SSH (no GUI) — falls back to a clear error message suggesting `sudo`
 - Canceling the dialog — reports "Authorization denied" without partial changes
+
+## Recovering from a mixed sudo/user state
+
+If xray has ever been started with `sudo`, a plain `corvex start` can fail because a root-owned xray is still around:
+
+- **A tracked root-owned xray is running** (`start` reports it's already running as another user): run `sudo corvex stop` once, then plain `corvex start`. Do **not** run `sudo corvex start` — that starts another root-owned xray and you're back where you started.
+- **An untracked xray is running** (an orphan, reported by `status` or a failed `start`): corvex only ever signals the process recorded in its own PID file, so it cannot stop this one for you. Stop it yourself with `sudo kill <pid>` (or plain `kill <pid>` if you own it) — check with `ps -p <pid>` first, since the report is a snapshot and PIDs get reused.
+
+Going forward, avoid `sudo corvex start` entirely — corvex already prompts for a password via the graphical dialog above when it needs admin rights.
 
