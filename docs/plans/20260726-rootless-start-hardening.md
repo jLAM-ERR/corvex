@@ -318,12 +318,12 @@ corvex has its own orphan-production path, and it is almost certainly how the re
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] verify all requirements from Overview are implemented: start advice never says bare "sudo"; orphan advice never says `corvex stop`; `start`, `stop` and `status` all report surviving processes; defaults are user-writable; unwritable targets fail naming the file; and corvex can no longer spawn an untracked xray via an unwritable PID file
-- [ ] verify no code path signals an untracked process: grep `signal::kill` / `force_kill_process` call sites and confirm the set is unchanged from before this branch
-- [ ] verify health-check probes are never classified as managed (Task 1 tests plus a manual `CORVEX_DEBUG=1 corvex start` trace showing probe temp configs)
-- [ ] run full test suite: `cargo test`
-- [ ] run `cargo clippy --all-targets -- -D warnings -A dead_code` (matching CI at `.github/workflows/rust.yml:70`) and `cargo fmt --check` — both clean
-- [ ] run `cargo build --release`, and confirm the Windows cfg stubs compile via `cargo check --target x86_64-pc-windows-msvc` if a toolchain is available, otherwise rely on the CI matrix before merge
+- [x] verify all requirements from Overview are implemented: start advice never says bare "sudo"; orphan advice never says `corvex stop`; `start`, `stop` and `status` all report surviving processes; defaults are user-writable; unwritable targets fail naming the file; and corvex can no longer spawn an untracked xray via an unwritable PID file
+- [x] verify no code path signals an untracked process: grep `signal::kill` / `force_kill_process` call sites and confirm the set is unchanged from before this branch
+- [x] verify health-check probes are never classified as managed (Task 1 tests plus a manual `CORVEX_DEBUG=1 corvex start` trace showing probe temp configs)
+- [x] run full test suite: `cargo test`
+- [x] run `cargo clippy --all-targets -- -D warnings -A dead_code` (matching CI at `.github/workflows/rust.yml:70`) and `cargo fmt --check` — both clean
+- [x] run `cargo build --release`, and confirm the Windows cfg stubs compile via `cargo check --target x86_64-pc-windows-msvc` if a toolchain is available, otherwise rely on the CI matrix before merge
 
 ### Task 8: [Final] Update documentation and release notes
 
