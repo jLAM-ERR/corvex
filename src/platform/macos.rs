@@ -142,6 +142,40 @@ fn batch_failure_message(commands: &[Vec<&str>], detail: &str) -> String {
     )
 }
 
+/// Outcome of one elevated osascript run, decided from already-captured
+/// output so the decision itself is unit testable without spawning anything.
+#[derive(Debug, PartialEq)]
+enum ElevatedOutcome {
+    Ok(String),
+    Cancelled,
+    NoGui,
+    Failed(String),
+}
+
+/// Decides the outcome of an elevated osascript run. A nonzero exit is
+/// classified the same way it always was (cancel, no-GUI, or a generic
+/// failure). But a zero exit is not trusted on its own: `networksetup` can
+/// print "** Error: ..." to either stream while still exiting 0, even inside
+/// the `&&`-chained elevated shell, so the remaining commands run anyway and
+/// look like success. Combined output is checked for that marker regardless
+/// of exit status.
+fn classify_elevated_output(exit_ok: bool, stdout: &str, stderr: &str) -> ElevatedOutcome {
+    if !exit_ok {
+        if is_user_cancel_error(stderr) {
+            return ElevatedOutcome::Cancelled;
+        }
+        if is_no_gui_error(stderr) {
+            return ElevatedOutcome::NoGui;
+        }
+        return ElevatedOutcome::Failed(join_output(stdout, stderr));
+    }
+    let detail = join_output(stdout, stderr);
+    if detail.contains("** Error") {
+        return ElevatedOutcome::Failed(detail);
+    }
+    ElevatedOutcome::Ok(stdout.to_string())
+}
+
 /// Runs `commands` through a single osascript elevation prompt.
 /// `already_applied` must be true if any of `commands` already ran
 /// unelevated and succeeded before this call, so a cancel here does not
@@ -156,24 +190,20 @@ fn run_networksetup_elevated(commands: &[Vec<&str>], already_applied: bool) -> R
         .output()
         .context("Failed to run osascript for privilege escalation")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if is_user_cancel_error(&stderr) {
-            anyhow::bail!("{}", authorization_denied_message(already_applied));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match classify_elevated_output(output.status.success(), &stdout, &stderr) {
+        ElevatedOutcome::Ok(stdout) => Ok(stdout),
+        ElevatedOutcome::Cancelled => {
+            anyhow::bail!("{}", authorization_denied_message(already_applied))
         }
-        if is_no_gui_error(&stderr) {
-            anyhow::bail!("No GUI session available — run with sudo instead");
+        ElevatedOutcome::NoGui => {
+            anyhow::bail!("No GUI session available — run with sudo instead")
         }
-        anyhow::bail!(
-            "{}",
-            batch_failure_message(
-                commands,
-                &join_output(&String::from_utf8_lossy(&output.stdout), &stderr)
-            )
-        );
+        ElevatedOutcome::Failed(detail) => {
+            anyhow::bail!("{}", batch_failure_message(commands, &detail))
+        }
     }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Ordered `networksetup` setters that enable socks, web, and secure web
@@ -776,6 +806,56 @@ mod tests {
             "networksetup batch failed (elevated): ** Error: Invalid arguments.\n\
              commands run in order, stopped at the first failure above — earlier ones in this list may already be applied: \
              -setsocksfirewallproxy Wi-Fi 127.0.0.1 21080; -setsocksfirewallproxystate Wi-Fi on"
+        );
+    }
+
+    // classify_elevated_output tests
+    #[test]
+    fn classify_elevated_output_clean_success_returns_stdout() {
+        let outcome = classify_elevated_output(true, "Enabled: Yes\n", "");
+        assert_eq!(outcome, ElevatedOutcome::Ok("Enabled: Yes\n".to_string()));
+    }
+
+    /// The exact bug this fix closes: exit status 0, but one command in the
+    /// elevated `&&` chain printed an error to stdout. Trusting the exit
+    /// code alone would report success while the proxy was never set.
+    #[test]
+    fn classify_elevated_output_zero_exit_with_error_on_stdout_is_failure() {
+        let outcome = classify_elevated_output(true, "** Error: Invalid arguments.\n", "");
+        assert_eq!(
+            outcome,
+            ElevatedOutcome::Failed("** Error: Invalid arguments.".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_elevated_output_zero_exit_with_error_on_stderr_is_failure() {
+        let outcome = classify_elevated_output(true, "", "** Error: Invalid arguments.\n");
+        assert_eq!(
+            outcome,
+            ElevatedOutcome::Failed("** Error: Invalid arguments.".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_elevated_output_nonzero_exit_user_cancel() {
+        let outcome = classify_elevated_output(false, "", "execution error: User canceled. (-128)");
+        assert_eq!(outcome, ElevatedOutcome::Cancelled);
+    }
+
+    #[test]
+    fn classify_elevated_output_nonzero_exit_no_gui() {
+        let outcome =
+            classify_elevated_output(false, "", "execution error: connection is invalid (-609)");
+        assert_eq!(outcome, ElevatedOutcome::NoGui);
+    }
+
+    #[test]
+    fn classify_elevated_output_nonzero_exit_generic_failure() {
+        let outcome = classify_elevated_output(false, "", "some other error");
+        assert_eq!(
+            outcome,
+            ElevatedOutcome::Failed("some other error".to_string())
         );
     }
 
