@@ -231,12 +231,14 @@ AmneziaWG is an optional alternative engine and corvex never installs it. **If y
 
 ## macOS privilege escalation
 
-Setting system proxy on macOS requires admin privileges. When running without `sudo`, corvex automatically shows a native macOS authorization dialog (Touch ID or password) via `osascript`. The system caches authorization for ~5 minutes, so only one dialog appears per session even though multiple `networksetup` calls are made.
+Setting the system proxy on macOS requires admin privileges. When running without `sudo`, corvex shows a native macOS authorization dialog via `osascript`. Enabling the proxy takes six `networksetup` calls and disabling it takes three; corvex applies each group inside a single `osascript` invocation, so you are asked **once** per command, not once per `networksetup` call.
 
-- `corvex start` / `corvex stop` — triggers auth dialog if not running as root
+- `corvex start` / `corvex stop` — one dialog each, if not running as root
 - `sudo corvex start` — bypasses the dialog entirely
 - SSH (no GUI) — falls back to a clear error message suggesting `sudo`
-- Canceling the dialog — reports "Authorization denied" without partial changes
+- Canceling the dialog — reports "Authorization denied" and leaves the proxy as it was
+
+**The dialog asks for a password and cannot offer Touch ID.** This is not a corvex setting. The dialog authorizes the system's `system.privilege.admin` right, which is password-only; there is no flag that adds biometrics to it. Touch ID would require corvex to elevate through `sudo` instead, which needs a terminal, excludes users who are not in `sudoers`, and depends on you enabling `pam_tid.so` in `/etc/pam.d/sudo_local` yourself. That trade is not currently worth it, so the single prompt is a password prompt.
 
 ## Recovering from a mixed sudo/user state
 

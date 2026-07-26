@@ -175,55 +175,55 @@ The two special cases keep their current friendly messages, checked before the g
 **Files:**
 - Modify: `src/platform/macos.rs`
 
-- [ ] change `build_osascript_command` to take `commands: &[Vec<&str>]`, render each as `/usr/sbin/networksetup <shell-escaped args>`, join with ` && `, and wrap the joined string in one `do shell script "…" with administrator privileges`
-- [ ] change `run_networksetup_elevated` to take `commands: &[Vec<&str>]` and update its generic error message to name every command in the batch
-- [ ] update the single existing caller in `run_networksetup` to pass a one-element batch so the crate still compiles
-- [ ] update the three existing `build_osascript_command` tests (`osascript_single_arg`, `osascript_multiple_args`, `osascript_args_with_special_chars`) to the new signature, keeping their expected strings unchanged — this proves single-command output did not drift
-- [ ] write a test that a 6-command batch renders as one `do shell script`, with the six invocations joined by ` && ` in the given order
-- [ ] write a test asserting `with administrator privileges` occurs **exactly once** in a batched script (use `matches(...).count()`, not `contains`)
-- [ ] write a test that a service name containing a double quote and a space is correctly escaped in **every** position of a 3-command batch, not just the first
-- [ ] run `cargo test` - must pass before task 2
+- [x] change `build_osascript_command` to take `commands: &[Vec<&str>]`, render each as `/usr/sbin/networksetup <shell-escaped args>`, join with ` && `, and wrap the joined string in one `do shell script "…" with administrator privileges`
+- [x] change `run_networksetup_elevated` to take `commands: &[Vec<&str>]` and update its generic error message to name every command in the batch
+- [x] update the single existing caller in `run_networksetup` to pass a one-element batch so the crate still compiles
+- [x] update the three existing `build_osascript_command` tests (`osascript_single_arg`, `osascript_multiple_args`, `osascript_args_with_special_chars`) to the new signature, keeping their expected strings unchanged — this proves single-command output did not drift
+- [x] write a test that a 6-command batch renders as one `do shell script`, with the six invocations joined by ` && ` in the given order
+- [x] write a test asserting `with administrator privileges` occurs **exactly once** in a batched script (use `matches(...).count()`, not `contains`)
+- [x] write a test that a service name containing a double quote and a space is correctly escaped in **every** position of a 3-command batch, not just the first
+- [x] run `cargo test` - must pass before task 2
 
 ### Task 2: Separate error classification from escalation and add the batch runner
 
 **Files:**
 - Modify: `src/platform/macos.rs`
 
-- [ ] add `enum NsOutcome { Ok(String), NeedsAdmin, Failed(String) }`
-- [ ] add `try_networksetup(args: &[&str]) -> Result<NsOutcome>` holding the current stdout/stderr merge, the `** Error` on-stdout check, and `is_admin_required_error` classification; it returns `Err` only when the process cannot be spawned
-- [ ] rewrite `run_networksetup` to call `try_networksetup` and, on `NeedsAdmin`, escalate a one-element batch — external behaviour for `proxy_status`'s getters is unchanged
-- [ ] add `run_networksetup_all(commands: &[Vec<&str>]) -> Result<()>`: returns `Ok(())` immediately on an empty slice; runs each command unelevated; on the first `NeedsAdmin` escalates the entire slice via `run_networksetup_elevated` and returns; on `Failed` bails naming that command
-- [ ] add a `debug!` line when escalating that records how many commands are being batched into the one prompt
-- [ ] extract the classification decision into a pure helper (e.g. `classify_networksetup_output(exit_ok: bool, stdout: &str, stderr: &str) -> NsOutcome`) so it is testable without spawning a process
-- [ ] write tests for the pure classifier: success, `** Error: Command requires admin privileges.` on stdout with exit 0, the same on stderr, and an unrelated failure
-- [ ] write a test that an empty command slice produces no script at all (assert the empty-slice guard, so a future refactor cannot start prompting for a no-op batch)
-- [ ] run `cargo test` - must pass before task 3
+- [x] add `enum NsOutcome { Ok(String), NeedsAdmin, Failed(String) }`
+- [x] add `try_networksetup(args: &[&str]) -> Result<NsOutcome>` holding the current stdout/stderr merge, the `** Error` on-stdout check, and `is_admin_required_error` classification; it returns `Err` only when the process cannot be spawned
+- [x] rewrite `run_networksetup` to call `try_networksetup` and, on `NeedsAdmin`, escalate a one-element batch — external behaviour for `proxy_status`'s getters is unchanged
+- [x] add `run_networksetup_all(commands: &[Vec<&str>]) -> Result<()>`: returns `Ok(())` immediately on an empty slice; runs each command unelevated; on the first `NeedsAdmin` escalates the entire slice via `run_networksetup_elevated` and returns; on `Failed` bails naming that command
+- [x] add a `debug!` line when escalating that records how many commands are being batched into the one prompt
+- [x] extract the classification decision into a pure helper (e.g. `classify_networksetup_output(exit_ok: bool, stdout: &str, stderr: &str) -> NsOutcome`) so it is testable without spawning a process
+- [x] write tests for the pure classifier: success, `** Error: Command requires admin privileges.` on stdout with exit 0, the same on stderr, and an unrelated failure
+- [x] write a test that an empty command slice produces no script at all — ⚠️ the first attempt was vacuous (an empty slice skips the `for` loop, so the test passed with the guard deleted; confirmed by mutation). Replaced with a real empty-batch rejection inside `run_networksetup_elevated`, which is the layer where the hazard actually exists.
+- [x] run `cargo test` - must pass before task 3
 
 ### Task 3: Route enable_proxy and disable_proxy through the batch runner
 
 **Files:**
 - Modify: `src/platform/macos.rs`
 
-- [ ] add pure `enable_proxy_commands<'a>(service: &'a str, host: &'a str, port: &'a str) -> Vec<Vec<&'a str>>` returning the six setters in order: socks host/port, socks state on, web host/port, web state on, secure-web host/port, secure-web state on
-- [ ] add pure `disable_proxy_commands<'a>(service: &'a str) -> Vec<Vec<&'a str>>` returning the three state-off commands in order: socks, web, secure-web
-- [ ] rewrite `Platform::enable_proxy` to build the port string, call `enable_proxy_commands`, and hand the result to `run_networksetup_all`
-- [ ] rewrite `Platform::disable_proxy` to call `disable_proxy_commands` and hand the result to `run_networksetup_all`
-- [ ] write a test that `enable_proxy_commands` returns exactly 6 commands in the exact expected order, with the service, host and port substituted into the right positions
-- [ ] write a test that each host/port setter precedes its matching state-on command (the ordering invariant: switching state on before the host is set would enable a proxy pointing at a stale address)
-- [ ] write a test that `disable_proxy_commands` returns exactly 3 commands, all `…state off`, in the expected order
-- [ ] write a test feeding `enable_proxy_commands` output straight into `build_osascript_command` and asserting the result prompts once — the end-to-end string a user's single dialog will execute
-- [ ] run `cargo test` - must pass before task 4
+- [x] add pure `enable_proxy_commands<'a>(service: &'a str, host: &'a str, port: &'a str) -> Vec<Vec<&'a str>>` returning the six setters in order: socks host/port, socks state on, web host/port, web state on, secure-web host/port, secure-web state on
+- [x] add pure `disable_proxy_commands<'a>(service: &'a str) -> Vec<Vec<&'a str>>` returning the three state-off commands in order: socks, web, secure-web
+- [x] rewrite `Platform::enable_proxy` to build the port string, call `enable_proxy_commands`, and hand the result to `run_networksetup_all`
+- [x] rewrite `Platform::disable_proxy` to call `disable_proxy_commands` and hand the result to `run_networksetup_all`
+- [x] write a test that `enable_proxy_commands` returns exactly 6 commands in the exact expected order, with the service, host and port substituted into the right positions
+- [x] write a test that each host/port setter precedes its matching state-on command (the ordering invariant: switching state on before the host is set would enable a proxy pointing at a stale address)
+- [x] write a test that `disable_proxy_commands` returns exactly 3 commands, all `…state off`, in the expected order
+- [x] write a test feeding `enable_proxy_commands` output straight into `build_osascript_command` and asserting the result prompts once — the end-to-end string a user's single dialog will execute
+- [x] run `cargo test` - must pass before task 4
 
 ### Task 4: Verify acceptance criteria
 
-- [ ] verify `corvex start` as a normal user now produces exactly one password dialog (see Post-Completion for the manual run)
-- [ ] verify `corvex stop` as a normal user produces exactly one password dialog
-- [ ] verify running under `sudo` still produces zero dialogs — confirm by code path: every unelevated attempt succeeds so `NeedsAdmin` never fires
-- [ ] verify the user-cancel and no-GUI messages still appear unchanged for a batched escalation
-- [ ] verify the empty-batch guard prevents a password prompt for a no-op
-- [ ] run `cargo fmt --check`
-- [ ] run `cargo clippy --all-targets` and confirm no new warnings
-- [ ] run the full suite: `cargo test`
+- [x] verify `corvex start` as a normal user now produces exactly one password dialog — verified by code path and generated-script text; the on-screen count is a Post-Completion manual check, since spawning a real dialog cannot be automated
+- [x] verify `corvex stop` as a normal user produces exactly one password dialog
+- [x] verify running under `sudo` still produces zero dialogs — confirm by code path: every unelevated attempt succeeds so `NeedsAdmin` never fires
+- [x] verify the user-cancel and no-GUI messages still appear unchanged for a batched escalation
+- [x] verify the empty-batch guard prevents a password prompt for a no-op
+- [x] run `cargo fmt --check`
+- [x] run `cargo clippy --all-targets` and confirm no new warnings
+- [x] run the full suite: `cargo test`
 
 ### Task 5: [Final] Update documentation
 
@@ -232,11 +232,11 @@ The two special cases keep their current friendly messages, checked before the g
 - Modify: `README.md`
 - Modify: `RELEASE_NOTES.md`
 
-- [ ] update the `src/platform/macos.rs` line in CLAUDE.md's architecture tree to say proxy changes are applied as one batched, single-prompt escalation
-- [ ] check README for any text describing the macOS password prompt and correct it if it implies repeated prompts
-- [ ] state in README that the single prompt is password-only and that Touch ID is not available for this dialog, so the behaviour is not filed as a bug
-- [ ] prepend a `# Corvex v0.6.4 Release Notes` section to RELEASE_NOTES.md describing the fix (the release-guard CI job reads `head -1 RELEASE_NOTES.md`, so the new heading must be the first line)
-- [ ] move this plan to `docs/plans/completed/`
+- [x] update the `src/platform/macos.rs` line in CLAUDE.md's architecture tree to say proxy changes are applied as one batched, single-prompt escalation
+- [x] check README for any text describing the macOS password prompt and correct it if it implies repeated prompts
+- [x] state in README that the single prompt is password-only and that Touch ID is not available for this dialog, so the behaviour is not filed as a bug
+- [x] prepend a `# Corvex v0.6.4 Release Notes` section to RELEASE_NOTES.md describing the fix (the release-guard CI job reads `head -1 RELEASE_NOTES.md`, so the new heading must be the first line)
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
@@ -251,3 +251,19 @@ The two special cases keep their current friendly messages, checked before the g
 
 **External system updates:**
 - version bump in `Cargo.toml` and the `v0.6.4` tag push are the maintainer's step; releases are published by pushing a `v*` tag, never via `gh release create`
+
+## Outcome
+
+Landed on `releases/0.6.4`. Final gate: `cargo fmt --check` clean, `cargo clippy --all-targets` no warnings, **361 tests passing** (up from 332 at branch point).
+
+### Review rounds
+
+Three codex review rounds ran, each followed by fixes:
+
+- **Round 1** — no CRITICAL/HIGH. Fixed: the user-cancel message claimed "proxy settings were not changed" unconditionally, which the code cannot guarantee (now driven by an `already_applied` flag); the mid-batch failure message implied every listed command had run; two test names overclaimed to prove a single `osascript` spawn when they only check script text; composed quoting coverage was thin on a path that executes as root (five tests added for `'`, `\`, `$()`, backtick, and a combination — verified inert by round-tripping the generated script through `shlex.split`); one vacuous test deleted.
+- **Round 2** — no CRITICAL/HIGH. Found a real bug: `classify_networksetup_output` checked only stdout for `** Error`, so an error on stderr with exit code 0 was classified as success. Fixed by classifying on the combined output. Message construction extracted into pure functions and tested directly.
+- **Round 3** — **HIGH, DO NOT SHIP**: `run_networksetup_elevated` trusted only `osascript`'s exit status, so a zero-exit `** Error` from one command in the `&&` chain was masked by the commands that ran after it — corvex would print `proxy enabled` with a setting silently unapplied. Fixed with `classify_elevated_output`, mirroring the unelevated classifier. Re-confirmed: **SHIP**.
+
+### Deviation from the plan
+
+The plan did not anticipate the elevated path needing its own output classification — it assumed a nonzero exit was sufficient there. Batching made that assumption unsafe, because chaining with `&&` lets a zero-exit error hide behind later successes. `ElevatedOutcome` / `classify_elevated_output` were added beyond the original three tasks.
