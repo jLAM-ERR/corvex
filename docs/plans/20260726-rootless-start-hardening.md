@@ -265,12 +265,12 @@ Sites asserting or documenting the old values, all of which must change with the
 **Files:**
 - Modify: `src/main.rs`
 
-- [ ] add pure `status_process_lines(tracked, all, config_path, current_user)` returning **orphan lines only** — the existing `xray: started (PID: N)` line at `src/main.rs:705` stays exactly where it is and is not re-rendered here, so an empty return means byte-identical output to today. Managed processes only: `ps` cannot reveal what port another process listens on, so listing *other xray* here is not derivable; that stays in `start_failure_diagnostics`, where the user is already told the port
-- [ ] wire it into `cmd_status` immediately after that existing line
-- [ ] in `cmd_stop`, after a successful `xray::stop`, list any surviving managed processes and qualify the `corvex stopped!` line instead of claiming a clean stop — `stop` is the command the new hint sends users to, so it must not lie
-- [ ] write tests for `status_process_lines` success cases: single tracked process and no orphans → **empty vec** (no duplicate of the tracked line); tracked + one root-owned orphan → one line carrying `sudo kill`
-- [ ] write tests for error/edge cases: orphan present with no tracked PID; no processes at all; an xray running against a different config is never listed by `status`
-- [ ] run `cargo test` - must pass before task 4
+- [x] add pure `status_process_lines(tracked, all, config_path, current_user)` returning **orphan lines only** — the existing `xray: started (PID: N)` line at `src/main.rs:705` stays exactly where it is and is not re-rendered here, so an empty return means byte-identical output to today. Managed processes only: `ps` cannot reveal what port another process listens on, so listing *other xray* here is not derivable; that stays in `start_failure_diagnostics`, where the user is already told the port
+- [x] wire it into `cmd_status` immediately after that existing line
+- [x] in `cmd_stop`, after a successful `xray::stop`, list any surviving managed processes and qualify the `corvex stopped!` line instead of claiming a clean stop — `stop` is the command the new hint sends users to, so it must not lie
+- [x] write tests for `status_process_lines` success cases: single tracked process and no orphans → **empty vec** (no duplicate of the tracked line); tracked + one root-owned orphan → one line carrying `sudo kill`
+- [x] write tests for error/edge cases: orphan present with no tracked PID; no processes at all; an xray running against a different config is never listed by `status`
+- [x] run `cargo test` - must pass before task 4
 
 ### Task 4: Move default xray log paths to the user state directory
 

@@ -725,7 +725,35 @@ fn stop_awg_if_running(config: &Config) {
     }
 }
 
+/// Lines printed once `stop` has actually stopped xray: a plain success line
+/// when no managed process survives, or a qualifying line plus the recovery
+/// advice for each survivor. `stop` is exactly where the new hints send
+/// users, so it must not claim a clean stop while a corvex-managed xray is
+/// still running. Reuses `xray::orphan_lines` for the recovery commands
+/// rather than duplicating that text.
+fn stop_outcome_lines(survivors: &[xray::XrayProcess], current_user: &str) -> Vec<String> {
+    if survivors.is_empty() {
+        return vec!["corvex stopped!".to_string()];
+    }
+    let mut lines = vec![
+        "corvex stopped, but other corvex-managed xray process(es) are still running:".to_string(),
+    ];
+    lines.extend(xray::orphan_lines(survivors, current_user));
+    lines
+}
+
 fn cmd_stop(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
+    cmd_stop_inner(config, plat, &mut std::io::stdout())
+}
+
+/// Takes the output writer as a parameter (defaulting to stdout via
+/// `cmd_stop`) so the qualified-vs-clean success message - not just
+/// `cmd_stop`'s side effects - can be asserted directly in tests.
+fn cmd_stop_inner<W: std::io::Write>(
+    config: &Config,
+    plat: &impl Platform,
+    out: &mut W,
+) -> anyhow::Result<()> {
     // Resolve the network service first: detection is read-only, so a
     // detection failure aborts before anything is touched. Then stop xray;
     // if that fails for any reason (not running, owned by another user, ...),
@@ -736,13 +764,30 @@ fn cmd_stop(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     debug!("stopping xray");
     xray::stop(config)?;
 
+    // The tracked process is gone (xray::stop just removed the PID file), so
+    // any managed process still in `ps` is an orphan `stop` cannot reach -
+    // report it instead of claiming a clean stop.
+    let config_path = config.xray_config.to_string_lossy().to_string();
+    let survivors = xray::orphans(
+        &xray::list_xray_processes(&config.xray_bin),
+        &config_path,
+        None,
+    );
+
     debug!("disabling system proxy");
     plat.disable_proxy(&service)?;
 
     // Also stop any AWG tunnel left running from a previous session
     stop_awg_if_running(config);
 
-    println!("{}", "corvex stopped!".green());
+    let lines = stop_outcome_lines(&survivors, &current_user());
+    if survivors.is_empty() {
+        writeln!(out, "{}", lines[0].green())?;
+    } else {
+        for line in &lines {
+            writeln!(out, "{}", line.yellow())?;
+        }
+    }
     Ok(())
 }
 
@@ -752,6 +797,21 @@ fn cmd_reload(config: &Config) -> anyhow::Result<()> {
     xray::reload(config)?;
     println!("{}", "Config reloaded (SIGHUP sent)".green());
     Ok(())
+}
+
+/// Orphan lines only - the tracked-process line printed by `cmd_status`
+/// itself is not re-rendered here, so an empty return means nothing changes
+/// versus today's output. Managed processes only: `ps` cannot show what port
+/// another process listens on, so "other xray" reporting stays in
+/// `start_failure_diagnostics`, where the port is already named.
+fn status_process_lines(
+    tracked: Option<i32>,
+    all: &[xray::XrayProcess],
+    config_path: &str,
+    current_user: &str,
+) -> Vec<String> {
+    let orphans = xray::orphans(all, config_path, tracked);
+    xray::orphan_lines(&orphans, current_user)
 }
 
 fn cmd_status(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
@@ -778,9 +838,15 @@ fn cmd_status(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     }
 
     // Xray process
-    match xray::is_running(config) {
+    let tracked_pid = xray::is_running(config);
+    match tracked_pid {
         Some(pid) => println!("xray: {} (PID: {})", "started".green(), pid),
         None => println!("xray: {}", "stopped".red()),
+    }
+    let config_path = config.xray_config.to_string_lossy().to_string();
+    let all_processes = xray::list_xray_processes(&config.xray_bin);
+    for line in status_process_lines(tracked_pid, &all_processes, &config_path, &current_user()) {
+        println!("{}", line.yellow());
     }
 
     // Proxy status from networksetup
@@ -1069,6 +1135,195 @@ mod tests {
             *plat.calls.borrow(),
             ["detect_active_service", "disable_proxy"]
         );
+    }
+
+    /// Writes an executable `#!/bin/sh\nsleep 30\n` script at `path`. Its `ps`
+    /// comm/argv0 is `/bin/sh`, so a test config with `xray_bin = "sh"`
+    /// classifies it as xray without needing a real xray binary.
+    #[cfg(unix)]
+    fn write_fake_process_script(path: &std::path::Path) {
+        std::fs::write(path, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    // -- status_process_lines --
+
+    #[test]
+    fn test_status_process_lines_tracked_only_no_orphans_is_empty() {
+        let all = vec![crate::xray::XrayProcess {
+            pid: 100,
+            user: "alice".to_string(),
+            config_arg: "/Users/alice/.config/xray/config.json".to_string(),
+        }];
+        let lines = super::status_process_lines(
+            Some(100),
+            &all,
+            "/Users/alice/.config/xray/config.json",
+            "alice",
+        );
+        assert!(
+            lines.is_empty(),
+            "a lone tracked process must not be re-rendered here: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_status_process_lines_tracked_plus_root_orphan_lists_sudo_kill() {
+        let config_path = "/Users/alice/.config/xray/config.json";
+        let all = vec![
+            crate::xray::XrayProcess {
+                pid: 100,
+                user: "alice".to_string(),
+                config_arg: config_path.to_string(),
+            },
+            crate::xray::XrayProcess {
+                pid: 7597,
+                user: "root".to_string(),
+                config_arg: config_path.to_string(),
+            },
+        ];
+        let lines = super::status_process_lines(Some(100), &all, config_path, "alice");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("sudo kill 7597"));
+    }
+
+    #[test]
+    fn test_status_process_lines_orphan_with_no_tracked_pid() {
+        let config_path = "/Users/alice/.config/xray/config.json";
+        let all = vec![crate::xray::XrayProcess {
+            pid: 7597,
+            user: "root".to_string(),
+            config_arg: config_path.to_string(),
+        }];
+        let lines = super::status_process_lines(None, &all, config_path, "alice");
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("sudo kill 7597"));
+    }
+
+    #[test]
+    fn test_status_process_lines_no_processes_is_empty() {
+        let lines = super::status_process_lines(
+            None,
+            &[],
+            "/Users/alice/.config/xray/config.json",
+            "alice",
+        );
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn test_status_process_lines_never_lists_other_config_xray() {
+        let all = vec![crate::xray::XrayProcess {
+            pid: 999,
+            user: "bob".to_string(),
+            config_arg: "/opt/homebrew/etc/xray/config.json".to_string(),
+        }];
+        let lines = super::status_process_lines(
+            None,
+            &all,
+            "/Users/alice/.config/xray/config.json",
+            "alice",
+        );
+        assert!(
+            lines.is_empty(),
+            "an xray running against a different config must never be listed by status: {lines:?}"
+        );
+    }
+
+    // -- stop_outcome_lines / cmd_stop qualified success --
+
+    #[test]
+    fn test_stop_outcome_lines_no_survivors_is_plain_success() {
+        let lines = super::stop_outcome_lines(&[], "alice");
+        assert_eq!(lines, vec!["corvex stopped!".to_string()]);
+    }
+
+    #[test]
+    fn test_stop_outcome_lines_survivor_qualifies_and_reuses_orphan_lines() {
+        let survivors = vec![crate::xray::XrayProcess {
+            pid: 7597,
+            user: "root".to_string(),
+            config_arg: "/Users/alice/.config/xray/config.json".to_string(),
+        }];
+        let lines = super::stop_outcome_lines(&survivors, "alice");
+        assert_eq!(lines.len(), 2);
+        assert_ne!(lines[0], "corvex stopped!", "must not claim a clean stop");
+        assert!(lines[1].contains("sudo kill 7597"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_stop_qualifies_success_when_managed_process_survives() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "sh");
+        std::fs::create_dir_all(config.xray_pid_file.parent().unwrap()).unwrap();
+
+        let scripts_dir = dir.path().join("scripts");
+        std::fs::create_dir_all(&scripts_dir).unwrap();
+
+        // Tracked process: `xray::stop` signals this one and it goes away.
+        let tracked_script = scripts_dir.join("tracked.sh");
+        write_fake_process_script(&tracked_script);
+        let mut tracked_child = std::process::Command::new(&tracked_script)
+            .spawn()
+            .expect("failed to spawn tracked fake process");
+        std::fs::write(&config.xray_pid_file, tracked_child.id().to_string()).unwrap();
+
+        // Orphan: same config path, but never written to xray.pid, so `stop`
+        // cannot reach it and must report it as a survivor instead.
+        let config_path = config.xray_config.to_string_lossy().to_string();
+        let orphan_script = scripts_dir.join("orphan.sh");
+        write_fake_process_script(&orphan_script);
+        let mut orphan_child = std::process::Command::new(&orphan_script)
+            .args(["run", "-c", &config_path])
+            .spawn()
+            .expect("failed to spawn orphan fake process");
+
+        let plat = RecordingPlatform::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let result = super::cmd_stop_inner(&config, &plat, &mut buf);
+
+        let _ = tracked_child.wait();
+        let _ = orphan_child.kill();
+        let _ = orphan_child.wait();
+
+        result.expect("cmd_stop must still succeed when a survivor remains");
+        let output = String::from_utf8(buf).unwrap();
+        // The test process itself owns the orphan, so the advice is bare
+        // `kill`, not `sudo kill` (that only applies to another user's PID).
+        assert!(
+            output.contains(&format!("kill {}", orphan_child.id())),
+            "qualified message must carry the survivor's recovery command: {output}"
+        );
+        assert!(
+            !output.contains("corvex stopped!"),
+            "must not claim a clean stop while a survivor remains: {output}"
+        );
+        assert_eq!(
+            *plat.calls.borrow(),
+            ["detect_active_service", "disable_proxy"]
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_cmd_stop_clean_path_prints_unqualified_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = temp_config(dir.path(), "sleep");
+        let reaper = spawn_fake_xray(&config);
+
+        let plat = RecordingPlatform::default();
+        let mut buf: Vec<u8> = Vec::new();
+        let result = super::cmd_stop_inner(&config, &plat, &mut buf);
+
+        reaper.join().expect("failed to join reaper thread");
+
+        result.expect("cmd_stop must succeed when xray stops cleanly");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("corvex stopped!"));
+        assert!(!output.contains("sudo kill"));
     }
 
     fn format_xray_status(pid: Option<i32>) -> String {
