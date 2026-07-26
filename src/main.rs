@@ -365,6 +365,11 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         .and_then(|r| r.corporate_traffic.clone())
         .unwrap_or_default();
     let log_config = build_xray_log_config(&s);
+    preflight_log_paths(&[
+        config.xray_log.clone(),
+        std::path::PathBuf::from(&log_config.access),
+        std::path::PathBuf::from(&log_config.error),
+    ])?;
     let merge_subs = s.routes.as_ref().and_then(|r| r.merge_subs) == Some(true);
     let routing = RoutingContext {
         corporate_traffic: &corporate_traffic,
@@ -580,6 +585,69 @@ fn ensure_directories(config: &Config, settings: &settings::CorvexSettings) {
                 );
             }
         }
+    }
+}
+
+/// Message for a log target xray could not open. `PermissionDenied` with a
+/// known owner uid gets the `sudo chown` fix; every other case (a directory,
+/// a read-only filesystem, a symlink loop, an uncreatable parent, or an
+/// unknown owner) only names the file and the underlying error - that advice
+/// would be wrong for those.
+fn log_open_error_message(
+    path: &std::path::Path,
+    err: &std::io::Error,
+    owner_uid: Option<u32>,
+) -> String {
+    let base = format!("cannot open log file {} for writing: {err}", path.display());
+    match (err.kind(), owner_uid) {
+        (std::io::ErrorKind::PermissionDenied, Some(uid)) => format!(
+            "{base} (owned by uid {uid}). Fix with: sudo chown $(id -un) {}",
+            path.display()
+        ),
+        _ => base,
+    }
+}
+
+#[cfg(unix)]
+fn log_target_owner_uid(path: &std::path::Path) -> Option<u32> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| std::os::unix::fs::MetadataExt::uid(&m))
+}
+
+#[cfg(windows)]
+fn log_target_owner_uid(_path: &std::path::Path) -> Option<u32> {
+    None
+}
+
+/// Verify every xray log target is writable before spawning xray, so an
+/// unwritable log fails loudly here, naming the file, instead of xray dying
+/// silently and corvex pointing at the log it just failed to write. Every
+/// open failure is fatal, not just `PermissionDenied`: a directory, a
+/// read-only filesystem, a symlink loop or an uncreatable parent are just as
+/// fatal to xray, and `ensure_directories` above deliberately swallows those
+/// errors. The path list is deduplicated first, since `config.xray_log` is
+/// aliased to `log.xray.error` above whenever that setting is present.
+fn preflight_log_paths(paths: &[std::path::PathBuf]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    let mut errors = Vec::new();
+    for path in paths {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if let Err(e) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+        {
+            let owner_uid = log_target_owner_uid(path);
+            errors.push(log_open_error_message(path, &e, owner_uid));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(errors.join("\n"))
     }
 }
 
@@ -1976,6 +2044,148 @@ mod tests {
         let settings = crate::settings::CorvexSettings::default();
         // Should not panic
         super::ensure_directories(&config, &settings);
+    }
+
+    // -- log_open_error_message --
+
+    #[test]
+    fn test_log_open_error_message_permission_denied_names_uid_and_chown() {
+        let path = std::path::Path::new("/var/log/xray/access.log");
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        let msg = super::log_open_error_message(path, &err, Some(501));
+
+        assert!(msg.contains("/var/log/xray/access.log"));
+        assert!(msg.contains("501"));
+        assert!(msg.contains("sudo chown $(id -un) /var/log/xray/access.log"));
+    }
+
+    #[test]
+    fn test_log_open_error_message_other_error_has_no_chown_line() {
+        let path = std::path::Path::new("/var/log/xray/access.log");
+        let err = std::io::Error::other("read-only file system");
+
+        let msg = super::log_open_error_message(path, &err, None);
+
+        assert!(msg.contains("/var/log/xray/access.log"));
+        assert!(msg.contains("read-only file system"));
+        assert!(!msg.contains("chown"));
+    }
+
+    #[test]
+    fn test_log_open_error_message_permission_denied_without_known_owner_has_no_chown_line() {
+        // The Windows case: MetadataExt is unix-only, so owner_uid is always
+        // None there even on a PermissionDenied error.
+        let path = std::path::Path::new("/var/log/xray/access.log");
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+
+        let msg = super::log_open_error_message(path, &err, None);
+
+        assert!(!msg.contains("chown"));
+    }
+
+    // -- preflight_log_paths --
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_rejects_readonly_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        std::fs::write(&path, "").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o400);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let result = super::preflight_log_paths(std::slice::from_ref(&path));
+
+        // Restore before the temp dir is dropped.
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let err = result.expect_err("a 0o400 existing file must be rejected");
+        assert!(err.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_rejects_creation_in_readonly_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("logs");
+        std::fs::create_dir_all(&sub).unwrap();
+        let path = sub.join("access.log");
+        let mut perms = std::fs::metadata(&sub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(&sub, perms).unwrap();
+
+        let result = super::preflight_log_paths(std::slice::from_ref(&path));
+
+        // Restore before the temp dir is dropped.
+        let mut perms = std::fs::metadata(&sub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(&sub, perms).unwrap();
+
+        let err = result.expect_err("creating a new file in a 0o500 directory must be rejected");
+        assert!(err.to_string().contains(&path.display().to_string()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_accepts_writable_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+
+        super::preflight_log_paths(std::slice::from_ref(&path))
+            .expect("a writable target must pass");
+        assert!(path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_dedupes_duplicate_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("access.log");
+        std::fs::write(&path, "").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o400);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        // config.xray_log aliases to log.xray.error in real usage, so the
+        // same failing path can appear twice in the input.
+        let result = super::preflight_log_paths(&[path.clone(), path.clone()]);
+
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o600);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let err = result.expect_err("a 0o400 existing file must be rejected");
+        // The message names the path twice on its own (once in "cannot open
+        // log file X", once in the chown hint), so count failure entries via
+        // a marker that appears exactly once per checked path, not raw path
+        // occurrences.
+        let occurrences = err.to_string().matches("cannot open log file").count();
+        assert_eq!(
+            occurrences, 1,
+            "a duplicated path must be reported once, not once per occurrence: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_log_paths_rejects_non_permission_error() {
+        // A directory target fails to open as a file with ErrorKind::IsADirectory
+        // or ErrorKind::Other, never PermissionDenied - every failure must still
+        // be fatal, not just permission errors.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("access.log");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let result = super::preflight_log_paths(std::slice::from_ref(&target));
+
+        assert!(
+            result.is_err(),
+            "a non-permission open failure must still be fatal"
+        );
     }
 
     #[test]

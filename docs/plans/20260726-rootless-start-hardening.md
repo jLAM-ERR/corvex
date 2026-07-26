@@ -295,12 +295,12 @@ Sites asserting or documenting the old values, all of which must change with the
 **Files:**
 - Modify: `src/main.rs`
 
-- [ ] add pure `log_open_error_message(path, err, owner_uid)` naming the file and, for `PermissionDenied` only, its owner uid (via stdlib `std::os::unix::fs::MetadataExt::uid()`, no new crate) plus the `sudo chown $(id -un) <path>` fix; on Windows the uid is always `None` and the message omits the chown line, since `MetadataExt` is unix-only and `preflight_log_paths` lives in the cross-platform `main.rs`
-- [ ] add `preflight_log_paths(paths)` opening each target append+create and treating **any** failure as fatal (a directory, read-only filesystem, symlink loop or uncreatable parent all kill xray just as surely as a permission error); **deduplicate the path list first**, since `src/main.rs:93-103` aliases `config.xray_log` to `log.xray.error` and would otherwise report one file twice
-- [ ] call it from `cmd_start` before `main_algorithm`, covering `config.xray_log` plus the configured access/error paths
-- [ ] write tests for `log_open_error_message` (success cases): a `PermissionDenied` error yields path, uid and chown command; a non-permission error yields the path and the underlying error but no chown line
-- [ ] write `#[cfg(unix)]`-gated tests: an **existing file chmod'd `0o400`** is rejected (note a `0o500` *directory* does not prevent appending to a file that already exists inside it — directory permissions govern creation, not append); creation inside a `0o500` directory is rejected; a writable target passes; a duplicated path is reported once
-- [ ] run `cargo test` - must pass before task 6
+- [x] add pure `log_open_error_message(path, err, owner_uid)` naming the file and, for `PermissionDenied` only, its owner uid (via stdlib `std::os::unix::fs::MetadataExt::uid()`, no new crate) plus the `sudo chown $(id -un) <path>` fix; on Windows the uid is always `None` and the message omits the chown line, since `MetadataExt` is unix-only and `preflight_log_paths` lives in the cross-platform `main.rs`
+- [x] add `preflight_log_paths(paths)` opening each target append+create and treating **any** failure as fatal (a directory, read-only filesystem, symlink loop or uncreatable parent all kill xray just as surely as a permission error); **deduplicate the path list first**, since `src/main.rs:93-103` aliases `config.xray_log` to `log.xray.error` and would otherwise report one file twice
+- [x] call it from `cmd_start` before `main_algorithm`, covering `config.xray_log` plus the configured access/error paths
+- [x] write tests for `log_open_error_message` (success cases): a `PermissionDenied` error yields path, uid and chown command; a non-permission error yields the path and the underlying error but no chown line
+- [x] write `#[cfg(unix)]`-gated tests: an **existing file chmod'd `0o400`** is rejected (note a `0o500` *directory* does not prevent appending to a file that already exists inside it — directory permissions govern creation, not append); creation inside a `0o500` directory is rejected; a writable target passes; a duplicated path is reported once
+- [x] run `cargo test` - must pass before task 6
 
 ### Task 6: Stop corvex from creating orphans (PID-file preflight)
 
