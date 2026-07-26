@@ -1685,11 +1685,9 @@ mod tests {
         let s = crate::settings::CorvexSettings::default();
         let log_config = super::build_xray_log_config(&s);
         assert_eq!(log_config.loglevel, "warning");
-        #[cfg(unix)]
-        {
-            assert_eq!(log_config.access, "/var/log/xray/access.log");
-            assert_eq!(log_config.error, "/var/log/xray/error.log");
-        }
+        let base = crate::config::state_dir().join("xray");
+        assert_eq!(log_config.access, base.join("access.log").to_string_lossy());
+        assert_eq!(log_config.error, base.join("error.log").to_string_lossy());
     }
 
     #[test]

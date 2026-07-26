@@ -106,7 +106,7 @@ fn xray_config_dir() -> PathBuf {
     config_base_dir().join("xray")
 }
 
-fn state_dir() -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     state_dir_inner(
         #[cfg(unix)]
         std::env::var("XDG_STATE_HOME").ok(),
@@ -139,7 +139,7 @@ fn state_dir_inner(local_appdata: Option<String>) -> PathBuf {
 fn default_xray_log() -> PathBuf {
     #[cfg(unix)]
     {
-        PathBuf::from("/var/log/xray/xray.log")
+        state_dir().join("xray").join("xray.log")
     }
     #[cfg(windows)]
     {
@@ -168,10 +168,7 @@ mod tests {
         assert_eq!(config.xray_bin, "xray");
         assert!(config.xray_config.ends_with("xray/config.json"));
         assert!(config.xray_pid_file.ends_with("xray/xray.pid"));
-        #[cfg(unix)]
-        assert_eq!(config.xray_log, PathBuf::from("/var/log/xray/xray.log"));
-        #[cfg(windows)]
-        assert!(config.xray_log.ends_with("xray/xray.log"));
+        assert_eq!(config.xray_log, state_dir().join("xray").join("xray.log"));
     }
 
     #[test]

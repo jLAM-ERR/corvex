@@ -280,15 +280,15 @@ Sites asserting or documenting the old values, all of which must change with the
 - Modify: `src/main.rs` (test assertions only)
 - Modify: `examples/corvex.json`
 
-- [ ] make `state_dir()` (`src/config.rs:109`) `pub(crate)` — it is private today, which is why `XrayLogConfig::default()` open-codes its own `LOCALAPPDATA` lookup; exposing it avoids a third copy of the XDG fallback logic and keeps `state_dir_inner`'s existing tests (`src/config.rs:197-218`) covering the paths that actually ship
-- [ ] change `default_xray_log()` (`src/config.rs:139`) on unix to `state_dir().join("xray").join("xray.log")`, leaving the Windows branch untouched
-- [ ] change `XrayLogConfig::default()` (`src/protocol.rs:755-769`) to call `config::state_dir()` for **both** branches, giving unix `xray/access.log` and `xray/error.log` and removing the duplicated Windows `LOCALAPPDATA` lookup — note `src/main.rs:473 build_xray_log_config` needs no literal changes, it already delegates here
-- [ ] verify `ensure_directories` needs no change: `src/main.rs:563-572` already creates `config.xray_log.parent()` and 574-583 the settings access/error parents, so the new directory is created once the defaults move (no change expected)
-- [ ] update the assertions holding the old literals: `src/protocol.rs:1687-1688`, `src/config.rs:172`, `src/main.rs:1126-1127`; leave `src/settings.rs:130-131,171-172` unchanged (parser fixtures proving explicit `/var/log` paths still work)
-- [ ] update `examples/corvex.json:43-44` to the new defaults
-- [ ] write tests asserting the new defaults live under `state_dir()/xray/` and that an explicit `log.xray.*` in settings still overrides them
-- [ ] write tests for edge cases: `XDG_STATE_HOME` unset falls back to `~/.local/state`; the Windows default is unaffected
-- [ ] run `cargo test` - must pass before task 5
+- [x] make `state_dir()` (`src/config.rs:109`) `pub(crate)` — it is private today, which is why `XrayLogConfig::default()` open-codes its own `LOCALAPPDATA` lookup; exposing it avoids a third copy of the XDG fallback logic and keeps `state_dir_inner`'s existing tests (`src/config.rs:197-218`) covering the paths that actually ship
+- [x] change `default_xray_log()` (`src/config.rs:139`) on unix to `state_dir().join("xray").join("xray.log")`, leaving the Windows branch untouched
+- [x] change `XrayLogConfig::default()` (`src/protocol.rs:755-769`) to call `config::state_dir()` for **both** branches, giving unix `xray/access.log` and `xray/error.log` and removing the duplicated Windows `LOCALAPPDATA` lookup — note `src/main.rs:473 build_xray_log_config` needs no literal changes, it already delegates here
+- [x] verify `ensure_directories` needs no change: `src/main.rs:563-572` already creates `config.xray_log.parent()` and 574-583 the settings access/error parents, so the new directory is created once the defaults move (no change expected)
+- [x] update the assertions holding the old literals: `src/protocol.rs:1687-1688`, `src/config.rs:172`, `src/main.rs:1126-1127`; leave `src/settings.rs:130-131,171-172` unchanged (parser fixtures proving explicit `/var/log` paths still work)
+- [x] update `examples/corvex.json:43-44` to the new defaults
+- [x] write tests asserting the new defaults live under `state_dir()/xray/` and that an explicit `log.xray.*` in settings still overrides them
+- [x] write tests for edge cases: `XDG_STATE_HOME` unset falls back to `~/.local/state`; the Windows default is unaffected
+- [x] run `cargo test` - must pass before task 5
 
 ### Task 5: Preflight unwritable log targets before spawning xray
 
