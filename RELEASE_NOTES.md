@@ -1,3 +1,34 @@
+# Corvex v0.6.4 Release Notes
+
+A bug-fix release. Starting corvex as a normal user on macOS now asks for your password **once** instead of six times.
+
+## Fixes
+
+### The password dialog appeared six times on every start
+
+Enabling the system proxy takes six separate `networksetup` calls (address and on-switch for SOCKS, HTTP, and HTTPS). Each one hit "Command requires admin privileges" on its own, and each one independently opened its own `osascript` authorization dialog — so `corvex start` asked for the same password six times in a row. `corvex stop` asked three times.
+
+The reason the dialogs never collapsed is that macOS marks the underlying `system.privilege.admin` right as unshared, so authorizing one process grants nothing to the next one. Six processes meant six prompts.
+
+corvex now runs the whole group inside a single `osascript` invocation, so macOS asks once: one dialog for `start`, one for `stop`. Running as root still asks nothing at all.
+
+Note that this dialog asks for a password and cannot offer Touch ID — that right is password-only, and no corvex setting changes it. See the README for why using Touch ID would mean elevating through `sudo` and what that would cost.
+
+### Failed proxy changes could be reported as success
+
+`networksetup` sometimes prints `** Error: ...` while still exiting with a success status. corvex checked for that on one output stream but not the other, so an error written only to the error channel with a successful exit code was read as "worked". The same gap existed after an authorized dialog: only the exit status was checked, so with the commands now chained together, one failing setting could be hidden behind the ones that ran after it — corvex would print `proxy enabled` while, say, the HTTPS proxy had never been set.
+
+corvex now treats `** Error` on either output channel as a real failure, before and after authorization. A proxy change that does not apply is reported instead of silently passing.
+
+### Clearer messages when a proxy change does not complete
+
+- Canceling the password dialog previously always said "proxy settings were not changed". corvex now only says that when nothing had been applied yet, and tells you settings may already have changed when that is possible.
+- When one command in the group fails, the error now makes clear that the commands run in order and stop at the first failure, rather than listing every command as though all of them ran.
+
+## Migration
+
+corvex.json needs no changes.
+
 # Corvex v0.6.3 Release Notes
 
 A bug-fix release that finishes the rootless-start work started in 0.6.1: `corvex start` can now recover fully on a machine that has ever run `sudo corvex start`, instead of needing `sudo` forever.

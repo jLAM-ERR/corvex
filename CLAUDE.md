@@ -75,7 +75,7 @@ src/
 ├── platform/
 │   ├── mod.rs           — Platform trait, PlatformImpl type alias
 │   ├── linux.rs         — proxy via env file + DE detection (GNOME/KDE), DNS via resolvectl
-│   ├── macos.rs         — proxy, network, DNS via networksetup/scutil
+│   ├── macos.rs         — proxy, network, DNS via networksetup/scutil. Proxy changes are applied as a batch: `enable_proxy`/`disable_proxy` build their command lists with the pure `enable_proxy_commands`/`disable_proxy_commands`, then hand them to `run_networksetup_all`, which runs each unelevated and — on the first "requires admin privileges" — re-runs the *whole* batch inside one `osascript ... with administrator privileges`, so macOS asks for the password once instead of once per command. Both the unelevated (`classify_networksetup_output`) and elevated (`classify_elevated_output`) paths treat `** Error` on either output stream as a failure even when the exit code is 0, because networksetup reports errors inconsistently.
 │   └── windows.rs       — proxy, network, DNS stubs (WinAPI/registry)
 ```
 
