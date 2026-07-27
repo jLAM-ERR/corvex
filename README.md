@@ -236,7 +236,7 @@ Setting the system proxy on macOS requires admin privileges. When running withou
 - `corvex start` / `corvex stop` — one dialog each, if not running as root
 - `sudo corvex start` — bypasses the dialog entirely
 - SSH (no GUI) — falls back to a clear error message suggesting `sudo`
-- Canceling the dialog — reports "Authorization denied" and leaves the proxy as it was
+- Canceling the dialog — reports "Authorization denied". In the normal case nothing has been applied yet and the message says so, because the very first `networksetup` call is the one that asks for the password. If some commands had already gone through before the dialog appeared, the message says instead that earlier settings may already have been applied — corvex tracks the difference rather than promising the proxy is untouched.
 
 **The dialog asks for a password and cannot offer Touch ID.** This is not a corvex setting. The dialog authorizes the system's `system.privilege.admin` right, which is password-only; there is no flag that adds biometrics to it. Touch ID would require corvex to elevate through `sudo` instead, which needs a terminal, excludes users who are not in `sudoers`, and depends on you enabling `pam_tid.so` in `/etc/pam.d/sudo_local` yourself. That trade is not currently worth it, so the single prompt is a password prompt.
 
