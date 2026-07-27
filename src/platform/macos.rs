@@ -401,15 +401,30 @@ fn is_no_gui_error(stderr: &str) -> bool {
     stderr.contains("connection is invalid")
 }
 
-fn build_osascript_command(commands: &[Vec<&str>]) -> String {
+// networksetup can print "** Error: ..." while exiting 0, so a plain `&&`
+// chain would not stop there. This shell function captures each command's
+// combined output, echoes it (so the caller still sees it), and turns the
+// marker into a nonzero exit so `&&` stops the chain at that command.
+const GUARD_HELPER: &str =
+    "c() { o=$(\"$@\" 2>&1); printf %s \"$o\"; case $o in *'** Error'*) exit 1;; esac; }; ";
+
+/// Builds the guarded `&&` chain (helper definition + one guarded invocation
+/// per command) for `bin`, without any AppleScript wrapping. Kept separate
+/// from `build_osascript_command` so the guard's stop-on-error behaviour can
+/// be exercised directly against a stub binary in tests.
+fn build_guarded_chain(bin: &str, commands: &[Vec<&str>]) -> String {
     let rendered: Vec<String> = commands
         .iter()
         .map(|args| {
             let escaped_args: Vec<String> = args.iter().map(|a| shell_escape(a)).collect();
-            format!("/usr/sbin/networksetup {}", escaped_args.join(" "))
+            format!("c {} {}", bin, escaped_args.join(" "))
         })
         .collect();
-    let shell_cmd = rendered.join(" && ");
+    format!("{}{}", GUARD_HELPER, rendered.join(" && "))
+}
+
+fn build_osascript_command(commands: &[Vec<&str>]) -> String {
+    let shell_cmd = build_guarded_chain("/usr/sbin/networksetup", commands);
     let as_escaped = applescript_escape(&shell_cmd);
     format!(
         "do shell script \"{}\" with administrator privileges",
@@ -574,7 +589,7 @@ mod tests {
         let cmd = build_osascript_command(&[vec!["-getwebproxy"]]);
         assert_eq!(
             cmd,
-            "do shell script \"/usr/sbin/networksetup '-getwebproxy'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-getwebproxy'\" with administrator privileges"
         );
     }
 
@@ -588,7 +603,7 @@ mod tests {
         ]]);
         assert_eq!(
             cmd,
-            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxy' 'Wi-Fi' '127.0.0.1' '1080'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxy' 'Wi-Fi' '127.0.0.1' '1080'\" with administrator privileges"
         );
     }
 
@@ -602,7 +617,7 @@ mod tests {
         ]]);
         assert_eq!(
             cmd,
-            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxy' 'Thunderbolt \\\"Pro\\\" Bridge' '127.0.0.1' '1080'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxy' 'Thunderbolt \\\"Pro\\\" Bridge' '127.0.0.1' '1080'\" with administrator privileges"
         );
     }
 
@@ -619,13 +634,29 @@ mod tests {
         let cmd = build_osascript_command(&commands);
         assert_eq!(
             cmd,
-            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxy' 'Wi-Fi' '127.0.0.1' '21080' && \
-/usr/sbin/networksetup '-setsocksfirewallproxystate' 'Wi-Fi' 'on' && \
-/usr/sbin/networksetup '-setwebproxy' 'Wi-Fi' '127.0.0.1' '21080' && \
-/usr/sbin/networksetup '-setwebproxystate' 'Wi-Fi' 'on' && \
-/usr/sbin/networksetup '-setsecurewebproxy' 'Wi-Fi' '127.0.0.1' '21080' && \
-/usr/sbin/networksetup '-setsecurewebproxystate' 'Wi-Fi' 'on'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; \
+c /usr/sbin/networksetup '-setsocksfirewallproxy' 'Wi-Fi' '127.0.0.1' '21080' && \
+c /usr/sbin/networksetup '-setsocksfirewallproxystate' 'Wi-Fi' 'on' && \
+c /usr/sbin/networksetup '-setwebproxy' 'Wi-Fi' '127.0.0.1' '21080' && \
+c /usr/sbin/networksetup '-setwebproxystate' 'Wi-Fi' 'on' && \
+c /usr/sbin/networksetup '-setsecurewebproxy' 'Wi-Fi' '127.0.0.1' '21080' && \
+c /usr/sbin/networksetup '-setsecurewebproxystate' 'Wi-Fi' 'on'\" with administrator privileges"
         );
+    }
+
+    // Proves the chain is actually guarded: every command after the helper
+    // definition is invoked through `c`, so a "** Error" with exit 0 turns
+    // into a nonzero status and the `&&` chain stops there.
+    #[test]
+    fn osascript_batch_each_command_is_guarded_by_c() {
+        let commands: Vec<Vec<&str>> = vec![
+            vec!["-setsocksfirewallproxy", "Wi-Fi", "127.0.0.1", "21080"],
+            vec!["-setsocksfirewallproxystate", "Wi-Fi", "on"],
+        ];
+        let cmd = build_osascript_command(&commands);
+        assert!(cmd.contains("c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }"));
+        assert!(cmd.contains("c /usr/sbin/networksetup '-setsocksfirewallproxy'"));
+        assert!(cmd.contains("c /usr/sbin/networksetup '-setsocksfirewallproxystate'"));
     }
 
     // This only checks the generated script text has one elevation phrase.
@@ -655,6 +686,55 @@ mod tests {
         assert_eq!(cmd.matches(escaped_service).count(), 3);
     }
 
+    // Behavioural proof of the guard, run through /bin/sh with a stub in
+    // place of networksetup. Never touches osascript or the real
+    // networksetup, so it is safe to run here.
+    #[test]
+    fn guarded_chain_stops_after_a_command_reports_error_with_zero_exit() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("corvex_guard_test_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let stub = dir.join("fake_networksetup.sh");
+        fs::write(
+            &stub,
+            "#!/bin/sh\n\
+case \"$1\" in\n\
+  -first) echo '** Error: fake'; touch \"$MARKER_DIR/first_ran\"; exit 0 ;;\n\
+  -second) touch \"$MARKER_DIR/second_ran\"; exit 0 ;;\n\
+esac\n",
+        )
+        .expect("write stub script");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub script");
+
+        let commands: Vec<Vec<&str>> = vec![vec!["-first"], vec!["-second"]];
+        let chain = build_guarded_chain(stub.to_str().unwrap(), &commands);
+
+        let output = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&chain)
+            .env("MARKER_DIR", &dir)
+            .output()
+            .expect("run guarded chain via /bin/sh");
+
+        assert!(
+            dir.join("first_ran").exists(),
+            "the first command should have run"
+        );
+        assert!(
+            !dir.join("second_ran").exists(),
+            "the second command must not run once the first reports ** Error"
+        );
+        assert!(
+            !output.status.success(),
+            "the guarded chain must exit nonzero"
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("** Error"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // The service name comes from parsing `networksetup -listallhardwareports`
     // output and ends up inside a shell string that runs with administrator
     // privileges, so shell metacharacters in it must stay inert data: they
@@ -666,7 +746,7 @@ mod tests {
         let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", "O'Brien", "off"]]);
         assert_eq!(
             cmd,
-            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxystate' 'O'\\\\''Brien' 'off'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' 'O'\\\\''Brien' 'off'\" with administrator privileges"
         );
     }
 
@@ -679,7 +759,7 @@ mod tests {
         ]]);
         assert_eq!(
             cmd,
-            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxystate' 'Path\\\\to\\\\Bridge' 'off'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' 'Path\\\\to\\\\Bridge' 'off'\" with administrator privileges"
         );
     }
 
@@ -688,7 +768,7 @@ mod tests {
         let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", "$(id)", "off"]]);
         assert_eq!(
             cmd,
-            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxystate' '$(id)' 'off'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' '$(id)' 'off'\" with administrator privileges"
         );
     }
 
@@ -697,7 +777,7 @@ mod tests {
         let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", "`id`", "off"]]);
         assert_eq!(
             cmd,
-            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxystate' '`id`' 'off'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' '`id`' 'off'\" with administrator privileges"
         );
     }
 
@@ -707,7 +787,7 @@ mod tests {
         let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", service, "off"]]);
         assert_eq!(
             cmd,
-            "do shell script \"/usr/sbin/networksetup '-setsocksfirewallproxystate' ''\\\\''\\\\\\\"$(id)`whoami`' 'off'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' ''\\\\''\\\\\\\"$(id)`whoami`' 'off'\" with administrator privileges"
         );
     }
 
