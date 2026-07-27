@@ -403,10 +403,11 @@ fn is_no_gui_error(stderr: &str) -> bool {
 
 // networksetup can print "** Error: ..." while exiting 0, so a plain `&&`
 // chain would not stop there. This shell function captures each command's
-// combined output, echoes it (so the caller still sees it), and turns the
-// marker into a nonzero exit so `&&` stops the chain at that command.
+// combined output and its real exit status, echoes the output (so the
+// caller still sees it), and returns nonzero if the marker is present or the
+// command itself failed, so `&&` stops the chain at that command either way.
 const GUARD_HELPER: &str =
-    "c() { o=$(\"$@\" 2>&1); printf %s \"$o\"; case $o in *'** Error'*) exit 1;; esac; }; ";
+    "c() { o=$(\"$@\" 2>&1); s=$?; printf %s \"$o\"; case $o in *'** Error'*) return 1;; esac; return $s; }; ";
 
 /// Builds the guarded `&&` chain (helper definition + one guarded invocation
 /// per command) for `bin`, without any AppleScript wrapping. Kept separate
@@ -589,7 +590,7 @@ mod tests {
         let cmd = build_osascript_command(&[vec!["-getwebproxy"]]);
         assert_eq!(
             cmd,
-            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-getwebproxy'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); s=$?; printf %s \\\"$o\\\"; case $o in *'** Error'*) return 1;; esac; return $s; }; c /usr/sbin/networksetup '-getwebproxy'\" with administrator privileges"
         );
     }
 
@@ -603,7 +604,7 @@ mod tests {
         ]]);
         assert_eq!(
             cmd,
-            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxy' 'Wi-Fi' '127.0.0.1' '1080'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); s=$?; printf %s \\\"$o\\\"; case $o in *'** Error'*) return 1;; esac; return $s; }; c /usr/sbin/networksetup '-setsocksfirewallproxy' 'Wi-Fi' '127.0.0.1' '1080'\" with administrator privileges"
         );
     }
 
@@ -617,7 +618,7 @@ mod tests {
         ]]);
         assert_eq!(
             cmd,
-            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxy' 'Thunderbolt \\\"Pro\\\" Bridge' '127.0.0.1' '1080'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); s=$?; printf %s \\\"$o\\\"; case $o in *'** Error'*) return 1;; esac; return $s; }; c /usr/sbin/networksetup '-setsocksfirewallproxy' 'Thunderbolt \\\"Pro\\\" Bridge' '127.0.0.1' '1080'\" with administrator privileges"
         );
     }
 
@@ -634,7 +635,7 @@ mod tests {
         let cmd = build_osascript_command(&commands);
         assert_eq!(
             cmd,
-            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; \
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); s=$?; printf %s \\\"$o\\\"; case $o in *'** Error'*) return 1;; esac; return $s; }; \
 c /usr/sbin/networksetup '-setsocksfirewallproxy' 'Wi-Fi' '127.0.0.1' '21080' && \
 c /usr/sbin/networksetup '-setsocksfirewallproxystate' 'Wi-Fi' 'on' && \
 c /usr/sbin/networksetup '-setwebproxy' 'Wi-Fi' '127.0.0.1' '21080' && \
@@ -654,7 +655,7 @@ c /usr/sbin/networksetup '-setsecurewebproxystate' 'Wi-Fi' 'on'\" with administr
             vec!["-setsocksfirewallproxystate", "Wi-Fi", "on"],
         ];
         let cmd = build_osascript_command(&commands);
-        assert!(cmd.contains("c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }"));
+        assert!(cmd.contains("c() { o=$(\\\"$@\\\" 2>&1); s=$?; printf %s \\\"$o\\\"; case $o in *'** Error'*) return 1;; esac; return $s; }"));
         assert!(cmd.contains("c /usr/sbin/networksetup '-setsocksfirewallproxy'"));
         assert!(cmd.contains("c /usr/sbin/networksetup '-setsocksfirewallproxystate'"));
     }
@@ -688,22 +689,32 @@ c /usr/sbin/networksetup '-setsecurewebproxystate' 'Wi-Fi' 'on'\" with administr
 
     // Behavioural proof of the guard, run through /bin/sh with a stub in
     // place of networksetup. Never touches osascript or the real
-    // networksetup, so it is safe to run here.
-    #[test]
-    fn guarded_chain_stops_after_a_command_reports_error_with_zero_exit() {
+    // networksetup, so it is safe to run here. `case_name` keeps each test's
+    // temp dir distinct so tests running in parallel don't share markers.
+    fn run_guarded_chain_against_stub(
+        case_name: &str,
+        first_command_body: &str,
+    ) -> (std::path::PathBuf, std::process::Output) {
         use std::fs;
         use std::os::unix::fs::PermissionsExt;
 
-        let dir = std::env::temp_dir().join(format!("corvex_guard_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "corvex_guard_test_{}_{}",
+            std::process::id(),
+            case_name
+        ));
         fs::create_dir_all(&dir).expect("create temp dir");
         let stub = dir.join("fake_networksetup.sh");
         fs::write(
             &stub,
-            "#!/bin/sh\n\
+            format!(
+                "#!/bin/sh\n\
 case \"$1\" in\n\
-  -first) echo '** Error: fake'; touch \"$MARKER_DIR/first_ran\"; exit 0 ;;\n\
+  -first) {} ;;\n\
   -second) touch \"$MARKER_DIR/second_ran\"; exit 0 ;;\n\
 esac\n",
+                first_command_body
+            ),
         )
         .expect("write stub script");
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub script");
@@ -718,10 +729,16 @@ esac\n",
             .output()
             .expect("run guarded chain via /bin/sh");
 
-        assert!(
-            dir.join("first_ran").exists(),
-            "the first command should have run"
+        (dir, output)
+    }
+
+    #[test]
+    fn guarded_chain_stops_after_a_command_reports_error_with_zero_exit() {
+        let (dir, output) = run_guarded_chain_against_stub(
+            "zero_exit_with_marker",
+            "echo '** Error: fake'; exit 0",
         );
+
         assert!(
             !dir.join("second_ran").exists(),
             "the second command must not run once the first reports ** Error"
@@ -732,7 +749,47 @@ esac\n",
         );
         assert!(String::from_utf8_lossy(&output.stdout).contains("** Error"));
 
-        let _ = fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The regression this fix closes: a command that fails without printing
+    // the "** Error" marker (a differently formatted failure, or a signal)
+    // used to have its nonzero exit overwritten by the guard's own `printf`
+    // and unmatched `case`, so the chain reported success anyway.
+    #[test]
+    fn guarded_chain_stops_after_a_command_exits_nonzero_without_the_marker() {
+        let (dir, output) = run_guarded_chain_against_stub(
+            "nonzero_exit_no_marker",
+            "echo 'some other failure format'; exit 7",
+        );
+
+        assert!(
+            !dir.join("second_ran").exists(),
+            "the second command must not run once the first exits nonzero"
+        );
+        assert!(
+            !output.status.success(),
+            "the guarded chain must exit nonzero even without the ** Error marker"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guarded_chain_continues_after_a_clean_success() {
+        let (dir, output) =
+            run_guarded_chain_against_stub("clean_success", "echo 'all good'; exit 0");
+
+        assert!(
+            dir.join("second_ran").exists(),
+            "the second command must run once the first succeeds cleanly"
+        );
+        assert!(
+            output.status.success(),
+            "the guarded chain must exit zero on a clean success"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The service name comes from parsing `networksetup -listallhardwareports`
@@ -746,7 +803,7 @@ esac\n",
         let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", "O'Brien", "off"]]);
         assert_eq!(
             cmd,
-            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' 'O'\\\\''Brien' 'off'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); s=$?; printf %s \\\"$o\\\"; case $o in *'** Error'*) return 1;; esac; return $s; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' 'O'\\\\''Brien' 'off'\" with administrator privileges"
         );
     }
 
@@ -759,7 +816,7 @@ esac\n",
         ]]);
         assert_eq!(
             cmd,
-            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' 'Path\\\\to\\\\Bridge' 'off'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); s=$?; printf %s \\\"$o\\\"; case $o in *'** Error'*) return 1;; esac; return $s; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' 'Path\\\\to\\\\Bridge' 'off'\" with administrator privileges"
         );
     }
 
@@ -768,7 +825,7 @@ esac\n",
         let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", "$(id)", "off"]]);
         assert_eq!(
             cmd,
-            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' '$(id)' 'off'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); s=$?; printf %s \\\"$o\\\"; case $o in *'** Error'*) return 1;; esac; return $s; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' '$(id)' 'off'\" with administrator privileges"
         );
     }
 
@@ -777,7 +834,7 @@ esac\n",
         let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", "`id`", "off"]]);
         assert_eq!(
             cmd,
-            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' '`id`' 'off'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); s=$?; printf %s \\\"$o\\\"; case $o in *'** Error'*) return 1;; esac; return $s; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' '`id`' 'off'\" with administrator privileges"
         );
     }
 
@@ -787,7 +844,7 @@ esac\n",
         let cmd = build_osascript_command(&[vec!["-setsocksfirewallproxystate", service, "off"]]);
         assert_eq!(
             cmd,
-            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); printf %s \\\"$o\\\"; case $o in *'** Error'*) exit 1;; esac; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' ''\\\\''\\\\\\\"$(id)`whoami`' 'off'\" with administrator privileges"
+            "do shell script \"c() { o=$(\\\"$@\\\" 2>&1); s=$?; printf %s \\\"$o\\\"; case $o in *'** Error'*) return 1;; esac; return $s; }; c /usr/sbin/networksetup '-setsocksfirewallproxystate' ''\\\\''\\\\\\\"$(id)`whoami`' 'off'\" with administrator privileges"
         );
     }
 
