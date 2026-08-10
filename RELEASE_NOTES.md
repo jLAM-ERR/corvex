@@ -1,3 +1,30 @@
+# Corvex v0.6.5 Release Notes
+
+A small bug-fix release. When a subscription fails to download, corvex now tells you why.
+
+## Fixes
+
+### "failed to fetch" said nothing about what had actually failed
+
+When a subscription URL could not be downloaded, the warning repeated the URL back at you and stopped there:
+
+```
+[WARN] subscription https://panel.example/sub/abc failed: failed to fetch https://panel.example/sub/abc
+Error: no supported proxy servers found in subscriptions
+```
+
+The real reason was discarded before it reached the screen. Whether the host name failed to resolve, the connection was refused, or the secure channel could not be set up, you saw the same line — which made a blocked panel, a mistyped URL, and a network that was simply down all look identical.
+
+The warning now carries the full chain of causes, so the same failure reads:
+
+```
+[WARN] subscription https://panel.example/sub/abc failed: failed to fetch https://panel.example/sub/abc: dns error: no record found
+```
+
+## Migration
+
+corvex.json needs no changes.
+
 # Corvex v0.6.4 Release Notes
 
 A bug-fix release. Starting corvex as a normal user on macOS now asks for your password **once** instead of six times.
