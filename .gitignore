@@ -7,12 +7,4 @@ Thumbs.db
 
 # Local working files (not part of the project)
 resources/
-xray-proxy
-config.json_temp
-pr-description.md
-REVIEW.md
-traffic
-id_gh.pub
-corvex_macos.zip
-xray_awg_perf.txt
-PLAN.md
+/tmp

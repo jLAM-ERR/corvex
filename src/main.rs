@@ -244,6 +244,17 @@ fn start_xray_engine(
     main_algorithm(config, plat, static_port)
 }
 
+/// Warning line for a subscription that could not be downloaded.
+///
+/// Renders the whole anyhow cause chain (`{:#}`), not just the outermost context.
+/// `download_subscription` wraps every failure as "failed to fetch <url>", so a
+/// plain `{}` prints that and nothing else — the caller never learns whether the
+/// fetch died at DNS, at TCP connect, or in the TLS handshake, which is the only
+/// part worth reading.
+fn subscription_failure_message(url: &str, err: &anyhow::Error) -> String {
+    format!("subscription {url} failed: {err:#}")
+}
+
 fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
     // 1. Load corvex.json
     let s = settings::load(&config.corvex_settings)
@@ -313,7 +324,7 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
                     }
                 }
                 Err(e) => {
-                    warn!("subscription {} failed: {}", url, e);
+                    warn!("{}", subscription_failure_message(url, &e));
                     continue;
                 }
             }
@@ -1174,6 +1185,27 @@ mod tests {
     // (see the plan's Post-Completion section). Every `xray::stop` error
     // takes the same early-return path in `cmd_stop` as the NotRunning case
     // below.
+
+    /// A subscription failure must surface the root cause, not just the
+    /// "failed to fetch <url>" context `download_subscription` wraps everything
+    /// in. Formatting the error with `{}` printed only that context, which told
+    /// the user nothing about *why* the fetch failed.
+    #[test]
+    fn test_subscription_failure_message_includes_whole_cause_chain() {
+        let err = anyhow::anyhow!("dns error: no record found")
+            .context("failed to fetch https://panel.example/sub/abc");
+
+        let msg = super::subscription_failure_message("https://panel.example/sub/abc", &err);
+
+        assert!(
+            msg.contains("failed to fetch https://panel.example/sub/abc"),
+            "context must survive: {msg}"
+        );
+        assert!(
+            msg.contains("dns error: no record found"),
+            "root cause must be visible: {msg}"
+        );
+    }
 
     /// Regression test: a failed stop (here: xray not running) must not touch
     /// the system proxy at all — previously the proxy was disabled first.
