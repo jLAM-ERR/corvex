@@ -175,13 +175,45 @@ pub fn generate_conf(config: &AwgConfig) -> Result<String> {
 }
 
 /// Write the AWG .conf file to disk with restricted permissions (0o600 on unix).
+///
+/// The directory check runs before the write, not after: see
+/// [`ensure_conf_trusted`] for what it is for.
 pub fn write_conf(config: &AwgConfig, path: &Path) -> Result<()> {
     let content = generate_conf(config)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
+        crate::config::create_dir_restricted(parent)
             .with_context(|| format!("failed to create dir {}", parent.display()))?;
     }
+    ensure_conf_trusted(path)?;
     crate::config::write_restricted(path, &content)
+}
+
+/// Refuse to write, or to hand to `sudo`, a .conf whose directory chain
+/// somebody else can rearrange.
+///
+/// `write_restricted` protects the file: the descriptor it writes through is
+/// vetted, so the private key never lands anywhere another uid can read it.
+/// It cannot protect the *name*, and the name is what leaves this process —
+/// [`start_tunnel`] and [`stop_tunnel`] pass it to `sudo awg-quick`, which
+/// reads it as **root** and runs any `PreUp`/`PostUp`/`PreDown`/`PostDown`
+/// line in it as a root shell command. Anyone who can replace an entry on
+/// that chain between the write and the `sudo` therefore has a root shell,
+/// and no check made through a descriptor here can see it coming — exactly
+/// the gap [`crate::config::ensure_trusted_ancestry`] exists to close for the
+/// xray logs xray reopens by name. The `$XDG_CONFIG_HOME`-unset fallback puts
+/// this file under `/tmp`, which is where that matters most.
+///
+/// It is asked at all three handoffs rather than at the write alone, because
+/// `stop` runs against a file some earlier `start` wrote and the directory
+/// may have been widened since.
+fn ensure_conf_trusted(path: &Path) -> Result<()> {
+    crate::config::ensure_trusted_ancestry(path).with_context(|| {
+        format!(
+            "refusing to use {} as an AmneziaWG config: 'sudo awg-quick' runs its \
+             PostUp/PreUp lines as root",
+            path.display()
+        )
+    })
 }
 
 /// Message shown when awg-quick cannot be found on the system.
@@ -223,6 +255,7 @@ pub fn ensure_awg_installed() -> Result<()> {
 /// Start AWG tunnel. Requires root/sudo.
 pub fn start_tunnel(conf_path: &Path) -> Result<()> {
     debug!("starting AWG tunnel: {}", conf_path.display());
+    ensure_conf_trusted(conf_path)?;
     let output = Command::new("sudo")
         .args(["awg-quick", "up"])
         .arg(conf_path)
@@ -247,6 +280,7 @@ pub fn start_tunnel(conf_path: &Path) -> Result<()> {
 /// Stop AWG tunnel. Requires root/sudo.
 pub fn stop_tunnel(conf_path: &Path) -> Result<()> {
     debug!("stopping AWG tunnel: {}", conf_path.display());
+    ensure_conf_trusted(conf_path)?;
     let output = Command::new("sudo")
         .args(["awg-quick", "down"])
         .arg(conf_path)
@@ -452,7 +486,7 @@ mod tests {
 
     #[test]
     fn write_conf_creates_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let conf_path = dir.path().join("awg/corvex.conf");
 
         let config = AwgConfig {
@@ -480,6 +514,74 @@ mod tests {
         let content = std::fs::read_to_string(&conf_path).unwrap();
         assert!(content.contains("[Interface]"));
         assert!(content.contains("[Peer]"));
+    }
+
+    /// `sudo awg-quick` reads this file as root and runs its `PostUp` lines
+    /// as root, so a directory anyone can rearrange is refused *before* the
+    /// key is written into it - not left for a swap between the write and the
+    /// `sudo` to exploit.
+    #[cfg(unix)]
+    #[test]
+    fn write_conf_refuses_a_directory_anyone_can_rearrange() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::config::test_tempdir();
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let conf_path = shared.join("corvex-awg.conf");
+
+        let err = write_conf(&sample_config(), &conf_path)
+            .expect_err("a world-writable directory must be refused");
+
+        assert!(
+            err.to_string().contains("PostUp"),
+            "the message must say why root cares: {err}"
+        );
+        assert!(
+            !conf_path.exists(),
+            "the private key must not be written into it first"
+        );
+    }
+
+    /// The same refusal at the handoff itself, for a .conf an earlier `start`
+    /// wrote into a directory that has been widened since.
+    #[cfg(unix)]
+    #[test]
+    fn start_tunnel_refuses_a_directory_anyone_can_rearrange() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::config::test_tempdir();
+        let shared = dir.path().join("shared");
+        crate::config::create_dir_restricted(&shared).unwrap();
+        let conf_path = shared.join("corvex-awg.conf");
+        write_conf(&sample_config(), &conf_path).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        let err = start_tunnel(&conf_path).expect_err("sudo must not be reached");
+        assert!(err.to_string().contains("PostUp"), "{err}");
+
+        let err = stop_tunnel(&conf_path).expect_err("nor by the down path");
+        assert!(err.to_string().contains("PostUp"), "{err}");
+    }
+
+    fn sample_config() -> AwgConfig {
+        AwgConfig {
+            private_key: "pk".to_string(),
+            address: "10.0.0.1/32".to_string(),
+            dns: "8.8.8.8".to_string(),
+            public_key: "spk".to_string(),
+            endpoint: "h:443".to_string(),
+            allowed_ips: "0.0.0.0/0".to_string(),
+            preshared_key: "psk".to_string(),
+            jc: "1".to_string(),
+            jmin: "2".to_string(),
+            jmax: "3".to_string(),
+            s1: "4".to_string(),
+            s2: "5".to_string(),
+            h1: "6".to_string(),
+            h2: "7".to_string(),
+            h3: "8".to_string(),
+            h4: "9".to_string(),
+        }
     }
 
     #[test]

@@ -752,10 +752,17 @@ pub struct XrayLogConfig {
 
 impl Default for XrayLogConfig {
     fn default() -> Self {
-        let base = crate::config::state_dir().join("xray");
+        // From `config`, not spelled out again here: these two paths are
+        // corvex's own picks, and `config::is_corvex_chosen_xray_log` decides
+        // from them whether the preflight opens them strictly or follows a
+        // symlink at them. Two spellings of one path is how that went wrong.
         let (access, error) = (
-            base.join("access.log").to_string_lossy().to_string(),
-            base.join("error.log").to_string_lossy().to_string(),
+            crate::config::default_xray_access_log()
+                .to_string_lossy()
+                .to_string(),
+            crate::config::default_xray_error_log()
+                .to_string_lossy()
+                .to_string(),
         );
 
         Self {

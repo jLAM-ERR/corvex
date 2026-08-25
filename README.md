@@ -38,7 +38,7 @@ The script needs `curl` and `tar`; `unzip` is required only when it has to insta
 
 ### Installation from source
 
-Requires a stable [Rust toolchain](https://rustup.rs):
+Requires [rustup](https://rustup.rs). The toolchain is pinned in `rust-toolchain.toml`, so rustup installs that exact version — and the cross-compilation targets the release job builds — on your first `cargo` command in the checkout. A cargo installed outside rustup ignores the pin and may format and lint differently from CI:
 
 ```bash
 cargo build --release
@@ -85,6 +85,7 @@ Then:
 corvex start    # Load config, resolve server, start xray, enable system proxy
 corvex stop     # Stop xray, then disable system proxy
 corvex status   # Show engine type, process state, ports, proxy settings
+corvex dns      # Diagnose the system resolvers when name resolution misbehaves
 ```
 
 ## Commands
@@ -96,8 +97,9 @@ corvex status   # Show engine type, process state, ports, proxy settings
 | `restart` | Same flow as `start`: stops the running xray (and stale AWG tunnel), re-reads config, re-resolves server, re-applies system proxy |
 | `reload` | Validate config and send SIGHUP to xray |
 | `status` | Show engine type (xray / AWG+xray), process state, ports, proxy settings |
-| `logs` | Show last 20 log lines |
-| `logs -f` | Follow log output |
+| `dns` | Diagnose the system resolvers: route, interface, next-hop reachability, live UDP/53 probe |
+| `logs` | Show last 20 lines of the xray log |
+| `logs -f` | Follow the xray log |
 
 A failed `stop` (e.g. xray owned by another user) leaves the system proxy untouched; if disabling the proxy fails after xray stopped, the AWG tunnel is likewise left running.
 
@@ -107,7 +109,63 @@ A failed `stop` (e.g. xray owned by another user) leaves the system proxy untouc
 |------|-------------|
 | `--settings <path>` | Use a custom `corvex.json` path (overrides default) |
 
-Environment: `CORVEX_DEBUG=1` enables debug logging to stderr.
+Environment: `CORVEX_DEBUG=1` enables debug logging (see [Logging](#logging)).
+
+## Logging
+
+corvex writes its own log to `$XDG_STATE_HOME/corvex/corvex.log` (`%LOCALAPPDATA%\corvex\corvex.log` on Windows). Every *log* line goes to both the terminal and that file. Command output printed on stdout — the `corvex status` and `corvex dns` reports, and the green `xray started` / `proxy enabled` confirmations — is terminal-only and is not recorded. On macOS and Linux the file is created with mode `0600` — owner read/write only — and a file already at that path with a looser mode is tightened to `0600` on the next run. Windows has no mode bits; there the file inherits the per-user ACL of `%LOCALAPPDATA%`.
+
+The location is not configurable. A `log.corvex.path` key in `corvex.json` parses without complaint but is ignored; corvex always writes the path above.
+
+The default level is `info`, so a `start` narrates what it is doing and how long each phase took. This matters when a start is slow or fails: it used to print nothing at all between "invoked" and "failed", which made a stalled subscription download and a stalled server sweep look identical.
+
+```
+2026-08-24T09:12:03Z [INFO] settings loaded: /home/you/.config/corvex/corvex.json (2ms)
+2026-08-24T09:12:03Z [INFO] subscription https://panel.example/<redacted>: downloading
+2026-08-24T09:12:04Z [INFO] subscription downloaded: 4821 bytes from https://panel.example/<redacted> (612ms)
+2026-08-24T09:12:04Z [INFO] subscription candidates: 12 json entries, 0 xray uris, 0 vpn uris (615ms)
+2026-08-24T09:12:04Z [INFO] candidate 1/12 example.net:443: testing
+2026-08-24T09:12:07Z [INFO] candidate 1/12 example.net:443: alive (284.31ms)
+2026-08-24T09:12:07Z [INFO] engine selected: xray (json subscription entry)
+2026-08-24T09:12:08Z [INFO] xray started: PID 40321 (1.03s)
+2026-08-24T09:12:09Z [INFO] proxy applied: Wi-Fi -> 127.0.0.1:21080 (1.02s)
+2026-08-24T09:12:09Z [INFO] start complete (6.29s)
+```
+
+**Subscription URLs are never written in full.** Panels put the access token in the URL path (`https://panel.example/sub/<TOKEN>`), so every line that mentions a subscription — success, progress, and failure alike — keeps the scheme and host and replaces userinfo, path, query and fragment with `<redacted>`. A URL corvex cannot parse is rendered as `<redacted>` alone rather than echoed back.
+
+**Levels.** `CORVEX_DEBUG=1`, or `"log": { "corvex": { "debug": true } }` in `corvex.json`, raises the level to `debug`. `RUST_LOG` overrides both. Note that `RUST_LOG=warn corvex start` is now *quieter* than the old default, not equal to it: the server-testing progress lines used to print unconditionally and now go through the log level like everything else.
+
+**Rotation.** Once `corvex.log` passes 5 MB it is renamed to `corvex.log.1`, replacing any previous `.1`. One past generation is kept; there is no compression and no dated archive.
+
+**If the log file cannot be written** — an unwritable state directory, a full disk — corvex reports it once on the terminal and carries on with terminal output only. Logging never aborts a command.
+
+Note that `corvex logs` tails the **xray** log, not this one. Read `corvex.log` directly (`tail -f ~/.local/state/corvex/corvex.log`).
+
+## Diagnosing DNS problems (`corvex dns`)
+
+`corvex dns` walks the whole path to each of your system resolvers and reports where it breaks:
+
+```
+$ corvex dns
+Settings: /home/you/.config/corvex/corvex.json
+
+Resolver: domain corp.example.com on en0
+  10.10.20.53  via 10.10.99.1 on en0  UNREACHABLE NEXT HOP: gateway 10.10.99.1 is outside en0's subnet, probe skipped
+  10.10.20.54  via 192.0.2.1 on en0  answered in 34ms
+
+Resolver: global (no domain scope) on en0
+  192.0.2.1  directly connected on en0  answered in 4ms
+  fe80::1%en0  not diagnosed: the route check and the probe are IPv4-only
+```
+
+For every nameserver of every resolver it reads the route (`route -n get` on macOS, `ip route get` on Linux), finds the interface that route names, and checks whether the gateway is actually **on-link** — inside that interface's own subnet. A gateway outside it can never be ARP-resolved, so every query to that nameserver dies with `sendto: Network is unreachable` even though the route, the interface and the nameserver each look healthy in isolation. That is the failure this command exists to catch; a stale per-host route left behind by a VPN client is the usual cause. Only a nameserver whose next hop is on-link is probed with a real UDP/53 query (2 s timeout).
+
+**The check is IPv4-only, and it never invents a fault.** Whenever the arithmetic cannot be done, the next hop is reported reachable and the probe runs anyway: an interface whose IPv4 address cannot be read, and a point-to-point tunnel (`utun`, `wg`), whose `/32` has no subnet for a peer gateway to be outside of. A `/32` sitting *beside* a real subnet is a service alias rather than a tunnel, so it is skipped and the subnet still decides. An interface carrying several addresses is on-link if the gateway matches *any* of them. A nameserver that is not an IPv4 literal — including the `fe80::1%en0` a router advertising RDNSS puts in `scutil --dns` — is listed as `not diagnosed` rather than walked, because neither `route get` nor the probe socket accepts a zone id.
+
+The report is read-only and exits 0 even when it finds problems — a resolver that does not answer prints `no answer: <cause>`, one whose route cannot be read prints `no route: <cause>`, and the walk continues either way, so one dead half of a failover pair never hides the working half. A system that reports no resolvers at all prints `No resolvers to diagnose were reported by the system.` Every probe asks for `example.com`, reserved for documentation by RFC 2606, so a diagnostic never puts your own zone on the wire. **corvex never changes routes.** Fixing a stale route is a job for the VPN client that installed it (typically by dropping a redundant per-host `route` directive from the profile when a covering network route already exists).
+
+**Platform support.** On macOS the listing comes from `scutil --dns` and covers every resolver the system reports — the default one with no domain scope included, and every nameserver of a failover pair, not just the first of each. On Linux it comes from `resolvectl status` and is currently narrower: one nameserver per search domain, no interface name, and no global resolver, because the `resolvectl` parser still returns a domain-to-nameserver map. The next-hop check and the probe work fully on both. In all, `corvex dns` shells out to `scutil --dns`, `route -n get` and `ifconfig` on macOS, and to `resolvectl status`, `ip route get` and `ip addr show` on Linux — all read-only. A Linux box without systemd-resolved has no `resolvectl`, and `corvex dns` reports that failure instead of a report. On Windows `corvex dns` reports that it is not implemented; every other command is unaffected.
 
 ## Configuration
 
@@ -151,7 +209,7 @@ All settings live in a single JSONC file (comments allowed) at `$XDG_CONFIG_HOME
       // e.g. "/var/log/xray/access.log" (needs the directory to be
       // user-writable)
     },
-    "corvex": { "debug": false }
+    "corvex": { "debug": false }  // "path" is parsed but ignored: the log location is fixed
   }
 }
 ```
@@ -216,13 +274,13 @@ AmneziaWG is an optional alternative engine and corvex never installs it. **If y
 | `$XDG_CONFIG_HOME/corvex/corvex.json` | Settings file (default `~/.config/corvex/corvex.json`) |
 | `$XDG_CONFIG_HOME/xray/config.json` | Xray daemon config (auto-generated) |
 | `$XDG_CONFIG_HOME/xray/xray.pid` | PID file for running xray process |
-| `$XDG_STATE_HOME/corvex/corvex.log` | Corvex log (default `~/.local/state/corvex/corvex.log`) |
+| `$XDG_STATE_HOME/corvex/corvex.log` | Corvex log (default `~/.local/state/corvex/corvex.log`), mode `0600` on unix, rotated to `corvex.log.1` past 5 MB — see [Logging](#logging) |
 | `$XDG_STATE_HOME/xray/{access,error}.log` | Xray logs (default; `%LOCALAPPDATA%\xray\` on Windows); override via `log.xray` in corvex.json |
 
 ## How it works
 
 1. **Load config**: reads `corvex.json` settings
-2. **Resolve server**: uses the `uri` directly, or downloads subscriptions, decodes base64, filters supported protocols, and health-checks candidates
+2. **Resolve server**: uses the `uri` directly, or downloads subscriptions, decodes base64, filters supported protocols, and health-checks candidates. Subscription downloads deliberately ignore `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` — the fetch is what brings the tunnel up, so sending it through the tunnel (which a shell exporting `HTTP_PROXY=http://localhost:<proxy.port>` would do) deadlocks `start` against itself
 3. **Engine dispatch**: detects engine mode from URI scheme (`vpn://` → AWG, others → Xray)
 4. **Generate xray config**: creates xray `config.json` with proxy settings, routing rules, DNS, and corporate-dns routing rule (port 53)
 5. **Verify**: checks the xray binary is present (installed by install.sh); in AWG mode also checks `awg-quick`

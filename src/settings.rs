@@ -3,7 +3,7 @@ use json_comments::StripComments;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, Deserialize, Default)]
 pub struct CorvexSettings {
@@ -51,6 +51,12 @@ pub struct XrayLogSettings {
 
 #[derive(Debug, Deserialize)]
 pub struct CorvexLogSettings {
+    /// Accepted but not honoured: `init_logger` always writes
+    /// `Config::corvex_log`, so setting this changes nothing. Deleting it would
+    /// change nothing either — no struct here uses `deny_unknown_fields`, so
+    /// serde already ignores keys it does not know. It is kept only as the
+    /// reserved name a configurable log path would take, and documented as
+    /// inert in the README so a user who sets it is not left guessing.
     #[allow(dead_code)]
     pub path: Option<String>,
     pub debug: Option<bool>,
@@ -82,27 +88,14 @@ fn warn_on_leftover_direct_ru(buf: &str) {
     }
 }
 
-pub fn xdg_settings_path() -> PathBuf {
-    xdg_settings_path_inner(std::env::var("XDG_CONFIG_HOME").ok())
-}
-
-fn xdg_settings_path_inner(xdg_home: Option<String>) -> PathBuf {
-    if let Some(xdg) = xdg_home {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("corvex/corvex.json");
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".config/corvex/corvex.json")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
 
     fn write_temp(content: &str) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let path = dir.path().join("corvex.json");
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
@@ -272,24 +265,6 @@ mod tests {
         let s = load(&path).unwrap();
         assert_eq!(s.uri.as_deref(), Some("vless://x@y:1"));
         assert_eq!(s.subs_url.unwrap(), vec!["https://a.com"]);
-    }
-
-    #[test]
-    fn xdg_settings_path_uses_xdg_config_home() {
-        let path = xdg_settings_path_inner(Some("/custom/xdg".to_string()));
-        assert_eq!(path, PathBuf::from("/custom/xdg/corvex/corvex.json"));
-    }
-
-    #[test]
-    fn xdg_settings_path_falls_back_to_home() {
-        let path = xdg_settings_path_inner(None);
-        assert!(path.ends_with(".config/corvex/corvex.json"));
-    }
-
-    #[test]
-    fn xdg_settings_path_ignores_empty_xdg_config_home() {
-        let path = xdg_settings_path_inner(Some(String::new()));
-        assert!(path.ends_with(".config/corvex/corvex.json"));
     }
 
     #[test]

@@ -1,4 +1,6 @@
-use super::{Platform, ProxyInfo, ProxyStatus};
+use super::{NextHop, Platform, ProxyInfo, ProxyStatus};
+use crate::dns::ResolverEntry;
+use crate::netdiag::{parse_ip_addr_inets, parse_ip_route_get, InetAddr};
 use anyhow::{Context, Result};
 use log::debug;
 use std::collections::BTreeMap;
@@ -386,6 +388,77 @@ impl Platform for LinuxPlatform {
 
         Ok(discovered)
     }
+
+    fn list_system_resolvers(&self) -> Result<Vec<ResolverEntry>> {
+        debug!("running resolvectl status to list resolvers");
+        let output = Command::new("resolvectl")
+            .arg("status")
+            .output()
+            .context("Failed to run 'resolvectl status'")?;
+
+        if !output.status.success() {
+            anyhow::bail!("resolvectl status exited with status {}", output.status);
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        Ok(resolver_entries(&parse_resolvectl_status(&stdout)))
+    }
+
+    fn next_hop_status(&self, ip: &str) -> Result<NextHop> {
+        let output = Command::new("ip")
+            .args(["route", "get", ip])
+            .output()
+            .with_context(|| format!("Failed to run 'ip route get {ip}'"))?;
+        // Status is not checked: `ip` exits non-zero for an unreachable
+        // destination, and the parse below says the same thing more clearly.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let route = parse_ip_route_get(&stdout)
+            .with_context(|| format!("no route to {ip}: 'ip route get' named no device"))?;
+
+        debug!("resolving the next hop to {ip}");
+        let inets = interface_inets(&route.interface);
+        Ok(NextHop::from_route(route, &inets))
+    }
+}
+
+/// Every IPv4 address configured on `interface`, empty if none can be read.
+///
+/// Best-effort by design: `route_is_on_link` reports an interface it cannot
+/// read as on-link, because failing to read it is not evidence that the gateway
+/// is unreachable.
+fn interface_inets(interface: &str) -> Vec<InetAddr> {
+    let Ok(output) = Command::new("ip")
+        .args(["addr", "show", "dev", interface])
+        .output()
+        .map_err(|error| debug!("failed to run 'ip addr show dev {interface}': {error}"))
+    else {
+        return Vec::new();
+    };
+    let inets = parse_ip_addr_inets(&String::from_utf8_lossy(&output.stdout));
+    if inets.is_empty() {
+        debug!("no IPv4 address on {interface}; reachability cannot be judged");
+    }
+    inets
+}
+
+/// Lift the `parse_resolvectl_status` map into resolver entries.
+///
+/// **Lossy, and knowingly so.** That parser keeps a single nameserver per
+/// domain and no interface, so every entry here carries one nameserver and
+/// `interface: None`, and a global resolver — one systemd-resolved lists with no
+/// search domain — never appears at all. Fixing the parser to return every
+/// nameserver belongs to the `dns-parser-fixes` plan; until then `corvex dns`
+/// shows less on Linux than it does on macOS, rather than showing something
+/// invented.
+fn resolver_entries(mappings: &BTreeMap<String, String>) -> Vec<ResolverEntry> {
+    mappings
+        .iter()
+        .map(|(domain, nameserver)| ResolverEntry {
+            domain: Some(domain.clone()),
+            nameservers: vec![nameserver.clone()],
+            interface: None,
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -485,6 +558,33 @@ fn collect_domains(text: &str, dns: &Option<String>, result: &mut BTreeMap<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- resolver_entries ---
+
+    #[test]
+    fn resolver_entries_lifts_each_mapping_into_one_entry() {
+        let mappings = BTreeMap::from([
+            ("corp.example.com".to_string(), "10.10.20.53".to_string()),
+            (
+                "internal.example.com".to_string(),
+                "10.10.20.54".to_string(),
+            ),
+        ]);
+
+        let entries = resolver_entries(&mappings);
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].domain.as_deref(), Some("corp.example.com"));
+        assert_eq!(entries[0].nameservers, ["10.10.20.53"]);
+        // Lossy on purpose: resolvectl's interface is not carried through.
+        assert_eq!(entries[0].interface, None);
+        assert_eq!(entries[1].nameservers, ["10.10.20.54"]);
+    }
+
+    #[test]
+    fn resolver_entries_of_nothing_is_nothing() {
+        assert!(resolver_entries(&BTreeMap::new()).is_empty());
+    }
 
     // --- parse_default_interface ---
 

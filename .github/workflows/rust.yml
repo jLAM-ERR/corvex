@@ -24,6 +24,11 @@ permissions:
   contents: write
 
 env:
+  # Must match `channel` in rust-toolchain.toml and ARG RUST_VERSION in
+  # ralphex-rust.Dockerfile. dtolnay/rust-toolchain sets RUSTUP_TOOLCHAIN, which
+  # outranks rust-toolchain.toml in rustup's override order, so the toml alone
+  # never reaches a CI job — the version has to be named here too.
+  RUST_VERSION: "1.97.1"
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   BINARY_NAME: corvex
@@ -45,7 +50,10 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
 
       - name: Cache Cargo
         uses: actions/cache@v5
@@ -151,8 +159,10 @@ jobs:
           echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
           targets: x86_64-apple-darwin,aarch64-apple-darwin
 
       - name: Cache Cargo
@@ -239,8 +249,10 @@ jobs:
           echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl
 
       - name: Install musl-tools
@@ -320,7 +332,10 @@ jobs:
           echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: rustfmt, clippy
 
       - name: Cache Cargo
         uses: actions/cache@v5

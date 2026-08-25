@@ -1,6 +1,6 @@
 use crate::config::{self, Config};
 use anyhow::{Context, Result};
-use log::debug;
+use log::{debug, info};
 #[cfg(unix)]
 use nix::sys::signal::{self, Signal};
 #[cfg(unix)]
@@ -554,28 +554,49 @@ fn asset_dir_override(env_set: bool, both_dat_files_exist: bool) -> Option<&'sta
 /// this preflight exists to prevent.
 ///
 /// Existence is checked with `symlink_metadata`, not `Path::exists`: the
-/// latter follows symlinks, so a dangling PID symlink would read as "does
-/// not exist", the write-open below would then silently create the
-/// symlink's *target*, and the "newly created, clean it up" branch would
-/// delete the symlink itself instead of the file it had just created.
+/// latter follows symlinks, so a PID symlink would read as "does not exist"
+/// and the "newly created, clean it up" branch would delete the symlink
+/// itself instead of the file it had just created.
+///
+/// The writability probe is `config::open_write_restricted`, not a plain
+/// `OpenOptions`, and that is the difference between a preflight and a
+/// vulnerability. `xray.pid` sits in the xray config directory, which falls
+/// back to a world-writable `/tmp` path exactly as the log does (see
+/// `config::open_append_restricted`), and its path is not configurable, so
+/// nothing but corvex has any business creating it. A plain open follows a
+/// symlink planted there: the probe would create the *target*, and the
+/// post-spawn write below would then truncate it and write a PID into it —
+/// an arbitrary-file clobber with corvex's privileges, and worse if corvex
+/// is running as root.
 fn preflight_pid_file(path: &Path, xray_bin: &str) -> Result<()> {
     let existed_before = fs::symlink_metadata(path).is_ok();
 
-    if fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
-        .is_ok()
-    {
-        if !existed_before {
-            let _ = fs::remove_file(path);
+    // The refusal is bound, not reduced to `is_ok()`: `open_write_restricted`
+    // is where `config::ensure_trusted_ancestry` speaks, and its message is
+    // the only one that names the offending directory, its mode and the exact
+    // `chmod` that fixes it. Discarding it left every such failure reported as
+    // "sudo rm a file that does not exist".
+    let refusal = match crate::config::open_write_restricted(path) {
+        Ok(_) => {
+            if !existed_before {
+                let _ = fs::remove_file(path);
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
+        Err(e) => e,
+    };
 
     if !existed_before {
-        anyhow::bail!(pid_file_preflight_message(path));
+        anyhow::bail!(pid_file_unwritable_path_message(path, &refusal));
+    }
+
+    // Everything below treats what is at `path` as an ordinary file: it reads
+    // it, and on a dead PID removes it. A shape corvex never writes there is
+    // refused by name instead, rather than being read through (a symlink's
+    // target is someone else's file, and its contents are not a PID corvex
+    // wrote) or silently unlinked.
+    if let Some(shape) = unsupported_pid_file_shape(path) {
+        anyhow::bail!(pid_file_shape_message(path, shape));
     }
 
     match fs::read_to_string(path) {
@@ -584,7 +605,24 @@ fn preflight_pid_file(path: &Path, xray_bin: &str) -> Result<()> {
                 anyhow::bail!(pid_file_tracks_live_process_message(path));
             }
             if fs::remove_file(path).is_ok() {
-                return Ok(());
+                // Unlinking the entry only cures a refusal that was *about*
+                // the entry - the read-only file in a writable directory this
+                // branch was written for. `open_write_restricted` also refuses
+                // on a property of the directory *chain*
+                // (`config::ensure_trusted_ancestry`), which removing a file
+                // inside it does nothing about, and `write_pid_file` makes
+                // this very same open *after* `cmd.spawn()`. Returning `Ok`
+                // on a chain refusal would hand back a preflight that passed
+                // and a start that leaves xray running and untracked - the one
+                // outcome this function exists to prevent. So re-probe rather
+                // than assume, and report what the open actually said.
+                return match crate::config::open_write_restricted(path) {
+                    Ok(_) => {
+                        let _ = fs::remove_file(path);
+                        Ok(())
+                    }
+                    Err(e) => Err(anyhow::anyhow!(pid_file_unwritable_path_message(path, &e))),
+                };
             }
             anyhow::bail!(pid_file_preflight_message(path));
         }
@@ -616,6 +654,56 @@ fn pid_file_preflight_message(path: &Path) -> String {
     )
 }
 
+/// Message for a PID *path* that cannot be written for a reason removing the
+/// file would not cure: an untrusted ancestor, a read-only filesystem, an
+/// uncreatable parent. Carries the underlying error, because that is where the
+/// actionable part lives - `config::ensure_trusted_ancestry` names the
+/// offending directory, its mode and the exact `chmod`, and none of that
+/// reaches the user otherwise. Deliberately never suggests `sudo rm`: that is
+/// advice for a file in the way, and here either there is no file or removing
+/// it has already been shown to change nothing.
+fn pid_file_unwritable_path_message(path: &Path, err: &std::io::Error) -> String {
+    format!(
+        "PID file {} cannot be written ({err}), and removing it would not help - the obstacle is \
+         the path, not the file. corvex will not start an xray it cannot track.",
+        path.display()
+    )
+}
+
+/// What is at `path`, when it is not the plain file corvex writes there.
+/// `None` means an ordinary regular file, which is the only shape the read /
+/// remove path below is written for. A dangling symlink counts as a symlink,
+/// not as "missing", which is the whole reason this reads
+/// `symlink_metadata`.
+///
+/// Advisory, not the enforcement: `open_write_restricted` already refused
+/// this descriptor, and a path checked here and swapped a microsecond later
+/// is refused there again on the next open. What this adds is a message that
+/// names what is in the way.
+fn unsupported_pid_file_shape(path: &Path) -> Option<&'static str> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if metadata.file_type().is_symlink() {
+        return Some("a symbolic link");
+    }
+    if !metadata.is_file() {
+        return Some("not a regular file");
+    }
+    None
+}
+
+/// Message for a PID path holding something other than the regular file
+/// corvex writes there. Never suggests `rm` on its own: in the world-writable
+/// `/tmp` fallback the thing in the way was planted by someone else, and the
+/// point is that corvex neither follows it nor quietly deletes it.
+fn pid_file_shape_message(path: &Path, shape: &str) -> String {
+    format!(
+        "PID file {} is {shape}, and corvex will not write a PID through it. Check what put it \
+         there, then remove it with: rm -- {}",
+        path.display(),
+        config::shell_quote(&path.display().to_string())
+    )
+}
+
 /// Message for a PID file corvex cannot read at all, so it cannot rule out
 /// that it names a live xray. Deliberately never suggests removing it
 /// directly - only a manual check first, since deleting it on a guess could
@@ -640,6 +728,16 @@ fn pid_file_tracks_live_process_message(path: &Path) -> String {
          remove since that would orphan it. Stop that xray first, then retry.",
         path.display()
     )
+}
+
+/// Write `pid` to the PID file through the same vetted, no-follow open the
+/// preflight probes with. `set_len` rather than an `OpenOptions::truncate`
+/// for the reason `config::write_restricted` gives: truncation happens inside
+/// `open`, before anything has looked at what was opened.
+fn write_pid_file(path: &Path, pid: i32) -> std::io::Result<()> {
+    let mut file = crate::config::open_write_restricted(path)?;
+    file.set_len(0)?;
+    std::io::Write::write_all(&mut file, pid.to_string().as_bytes())
 }
 
 /// Error text for the post-spawn PID-file write. By this point xray is
@@ -686,27 +784,29 @@ pub fn start(config: &Config) -> Result<i32> {
     // yet, the preflight's create-if-missing open would otherwise fail with
     // NotFound and refuse a start that used to work fine.
     if let Some(pid_dir) = config.xray_pid_file.parent() {
-        let _ = fs::create_dir_all(pid_dir);
+        let _ = crate::config::create_dir_restricted(pid_dir);
     }
     preflight_pid_file(&config.xray_pid_file, &config.xray_bin)?;
 
     if let Some(log_dir) = config.xray_log.parent() {
-        let _ = fs::create_dir_all(log_dir);
+        let _ = crate::config::create_dir_restricted(log_dir);
     }
 
     let xray_bin =
         resolve_binary(&config.xray_bin).unwrap_or_else(|| PathBuf::from(&config.xray_bin));
 
-    debug!(
+    info!(
         "spawning xray via {} with config {}",
         xray_bin.display(),
         config.xray_config.display()
     );
-    let log_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&config.xray_log)
-        .context("Failed to open log file")?;
+    // `config::open_xray_log`, not a bare `OpenOptions`: at corvex's own
+    // default path that open is `O_NOFOLLOW`ed and shape-checked like every
+    // other file corvex owns, and at a user-configured one it is at least
+    // non-blocking, so a FIFO with no reader cannot wedge the spawn instead
+    // of failing it.
+    let log_file =
+        crate::config::open_xray_log(&config.xray_log).context("Failed to open log file")?;
     let log_stderr = log_file
         .try_clone()
         .context("Failed to clone log file handle")?;
@@ -737,7 +837,12 @@ pub fn start(config: &Config) -> Result<i32> {
         .map_err(|_| anyhow::anyhow!(pid_out_of_range_message(native_pid)))?;
     debug!("xray spawned with PID {}", pid);
 
-    fs::write(&config.xray_pid_file, pid.to_string()).map_err(|e| {
+    // The same vetted open as the preflight rather than `fs::write`, which
+    // follows a symlink at the path and truncates whatever it points at. The
+    // window between the two opens is the TOCTOU this write's error message
+    // has always been honest about; what changes is that losing that race no
+    // longer hands an attacker a write to a file of their choosing.
+    write_pid_file(&config.xray_pid_file, pid).map_err(|e| {
         anyhow::anyhow!(pid_file_write_failed_message(
             pid,
             &config.xray_pid_file,
@@ -749,6 +854,7 @@ pub fn start(config: &Config) -> Result<i32> {
     thread::sleep(Duration::from_secs(1));
 
     if is_running(config).is_some() {
+        info!("xray still up 1s after spawn (PID {pid})");
         Ok(pid)
     } else {
         let _ = fs::remove_file(&config.xray_pid_file);
@@ -1295,6 +1401,64 @@ mod tests {
     }
 
     #[test]
+    fn test_pid_file_unwritable_path_message_carries_the_error_and_never_says_rm() {
+        let err = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "/Users/alice is writable by other users (mode 0775), so anything corvex leaves in \
+             it can be swapped; fix with: chmod go-w '/Users/alice'",
+        );
+        let msg =
+            pid_file_unwritable_path_message(Path::new("/Users/alice/.config/xray/xray.pid"), &err);
+
+        assert!(msg.contains("/Users/alice/.config/xray/xray.pid"));
+        // The actionable part of the refusal is inside the error, so it has to
+        // survive into the message the user sees.
+        assert!(msg.contains("chmod go-w '/Users/alice'"), "{msg}");
+        assert!(
+            !msg.contains("rm"),
+            "removing the file cannot fix a path problem: {msg}"
+        );
+    }
+
+    /// A directory the ancestry walk refuses is not cured by unlinking the
+    /// file inside it - and `write_pid_file` makes the same
+    /// `open_write_restricted` call *after* xray has been spawned. So the
+    /// preflight has to fail here rather than pass on a removal that changed
+    /// nothing, otherwise `start` reaches the spawn and orphans xray, which is
+    /// exactly what the preflight exists to prevent.
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_pid_file_rejects_an_untrusted_dir_it_can_still_unlink_in() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = crate::config::test_tempdir();
+        let path = dir.path().join("xray.pid");
+        fs::write(&path, definitely_dead_pid().to_string()).unwrap();
+        // World-writable and not sticky, which `untrusted_ancestor_rejection`
+        // refuses - while the file inside stays perfectly removable, so the
+        // read / remove branch runs to completion and would have returned
+        // `Ok`.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+
+        let result = preflight_pid_file(&path, "xray");
+
+        // Restore before asserting, so a failure still leaves a removable dir.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let err =
+            result.expect_err("an untrusted PID directory must fail the preflight, not pass it");
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("cannot be written"),
+            "the refusal must name the path problem: {rendered}"
+        );
+        assert!(
+            rendered.contains("chmod go-w"),
+            "the ancestry advice must reach the user: {rendered}"
+        );
+    }
+
+    #[test]
     fn test_pid_file_write_failed_message_names_pid_and_sudo_kill() {
         let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let msg = pid_file_write_failed_message(
@@ -1370,7 +1534,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_preflight_pid_file_accepts_readonly_file_in_writable_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let path = dir.path().join("xray.pid");
         fs::write(&path, definitely_dead_pid().to_string()).unwrap();
         let mut perms = fs::metadata(&path).unwrap().permissions();
@@ -1392,7 +1556,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_preflight_pid_file_rejects_neither_writable_nor_removable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let sub = dir.path().join("pid_dir");
         fs::create_dir_all(&sub).unwrap();
         let path = sub.join("xray.pid");
@@ -1424,7 +1588,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_preflight_pid_file_rejects_unreadable_file_without_deleting_it() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let path = dir.path().join("xray.pid");
         fs::write(&path, "12345").unwrap();
         let mut perms = fs::metadata(&path).unwrap().permissions();
@@ -1445,33 +1609,149 @@ mod tests {
         );
     }
 
-    /// A dangling PID symlink must be accepted (the write-open follows it and
-    /// creates the target) without the symlink itself being deleted as if it
-    /// were a probe artifact this check created.
+    /// A symlink at the PID path is refused, and neither followed nor
+    /// deleted. It used to be accepted: the probe open followed it and
+    /// created the target, and the post-spawn write then truncated that
+    /// target and wrote a PID into it. The PID path is not configurable, so a
+    /// link there is nobody's legitimate setup - and in the world-writable
+    /// `/tmp` fallback it is an arbitrary-file clobber someone else planted.
+    ///
+    /// Not deleting it matters as much as not following it: corvex refusing
+    /// to write is a start that fails loudly, while corvex unlinking whatever
+    /// it finds would make the plant a way to get files removed too.
     #[test]
     #[cfg(unix)]
-    fn test_preflight_pid_file_accepts_dangling_symlink_without_deleting_it() {
-        let dir = tempfile::tempdir().unwrap();
+    fn test_preflight_pid_file_refuses_a_dangling_symlink_without_creating_its_target() {
+        let dir = crate::config::test_tempdir();
         let target = dir.path().join("nonexistent-target.pid");
         let link = dir.path().join("xray.pid");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let result = preflight_pid_file(&link, "xray");
+        let err = preflight_pid_file(&link, "xray")
+            .expect_err("a symlink at the PID path must be refused");
 
         assert!(
-            result.is_ok(),
-            "a dangling symlink into a writable directory must be accepted: {result:?}"
+            err.to_string().contains("is a symbolic link"),
+            "the message must name what is in the way: {err}"
+        );
+        assert!(
+            !target.exists(),
+            "the probe must not create the symlink's target"
         );
         assert!(
             fs::symlink_metadata(&link).is_ok(),
-            "the symlink itself must not be deleted by the probe cleanup"
+            "the symlink itself must not be deleted either"
         );
+    }
+
+    /// The same plant pointed at a file that exists: the shape corvex would
+    /// otherwise truncate. The victim keeps its contents, and its own mode -
+    /// nothing in this path resolves the link a second time.
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_pid_file_refuses_a_symlink_to_an_existing_file() {
+        let dir = crate::config::test_tempdir();
+        let victim = dir.path().join("crontab");
+        let link = dir.path().join("xray.pid");
+        fs::write(&victim, "not corvex's\n").unwrap();
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        preflight_pid_file(&link, "xray").expect_err("a symlinked PID path must be refused");
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "not corvex's\n",
+            "the symlink target must be left exactly as it was"
+        );
+    }
+
+    /// A FIFO at the PID path: the other shape the same world-writable
+    /// directory admits. `O_NONBLOCK` is what keeps the probe open from
+    /// blocking forever on a reader that never comes - a regression here does
+    /// not fail the suite, it hangs it, hence the bounded join.
+    #[test]
+    #[cfg(unix)]
+    fn test_preflight_pid_file_refuses_a_readerless_fifo_without_blocking() {
+        let dir = crate::config::test_tempdir();
+        let path = dir.path().join("xray.pid");
+        crate::config::make_fifo(&path);
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let probe = path.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(preflight_pid_file(&probe, "xray").map_err(|e| e.to_string()));
+        });
+
+        let err = receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the preflight must return, not block waiting for a reader")
+            .expect_err("a FIFO at the PID path must be refused");
+        assert!(
+            err.contains("not a regular file"),
+            "the message must name what is in the way: {err}"
+        );
+    }
+
+    /// The post-spawn write goes through the same no-follow open as the
+    /// probe, so losing the race between them is a failed write rather than a
+    /// write to someone else's file.
+    #[test]
+    #[cfg(unix)]
+    fn test_write_pid_file_refuses_a_symlink() {
+        let dir = crate::config::test_tempdir();
+        let victim = dir.path().join("authorized_keys");
+        let link = dir.path().join("xray.pid");
+        fs::write(&victim, "ssh-ed25519 AAAA...\n").unwrap();
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = write_pid_file(&link, 4242).expect_err("a symlinked PID path must be refused");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(nix::libc::ELOOP),
+            "expected ELOOP from O_NOFOLLOW, got {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "ssh-ed25519 AAAA...\n",
+            "the symlink target must be neither truncated nor written to"
+        );
+    }
+
+    /// The ordinary path still works end to end: the PID lands in the file,
+    /// at 0600, ready for `is_running` to read back.
+    #[test]
+    #[cfg(unix)]
+    fn test_write_pid_file_writes_the_pid_at_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::config::test_tempdir();
+        let path = dir.path().join("xray.pid");
+
+        write_pid_file(&path, 4242).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "4242");
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+    }
+
+    /// A shorter PID written over a longer one must not leave the tail of the
+    /// old one behind: `is_running` would parse `123` out of `12345` and
+    /// signal a process corvex never started.
+    #[test]
+    #[cfg(unix)]
+    fn test_write_pid_file_truncates_a_longer_previous_pid() {
+        let dir = crate::config::test_tempdir();
+        let path = dir.path().join("xray.pid");
+
+        write_pid_file(&path, 123456).unwrap();
+        write_pid_file(&path, 42).unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "42");
     }
 
     #[test]
     #[cfg(unix)]
     fn test_preflight_pid_file_accepts_normal_writable_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let path = dir.path().join("xray.pid");
         fs::write(&path, "999").unwrap();
 
@@ -1481,7 +1761,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_preflight_pid_file_accepts_nonexistent_path_in_writable_dir() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let path = dir.path().join("xray.pid");
 
         preflight_pid_file(&path, "xray")
@@ -1563,7 +1843,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_start_returns_before_spawn_when_pid_file_preflight_fails() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let base = dir.path();
 
         // Name kept under 15 characters: on Linux `ps -o comm=` reads
@@ -1628,7 +1908,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn test_start_succeeds_when_pid_directory_does_not_exist_yet() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let base = dir.path();
 
         // Under 15 characters - see the note in the ordering test above.

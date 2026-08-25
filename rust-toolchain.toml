@@ -1,0 +1,29 @@
+# Pins the toolchain for this repo so the dev machine, the ralphex container
+# (ralphex-rust.Dockerfile) and CI all compile with the same rustc and format
+# with the same rustfmt. Without this, Alpine's packaged rustfmt disagreed with
+# the Mac's and `cargo fmt --check` passed or failed depending on where it ran.
+#
+# This file governs the dev machine only. rustup's override order puts
+# `RUSTUP_TOOLCHAIN` above a `rust-toolchain.toml`, and both CI and the
+# container set a toolchain by that route — `dtolnay/rust-toolchain` exports the
+# variable, and the image installs one version and no other. So the version
+# lives in three places by necessity, and a bump has to touch all three:
+#
+#   1. `channel` below
+#   2. `RUST_VERSION` in .github/workflows/rust.yml (one env, four jobs)
+#   3. `ARG RUST_VERSION` in ralphex-rust.Dockerfile
+#
+# `targets` is likewise local-only: the release jobs cross-compile and get their
+# targets from the `targets:` input to that action, not from here. Listing them
+# is what lets a `cargo build --target …` reproduce a release build on the dev
+# machine. Drop a target here only after dropping it from that workflow.
+
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+targets = [
+	"aarch64-apple-darwin",
+	"x86_64-apple-darwin",
+	"x86_64-unknown-linux-musl",
+]

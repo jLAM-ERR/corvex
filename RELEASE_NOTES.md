@@ -1,3 +1,112 @@
+# Corvex v0.7.0 Release Notes
+
+`corvex start` works again on machines whose shell exports a proxy, it now writes a real log of what it did, and a new `corvex dns` command diagnoses the network path to your resolvers.
+
+## Security
+
+### Subscription tokens were written to the log at the default level
+
+When a subscription failed to download, the warning printed the subscription URL in full:
+
+```
+[WARN] subscription https://panel.example/sub/9f3c…/ failed: failed to fetch …
+```
+
+Subscription panels put the access token in the URL path, so that line published a credential — at `warn`, which was the default level, so it needed no debugging flag to appear. Anyone who pasted a failing `corvex start` into a bug report or a chat message handed over their subscription along with it.
+
+corvex now reduces every subscription URL it mentions to scheme and host, replacing the rest with a marker:
+
+```
+[WARN] subscription https://panel.example/<redacted> failed: failed to fetch https://panel.example/<redacted>: dns error: no record found
+```
+
+This applies to every path that names a subscription — progress lines, success lines and errors alike — and a URL corvex cannot parse is rendered as `<redacted>` alone rather than echoed back. Two different subscriptions are still told apart by their host, which is all a diagnostic line needs.
+
+**If you have shared corvex output before upgrading, treat the token in it as exposed and rotate it with your panel.** Because the leak predates this release, it can also be sitting in your shell scrollback or terminal logs.
+
+## Fixes
+
+### `corvex start` deadlocked against its own proxy
+
+If your shell exported `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` pointing at corvex's own port — a very common setup, since that is the port corvex configures — then `corvex start` tried to download your subscription *through the tunnel it was in the middle of starting*. Nothing was listening yet, so the fetch sat until it timed out and the start died with:
+
+```
+timeout: global
+Error: no supported proxy servers found in subscriptions
+```
+
+The confusing part was that it did not always fail. A leftover xray from a previous session happened to serve the request, so `corvex restart` looked fine while `corvex stop` followed by `corvex start` did not. It also explained a second symptom that looked unrelated: with the start aborting at the subscription step, it never reached the point of enabling the system proxy, so the macOS Proxy pane showed every switch off.
+
+Subscription downloads now ignore the environment's proxy settings entirely. The fetch is what brings the tunnel up, so it must never travel through it. Nothing else about downloads changed — the same timeout, the same body cap, the same headers.
+
+If you genuinely need an upstream proxy for subscription downloads, say so in an issue; it would be an explicit setting rather than a silent read of the environment.
+
+### `corvex.log` was never actually written
+
+corvex worked out where its log file should live and created the directory for it, and then never opened it. The file simply did not exist. On top of that, every progress line was logged at `debug` while the default level was `warn`, so a successful start printed nothing and a slow one printed nothing either — a start stuck downloading a subscription and a start stuck testing servers looked exactly alike.
+
+Both halves are fixed:
+
+- corvex now writes `$XDG_STATE_HOME/corvex/corvex.log` (`%LOCALAPPDATA%\corvex\corvex.log` on Windows), appending to it and mirroring every log line to the terminal (command output on stdout — `status`, `dns`, the green start confirmations — stays terminal-only). The file is created with mode `0600` — owner-only — and a file already at that path with a looser mode is tightened on the next run. Past 5 MB it is rotated to `corvex.log.1`.
+- The default level is now `info`, and each phase of a start reports what it did and how long it took:
+
+```
+2026-08-24T09:12:04Z [INFO] subscription downloaded: 4821 bytes from https://panel.example/<redacted> (612ms)
+2026-08-24T09:12:07Z [INFO] engine selected: xray (json subscription entry)
+2026-08-24T09:12:08Z [INFO] xray started: PID 40321 (1.03s)
+2026-08-24T09:12:09Z [INFO] proxy applied: Wi-Fi -> 127.0.0.1:21080 (1.02s)
+2026-08-24T09:12:09Z [INFO] start complete (6.29s)
+```
+
+If the log file cannot be opened or written, corvex says so once and carries on with terminal output only — logging never aborts a command. `RUST_LOG=warn` turns the narration off; note that it is now *quieter* than the old default, because the server-testing progress lines used to bypass the log level and now go through it.
+
+Note that `corvex logs` still tails the **xray** log, not this one; read `corvex.log` directly.
+
+## New
+
+### `corvex dns` — diagnose the path to your resolvers
+
+```
+$ corvex dns
+Settings: /home/you/.config/corvex/corvex.json
+
+Resolver: domain corp.example.com on en0
+  10.10.20.53  via 10.10.99.1 on en0  UNREACHABLE NEXT HOP: gateway 10.10.99.1 is outside en0's subnet, probe skipped
+  10.10.20.54  via 192.0.2.1 on en0  answered in 34ms
+
+Resolver: global (no domain scope) on en0
+  192.0.2.1  directly connected on en0  answered in 4ms
+  fe80::1%en0  not diagnosed: the route check and the probe are IPv4-only
+```
+
+For each nameserver the system is configured to use, `corvex dns` reads the route to it, finds the interface that route names, checks whether the gateway is on that interface's subnet, and — if it is — sends a real DNS query and times the answer.
+
+The on-link check is the point of the command. It comes from a real incident: a stale VPN host route pointed two corporate nameservers at a gateway that was not on the wire for the interface the route named, so ARP never resolved and every query died with `sendto: Network is unreachable`. No firewall rule was involved, which is exactly why it took so long to find — the route existed, the interface was up, the nameservers were correct, and each layer looked healthy on its own.
+
+A few things worth knowing:
+
+- It is entirely read-only, and exits successfully even when it finds a problem. A resolver that does not answer is reported as `no answer: <cause>`, one whose route cannot be read as `no route: <cause>`, and the walk continues either way, so the working half of a failover pair is never hidden behind the broken half.
+- The check is IPv4-only and never invents a fault: when the subnet arithmetic cannot be done — an unreadable interface address, or an interface whose addresses are all `/32`, as a point-to-point `utun`/`wg` is — the next hop is called reachable and the probe runs anyway. A `/32` alongside a real subnet does not count: the subnet still decides. A nameserver that is not an IPv4 literal, such as the `fe80::1%en0` an RDNSS-advertising router leaves in `scutil --dns`, is listed as `not diagnosed` rather than walked. Every probe asks for `example.com` (RFC 2606), never a name of yours.
+- **corvex does not change routes and will not.** A stale route is fixed at the VPN client that installed it — usually by dropping a redundant per-host `route` directive from the profile when a covering network route already exists.
+- The listing itself got better on macOS as part of this: corvex previously kept only the first nameserver of each resolver and ignored any resolver without a domain scope, which meant it could not see the second half of a failover pair or your machine's primary resolver at all.
+- On Linux the listing is narrower (one nameserver per search domain, no interface name, no global resolver) because the `resolvectl` side still has that limitation; the next-hop check and the probe work fully. On Windows the command reports that it is not implemented — every other command is unaffected.
+
+## Migration
+
+corvex.json needs no changes. Five behavior changes to be aware of:
+
+- corvex is more talkative on the terminal by default (`RUST_LOG=warn` silences it, and then some — the server-testing progress lines used to ignore the log level).
+- Subscription downloads no longer honour `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`.
+- **corvex now refuses to write into a directory other accounts can tamper with.** Everything it writes without asking you where — `config.json`, `xray.pid`, `corvex.log`, and `xray.log` with the default `access.log`/`error.log` beside it — is now written only after every directory from it up to `/` has been checked: each must be owned by you (or root) and grant write to nobody else. A chain that fails is a hard error naming the directory and the `chmod go-w` that fixes it.
+
+  Two exceptions keep the ordinary cases working. Sticky directories such as `/tmp` (1777) pass, because sticky is exactly what stops one user replacing another's entry. And the group write bit passes when the group is your own private group — `gid == euid`, no other members listed, and no POSIX ACL on the directory — which is the default shape of a Debian or Ubuntu home, where `pam_umask` gives you umask 002 precisely because your primary group holds you alone. On macOS, where every local account shares `staff`, a group-writable directory is still refused.
+
+  If you hit this, the fix is usually the `chmod go-w` in the message. When it is a directory you would rather not change, point `XDG_CONFIG_HOME` and `XDG_STATE_HOME` somewhere you own. A log directory you named yourself in `log.xray.*` is exempt — that path is yours to place, `/var/log/xray` included.
+- **Windows: the fallback location for corvex's files moved off `C:\Users\Public`.** This affects you only if `%APPDATA%` or `%LOCALAPPDATA%` is unset — where they are set, nothing moves. Previously an unset variable fell back to `C:\Users\Public\AppData\Roaming` (corvex.json, the generated xray config) and `C:\Users\Public\AppData\Local` (the logs). `Public` grants every account on the machine full access by inheritance, so the generated `config.json` — which carries your VLESS UUID or Trojan password — was readable by anyone who could log in, and the directories were plantable before corvex ever created them. The fallback is now `%USERPROFILE%\AppData\Roaming` and `%USERPROFILE%\AppData\Local`, which belong to you.
+
+  If you were relying on the old fallback, corvex will not find your existing `corvex.json` and will start from a default: move it from `C:\Users\Public\AppData\Roaming\corvex\corvex.json` to the same path under `%USERPROFILE%`, or set `%APPDATA%` and `%LOCALAPPDATA%` explicitly. With `%USERPROFILE%` unset as well, corvex now **refuses** to write rather than fall back to `%TEMP%`, which on a service account is the machine-wide `C:\Windows\Temp`; the error names the variables to set.
+- The line that reports a failed command changed shape, for **every** command and not just `start`. It used to be `Error: <message>` and is now a log record — `2026-08-24T09:12:09Z [ERROR] <message>` — so that the failure which ended a run is recorded in `corvex.log` rather than only on the terminal. A script matching `^Error:` on stderr needs updating; the exit status is unchanged. Under `RUST_LOG=off`, where no log record would be emitted, the old `Error: <message>` line is printed instead.
+
 # Corvex v0.6.5 Release Notes
 
 A small bug-fix release. When a subscription fails to download, corvex now tells you why.

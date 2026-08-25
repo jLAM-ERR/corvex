@@ -6,56 +6,160 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
 
-/// Parse `scutil --dns` output into domain → nameserver mappings.
-/// Extracts resolvers that have a `domain` entry (split-DNS / corp DNS),
-/// mapping each domain to its first nameserver.
+/// One resolver block from `scutil --dns`.
+///
+/// A resolver may be scoped to a domain (split-DNS / corp DNS) or global, and it
+/// may list any number of nameservers. Both are preserved here: `domain: None`
+/// marks a global resolver, and `nameservers` keeps every `nameserver[N]` line in
+/// the order scutil printed them, so a failover pair survives parsing.
+///
+/// Every platform's `Platform::list_system_resolvers` speaks in these, so the
+/// type is unconditional even though the scutil parser below it is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolverEntry {
+    /// `None` for a global/default resolver — one with no `domain` line.
+    pub domain: Option<String>,
+    /// Every nameserver of this resolver, in scutil's order.
+    pub nameservers: Vec<String>,
+    /// Interface name from `if_index : 14 (en0)`, when the resolver is scoped.
+    pub interface: Option<String>,
+}
+
+/// Parse `scutil --dns` output into one [`ResolverEntry`] per resolver block.
+///
+/// Every resolver that lists at least one nameserver is returned, global ones
+/// included; a resolver with no nameservers is dropped because there is nothing
+/// to query or diagnose. Lines other than `domain`, `nameserver[N]` and
+/// `if_index` are ignored.
+///
+/// Parsing stops at `DNS configuration (for scoped queries)`. scutil prints the
+/// same resolvers a second time in that section, renumbered from `#1`, so
+/// reading it too would list — and probe — every nameserver twice.
+///
+/// Gated to macOS plus `test`: `scutil --dns` is a macOS command, so nothing
+/// else calls this, but every platform's test run still covers the fixtures.
 #[cfg(any(test, target_os = "macos"))]
-pub fn parse_scutil_dns(output: &str) -> BTreeMap<String, String> {
-    let mut result = BTreeMap::new();
-    let mut current_domain: Option<String> = None;
-    let mut current_nameserver: Option<String> = None;
+pub fn parse_scutil_dns(output: &str) -> Vec<ResolverEntry> {
+    let mut resolvers: Vec<ResolverEntry> = Vec::new();
+    let mut current: Option<ResolverEntry> = None;
+
+    // Keeps a resolver only once it has somewhere to send a query.
+    fn flush(resolvers: &mut Vec<ResolverEntry>, entry: Option<ResolverEntry>) {
+        if let Some(entry) = entry.filter(|entry| !entry.nameservers.is_empty()) {
+            resolvers.push(entry);
+        }
+    }
 
     for line in output.lines() {
         let trimmed = line.trim();
 
-        // New resolver block resets state
+        // "DNS configuration (for scoped queries)" — the repeat listing. The
+        // plain "DNS configuration" header has no parenthesis and is kept.
+        if trimmed.starts_with("DNS configuration (") {
+            break;
+        }
+
+        // New resolver block flushes the previous one
         if trimmed.starts_with("resolver #") {
-            if let (Some(domain), Some(ns)) = (current_domain.take(), current_nameserver.take()) {
-                result.entry(domain).or_insert(ns);
-            }
-            current_domain = None;
-            current_nameserver = None;
+            flush(&mut resolvers, current.take());
+            current = Some(ResolverEntry {
+                domain: None,
+                nameservers: Vec::new(),
+                interface: None,
+            });
             continue;
         }
+
+        let Some(entry) = current.as_mut() else {
+            // Preamble before the first "resolver #" header
+            continue;
+        };
 
         // "domain   : corp.example.com" — split-DNS domain (not "search domain")
         if trimmed.starts_with("domain") && !trimmed.starts_with("domain_") {
-            if let Some(value) = trimmed.split(':').nth(1) {
-                let value = value.trim();
-                if !value.is_empty() {
-                    current_domain = Some(value.to_string());
-                }
+            if let Some(value) = field_value(trimmed).filter(|value| !value.is_empty()) {
+                entry.domain = Some(value.to_string());
             }
             continue;
         }
 
-        // "nameserver[0] : 10.0.0.1" — take the first nameserver only
-        if trimmed.starts_with("nameserver[") && current_nameserver.is_none() {
-            if let Some(value) = trimmed.split(':').nth(1) {
-                let value = value.trim();
-                if value.parse::<IpAddr>().is_ok() {
-                    current_nameserver = Some(value.to_string());
-                }
+        // "nameserver[0] : 10.10.20.53" — every one of them, in order.
+        if trimmed.starts_with("nameserver[") {
+            if let Some(value) = field_value(trimmed).filter(|value| is_ip_literal(value)) {
+                entry.nameservers.push(value.to_string());
+            }
+            continue;
+        }
+
+        // "if_index : 14 (en0)" — the interface name lives in the parentheses
+        if trimmed.starts_with("if_index") {
+            if let Some(name) = trimmed
+                .split_once('(')
+                .and_then(|(_, rest)| rest.split_once(')'))
+                .map(|(name, _)| name.trim())
+                .filter(|name| !name.is_empty())
+            {
+                entry.interface = Some(name.to_string());
             }
         }
     }
 
-    // Flush last resolver
-    if let (Some(domain), Some(ns)) = (current_domain, current_nameserver) {
-        result.entry(domain).or_insert(ns);
-    }
+    flush(&mut resolvers, current);
+    resolvers
+}
 
-    result
+/// The value side of a `key : value` scutil line, trimmed.
+///
+/// `split_once`, not `split(':').nth(1)`, so an IPv6 nameserver survives.
+#[cfg(any(test, target_os = "macos"))]
+fn field_value(line: &str) -> Option<&str> {
+    line.split_once(':').map(|(_, value)| value.trim())
+}
+
+/// True if `value` is an IP address, with or without an IPv6 zone id
+/// (`fe80::1%en0`). The zone is stripped only for validation; callers keep the
+/// literal scutil printed.
+#[cfg(any(test, target_os = "macos"))]
+fn is_ip_literal(value: &str) -> bool {
+    let addr = value.split_once('%').map_or(value, |(head, _)| head);
+    addr.parse::<IpAddr>().is_ok()
+}
+
+/// Project resolver entries down to the one-nameserver-per-domain map the xray
+/// DNS block still takes.
+///
+/// **This is lossy by design.** Global resolvers (`domain: None`) are dropped
+/// entirely, every nameserver after the first usable one is discarded, and the
+/// first resolver scoped to a given domain wins over any later one. A failover
+/// pair therefore collapses to its primary, and the interface is lost.
+///
+/// Zone-scoped IPv6 literals (`fe80::1%en0`) are skipped rather than collapsed:
+/// [`sync_to_config`] writes the string straight into `dns.servers[].address`,
+/// and xray reads anything that is not a bare IP literal as a *domain*, so a
+/// zone id would land in the config as a silently wrong server.
+///
+/// That is tolerable only because the xray DNS block this feeds is inert today:
+/// `domainStrategy` is `"AsIs"`, so the servers written by
+/// [`sync_to_config`] are never actually consulted for resolution. The real fix
+/// — carrying the full `Vec<String>` of nameservers through to the config —
+/// belongs to the `dns-parser-fixes` plan, not here. Diagnostics read the rich
+/// [`ResolverEntry`] list directly and must not go through this projection.
+#[cfg(any(test, target_os = "macos"))]
+pub fn corporate_mappings_first(resolvers: &[ResolverEntry]) -> BTreeMap<String, String> {
+    let mut mappings = BTreeMap::new();
+    for entry in resolvers {
+        let usable = entry
+            .nameservers
+            .iter()
+            .find(|nameserver| !nameserver.contains('%'));
+        if let (Some(domain), Some(nameserver)) = (&entry.domain, usable) {
+            // `or_insert`, not `insert`: first resolver scoped to a domain wins.
+            mappings
+                .entry(domain.clone())
+                .or_insert_with(|| nameserver.clone());
+        }
+    }
+    mappings
 }
 
 /// Sync DNS mappings into xray config.json's dns.servers section.
@@ -159,6 +263,55 @@ pub fn sync_to_config(
 mod tests {
     use super::*;
 
+    // Sanitized shape of a real `scutil --dns`: a global resolver with a
+    // failover nameserver pair and no domain line, then a domain-scoped one.
+    // Values are fixtures only — see the plan's sanitization table.
+    const SCUTIL_FIXTURE: &str = "\
+DNS configuration
+
+resolver #1
+  nameserver[0] : 10.10.20.53
+  nameserver[1] : 10.10.20.54
+  flags    : Request A records
+  reach    : 0x00000002 (Reachable)
+  order    : 5000
+
+resolver #5
+  domain   : corp.example.com
+  nameserver[0] : 10.10.20.53
+  if_index : 14 (en0)
+  flags    : Scoped, Request A records
+";
+
+    #[test]
+    fn parse_scutil_dns_keeps_all_nameservers() {
+        let resolvers = parse_scutil_dns(SCUTIL_FIXTURE);
+
+        assert_eq!(
+            resolvers[0].nameservers,
+            vec!["10.10.20.53".to_string(), "10.10.20.54".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_scutil_dns_harvests_domainless_resolver() {
+        let resolvers = parse_scutil_dns(SCUTIL_FIXTURE);
+
+        assert_eq!(resolvers.len(), 2);
+        assert_eq!(resolvers[0].domain, None);
+        assert_eq!(resolvers[0].interface, None);
+    }
+
+    #[test]
+    fn parse_scutil_dns_scoped_resolver_carries_domain_and_interface() {
+        let resolvers = parse_scutil_dns(SCUTIL_FIXTURE);
+
+        let scoped = &resolvers[1];
+        assert_eq!(scoped.domain.as_deref(), Some("corp.example.com"));
+        assert_eq!(scoped.nameservers, vec!["10.10.20.53".to_string()]);
+        assert_eq!(scoped.interface.as_deref(), Some("en0"));
+    }
+
     #[test]
     fn parse_scutil_dns_with_split_resolvers() {
         let output = "\
@@ -172,14 +325,14 @@ resolver #1
 
 resolver #2
   domain   : corp.example.com
-  nameserver[0] : 10.0.0.1
-  nameserver[1] : 10.0.0.2
+  nameserver[0] : 10.10.20.53
+  nameserver[1] : 10.10.20.54
   if_index : 18 (utun3)
   flags    : Request A records
 
 resolver #3
-  domain   : internal.local
-  nameserver[0] : 172.16.0.1
+  domain   : internal.example
+  nameserver[0] : 10.10.20.1
   if_index : 18 (utun3)
 
 resolver #4
@@ -187,36 +340,199 @@ resolver #4
   flags    : Request A records
 ";
 
-        let map = parse_scutil_dns(output);
-        assert_eq!(map.len(), 2);
-        assert_eq!(map["corp.example.com"], "10.0.0.1");
-        assert_eq!(map["internal.local"], "172.16.0.1");
+        let resolvers = parse_scutil_dns(output);
+
+        // Every resolver survives now, scoped and global alike.
+        assert_eq!(resolvers.len(), 4);
+        assert_eq!(resolvers[0].domain, None);
+        assert_eq!(resolvers[0].interface.as_deref(), Some("en0"));
+        assert_eq!(resolvers[1].domain.as_deref(), Some("corp.example.com"));
+        assert_eq!(resolvers[1].nameservers.len(), 2);
+        assert_eq!(resolvers[2].domain.as_deref(), Some("internal.example"));
+        assert_eq!(resolvers[3].domain, None);
+        assert_eq!(resolvers[3].nameservers, vec!["8.8.8.8".to_string()]);
+        assert_eq!(resolvers[3].interface, None);
     }
 
     #[test]
-    fn parse_scutil_dns_no_split_resolvers() {
+    fn parse_scutil_dns_drops_resolver_without_nameservers() {
+        let output = "\
+resolver #1
+  domain   : corp.example.com
+  if_index : 14 (en0)
+
+resolver #2
+  nameserver[0] : 10.10.20.53
+";
+
+        let resolvers = parse_scutil_dns(output);
+        assert_eq!(resolvers.len(), 1);
+        assert_eq!(resolvers[0].nameservers, vec!["10.10.20.53".to_string()]);
+    }
+
+    #[test]
+    fn parse_scutil_dns_stops_at_the_scoped_queries_section() {
+        // scutil repeats the same resolvers in a second section, renumbered
+        // from #1. Reading both would list and probe every nameserver twice.
         let output = "\
 DNS configuration
 
 resolver #1
-  search domain[0] : home.lan
-  nameserver[0] : 192.168.1.1
-  if_index : 6 (en0)
+  nameserver[0] : 10.10.20.53
+  if_index : 14 (en0)
+
+DNS configuration (for scoped queries)
+
+resolver #1
+  nameserver[0] : 10.10.20.53
+  if_index : 14 (en0)
+  flags    : Scoped, Request A records
 ";
 
-        let map = parse_scutil_dns(output);
-        assert!(map.is_empty());
+        let resolvers = parse_scutil_dns(output);
+        assert_eq!(resolvers.len(), 1, "the scoped repeat is not a resolver");
+        assert_eq!(resolvers[0].nameservers, vec!["10.10.20.53".to_string()]);
     }
 
     #[test]
     fn parse_scutil_dns_empty_output() {
-        let map = parse_scutil_dns("");
-        assert!(map.is_empty());
+        assert!(parse_scutil_dns("").is_empty());
+    }
+
+    #[test]
+    fn parse_scutil_dns_garbage_output() {
+        let output = "\
+not a resolver block
+  domain   : corp.example.com
+  nameserver[0] : 10.10.20.53
+";
+
+        // Without a "resolver #" header there is no block to attach lines to.
+        assert!(parse_scutil_dns(output).is_empty());
+    }
+
+    fn entry(domain: Option<&str>, nameservers: &[&str]) -> ResolverEntry {
+        ResolverEntry {
+            domain: domain.map(str::to_string),
+            nameservers: nameservers.iter().map(|ns| ns.to_string()).collect(),
+            interface: None,
+        }
+    }
+
+    #[test]
+    fn corporate_mappings_first_drops_global_resolvers() {
+        let resolvers = vec![
+            entry(None, &["10.10.20.53", "10.10.20.54"]),
+            entry(Some("corp.example.com"), &["10.10.20.53"]),
+        ];
+
+        let mappings = corporate_mappings_first(&resolvers);
+
+        // A BTreeMap<String, String> holding only the domain-scoped resolver.
+        let mut expected: BTreeMap<String, String> = BTreeMap::new();
+        expected.insert("corp.example.com".to_string(), "10.10.20.53".to_string());
+        assert_eq!(mappings, expected);
+    }
+
+    #[test]
+    fn corporate_mappings_first_takes_only_the_primary_nameserver() {
+        let resolvers = vec![entry(
+            Some("corp.example.com"),
+            &["10.10.20.53", "10.10.20.54"],
+        )];
+
+        let mappings = corporate_mappings_first(&resolvers);
+
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(
+            mappings.get("corp.example.com").map(String::as_str),
+            Some("10.10.20.53")
+        );
+    }
+
+    #[test]
+    fn corporate_mappings_first_keeps_the_first_of_duplicate_domains() {
+        let resolvers = vec![
+            entry(Some("corp.example.com"), &["10.10.20.53"]),
+            entry(Some("corp.example.com"), &["10.10.20.54"]),
+        ];
+
+        let mappings = corporate_mappings_first(&resolvers);
+
+        assert_eq!(
+            mappings.get("corp.example.com").map(String::as_str),
+            Some("10.10.20.53")
+        );
+    }
+
+    #[test]
+    fn corporate_mappings_first_skips_scoped_resolver_without_nameservers() {
+        let resolvers = vec![entry(Some("corp.example.com"), &[])];
+
+        assert!(corporate_mappings_first(&resolvers).is_empty());
+    }
+
+    #[test]
+    fn corporate_mappings_first_on_empty_input() {
+        assert!(corporate_mappings_first(&[]).is_empty());
+    }
+
+    #[test]
+    fn corporate_mappings_first_skips_a_zone_scoped_nameserver() {
+        // xray reads a `dns.servers[].address` that is not a bare IP literal as
+        // a domain, so `fe80::1%en0` would land in config.json as a silently
+        // wrong server. The failover partner behind it is used instead.
+        let resolvers = vec![entry(
+            Some("corp.example.com"),
+            &["fe80::1%en0", "10.10.20.53"],
+        )];
+
+        let mappings = corporate_mappings_first(&resolvers);
+
+        assert_eq!(
+            mappings.get("corp.example.com").map(String::as_str),
+            Some("10.10.20.53")
+        );
+    }
+
+    #[test]
+    fn corporate_mappings_first_drops_a_resolver_with_only_zone_scoped_nameservers() {
+        let resolvers = vec![entry(Some("corp.example.com"), &["fe80::1%en0"])];
+
+        assert!(
+            corporate_mappings_first(&resolvers).is_empty(),
+            "no usable literal means no mapping, not a broken one"
+        );
+    }
+
+    // The projection is what the macOS discover_corporate_dns feeds to
+    // sync_to_config, so drive it straight off the parser fixture.
+    #[test]
+    fn corporate_mappings_first_projects_the_scutil_fixture() {
+        let mappings = corporate_mappings_first(&parse_scutil_dns(SCUTIL_FIXTURE));
+
+        assert_eq!(mappings.len(), 1);
+        assert_eq!(
+            mappings.get("corp.example.com").map(String::as_str),
+            Some("10.10.20.53")
+        );
+    }
+
+    #[test]
+    fn parse_scutil_dns_keeps_ipv6_nameserver_with_zone() {
+        let output = "\
+resolver #1
+  nameserver[0] : fe80::1%en0
+  nameserver[1] : not-an-ip
+";
+
+        let resolvers = parse_scutil_dns(output);
+        assert_eq!(resolvers[0].nameservers, vec!["fe80::1%en0".to_string()]);
     }
 
     #[test]
     fn sync_to_config_adds_dns_servers() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let xray_config_path = dir.path().join("config.json");
 
         // Write a minimal xray config
@@ -252,7 +568,7 @@ resolver #1
 
     #[test]
     fn sync_to_config_preserves_non_corp_entries() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let xray_config_path = dir.path().join("config.json");
 
         // Write xray config with existing DNS
@@ -293,7 +609,7 @@ resolver #1
 
     #[test]
     fn sync_to_config_adds_routing_rule_with_port_53() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let xray_config_path = dir.path().join("config.json");
 
         let xray_cfg = serde_json::json!({
@@ -335,7 +651,7 @@ resolver #1
 
     #[test]
     fn sync_to_config_replaces_existing_corporate_dns_rule() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let xray_config_path = dir.path().join("config.json");
 
         let xray_cfg = serde_json::json!({
@@ -373,7 +689,7 @@ resolver #1
 
     #[test]
     fn sync_to_config_adds_routing_when_section_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let xray_config_path = dir.path().join("config.json");
 
         // No routing section at all
@@ -403,7 +719,7 @@ resolver #1
 
     #[test]
     fn sync_to_config_domains_are_deduplicated() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let xray_config_path = dir.path().join("config.json");
 
         let xray_cfg = serde_json::json!({
@@ -431,21 +747,25 @@ resolver #1
         assert_eq!(domains[0], "domain:corp.example.com");
     }
 
+    // The parser no longer de-duplicates: two resolvers scoped to the same
+    // domain are two entries, in scutil's order. Collapsing them to one
+    // nameserver is the xray-facing projection's job (see Task 6).
     #[test]
-    fn parse_scutil_dns_duplicate_domain_keeps_first() {
+    fn parse_scutil_dns_keeps_duplicate_domains_in_order() {
         let output = "\
 resolver #1
   domain   : corp.example.com
-  nameserver[0] : 10.0.0.1
+  nameserver[0] : 10.10.20.53
 
 resolver #2
   domain   : corp.example.com
-  nameserver[0] : 10.0.0.99
+  nameserver[0] : 10.10.20.54
 ";
 
-        let map = parse_scutil_dns(output);
-        assert_eq!(map.len(), 1);
-        assert_eq!(map["corp.example.com"], "10.0.0.1");
+        let resolvers = parse_scutil_dns(output);
+        assert_eq!(resolvers.len(), 2);
+        assert_eq!(resolvers[0].nameservers, vec!["10.10.20.53".to_string()]);
+        assert_eq!(resolvers[1].nameservers, vec!["10.10.20.54".to_string()]);
     }
 
     // Pins the end-to-end ordering across both mutators of routing.rules:
@@ -454,7 +774,7 @@ resolver #2
     // at the tail without reordering. Loopback stays first, corporate-dns last.
     #[test]
     fn full_config_keeps_loopback_first_and_corp_dns_last() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::config::test_tempdir();
         let xray_config_path = dir.path().join("config.json");
 
         let uri =
