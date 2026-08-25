@@ -729,7 +729,12 @@ fn cmd_start(config: &Config, plat: &impl Platform) -> anyhow::Result<()> {
         },
         StartSource::Entry(entry) => {
             info!("engine selected: xray (json subscription entry)");
-            debug!("using JSON subscription entry: {}", entry.params.name);
+            // `remarks` verbatim from the panel, same as the address in
+            // `health::candidate_line` - escaped for the same reason.
+            debug!(
+                "using JSON subscription entry: {}",
+                entry.params.name.escape_debug()
+            );
             let (subs_domains, subs_ips) = subs_direct_slices(merge_subs, &entry);
             if merge_subs && (!subs_domains.is_empty() || !subs_ips.is_empty()) {
                 info!(

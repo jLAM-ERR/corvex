@@ -23,7 +23,12 @@ fn find_free_port() -> Result<u16> {
 
 /// Check TCP connectivity to host:port with the given timeout.
 pub fn check_tcp(host: &str, port: u16, timeout: Duration) -> Result<()> {
-    debug!("TCP check {}:{} (timeout {:?})", host, port, timeout);
+    debug!(
+        "TCP check {}:{} (timeout {:?})",
+        host.escape_debug(),
+        port,
+        timeout
+    );
     let addr_str = format!("{host}:{port}");
     let addr: SocketAddr = addr_str
         .to_socket_addrs()
@@ -34,7 +39,7 @@ pub fn check_tcp(host: &str, port: u16, timeout: Duration) -> Result<()> {
     TcpStream::connect_timeout(&addr, timeout)
         .with_context(|| format!("TCP connect to {addr} timed out or failed"))?;
 
-    debug!("TCP check {}:{} succeeded", host, port);
+    debug!("TCP check {}:{} succeeded", host.escape_debug(), port);
     Ok(())
 }
 
@@ -163,8 +168,26 @@ const DEGRADED_THRESHOLD: Duration = Duration::from_millis(3000);
 /// minutes and nobody was watching the terminal. `outcome` is "testing" before
 /// the checks run and the verdict afterwards, so a sweep that hangs still shows
 /// which candidate it hung on.
+///
+/// The host is rendered with [`str::escape_debug`], because it is not corvex's
+/// string: it arrives verbatim from the subscription, either as the authority
+/// of a URI or as `outbounds[0].settings.vnext[0].address` of a JSON entry,
+/// and nothing between there and here requires it to look like a hostname.
+/// This line is emitted at `info`, which is the default level, so a panel that
+/// answers with an address containing a newline writes a second line into
+/// `corvex.log` that reads exactly like one of corvex's own — and one
+/// containing `\x1b[` rewrites the terminal the sweep is printing to.
+/// `escape_debug` is the right shape for it rather than a strip: it is
+/// injective, so two different addresses never render alike, and it escapes
+/// the whole of the Unicode `C*` and `Z*` classes, which takes in the bidi
+/// overrides that reorder a line without carrying a control character at all.
+/// A hostname that is actually a hostname passes through it untouched.
 fn candidate_line(index: usize, total: usize, host: &str, port: u16, outcome: &str) -> String {
-    format!("candidate {}/{total} {host}:{port}: {outcome}", index + 1)
+    format!(
+        "candidate {}/{total} {}:{port}: {outcome}",
+        index + 1,
+        host.escape_debug()
+    )
 }
 
 /// Find the first alive candidate from a list of parsed proxy params.
@@ -257,6 +280,34 @@ mod tests {
         assert_eq!(
             candidate_line(2, 3, "example.com", 8443, "TCP check failed, skipping"),
             "candidate 3/3 example.com:8443: TCP check failed, skipping"
+        );
+    }
+
+    /// The address in that line comes from the subscription and is never
+    /// checked against anything that looks like a hostname, so a panel can put
+    /// a newline or an escape sequence in it. The line is emitted at the
+    /// default level and goes to `corvex.log` as well as the terminal, which
+    /// makes it forgery: the second half of the address below would otherwise
+    /// arrive in the file as a record of its own, in corvex's own format,
+    /// reporting a start that never happened.
+    #[test]
+    fn candidate_line_escapes_an_address_the_panel_chose() {
+        let forged = "evil.example\n2026-08-25T09:00:00Z [INFO] start complete (0ms)";
+        let line = candidate_line(0, 1, forged, 443, "testing");
+
+        assert!(
+            !line.contains('\n'),
+            "a newline in the address must not split the record: {line}"
+        );
+        assert!(
+            line.contains("evil.example") && line.contains("start complete"),
+            "the bytes are escaped, not dropped, so the log still shows what was sent: {line}"
+        );
+
+        let ansi = candidate_line(0, 1, "evil.example\u{1b}[2J", 443, "testing");
+        assert!(
+            !ansi.contains('\u{1b}'),
+            "an escape sequence must not reach the terminal: {ansi}"
         );
     }
 

@@ -24,6 +24,12 @@ This applies to every path that names a subscription — progress lines, success
 
 **If you have shared corvex output before upgrading, treat the token in it as exposed and rotate it with your panel.** Because the leak predates this release, it can also be sitting in your shell scrollback or terminal logs.
 
+### A subscription could write its own lines into your log
+
+The server-testing sweep prints one line per candidate, naming the address it is about to try. That address comes from the subscription verbatim — the authority of a URI, or `outbounds[0].settings.vnext[0].address` of a JSON entry — and nothing required it to look like a hostname. The line is printed at the default level and, as of this release, goes to `corvex.log` as well as the terminal, so a panel answering with an address containing a newline could append a record of its own in corvex's own format, and one containing an escape sequence could rewrite the terminal the sweep was printing to.
+
+Addresses and subscription names are now escaped where they are logged. A real hostname is unaffected; anything else is shown with its control characters spelled out, so the log still records exactly what the panel sent.
+
 ## Fixes
 
 ### `corvex start` deadlocked against its own proxy
