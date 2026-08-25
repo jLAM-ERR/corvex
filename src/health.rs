@@ -1,6 +1,6 @@
 use crate::protocol::ProxyParams;
 use anyhow::{bail, Context, Result};
-use log::debug;
+use log::{debug, info};
 use rand::Rng;
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
@@ -23,7 +23,12 @@ fn find_free_port() -> Result<u16> {
 
 /// Check TCP connectivity to host:port with the given timeout.
 pub fn check_tcp(host: &str, port: u16, timeout: Duration) -> Result<()> {
-    debug!("TCP check {}:{} (timeout {:?})", host, port, timeout);
+    debug!(
+        "TCP check {}:{} (timeout {:?})",
+        host.escape_debug(),
+        port,
+        timeout
+    );
     let addr_str = format!("{host}:{port}");
     let addr: SocketAddr = addr_str
         .to_socket_addrs()
@@ -34,7 +39,7 @@ pub fn check_tcp(host: &str, port: u16, timeout: Duration) -> Result<()> {
     TcpStream::connect_timeout(&addr, timeout)
         .with_context(|| format!("TCP connect to {addr} timed out or failed"))?;
 
-    debug!("TCP check {}:{} succeeded", host, port);
+    debug!("TCP check {}:{} succeeded", host.escape_debug(), port);
     Ok(())
 }
 
@@ -155,6 +160,36 @@ pub fn check_tunnel(params: &ProxyParams, xray_bin: &str) -> Result<Duration> {
 const TCP_TIMEOUT: Duration = Duration::from_secs(5);
 const DEGRADED_THRESHOLD: Duration = Duration::from_millis(3000);
 
+/// One line per candidate in the health-check sweep: which candidate it is,
+/// where it points, and what happened to it.
+///
+/// This used to be a bare `eprintln!`, so the only visible sign of a long sweep
+/// never reached `corvex.log` — the file that gets read when a start took two
+/// minutes and nobody was watching the terminal. `outcome` is "testing" before
+/// the checks run and the verdict afterwards, so a sweep that hangs still shows
+/// which candidate it hung on.
+///
+/// The host is rendered with [`str::escape_debug`], because it is not corvex's
+/// string: it arrives verbatim from the subscription, either as the authority
+/// of a URI or as `outbounds[0].settings.vnext[0].address` of a JSON entry,
+/// and nothing between there and here requires it to look like a hostname.
+/// This line is emitted at `info`, which is the default level, so a panel that
+/// answers with an address containing a newline writes a second line into
+/// `corvex.log` that reads exactly like one of corvex's own — and one
+/// containing `\x1b[` rewrites the terminal the sweep is printing to.
+/// `escape_debug` is the right shape for it rather than a strip: it is
+/// injective, so two different addresses never render alike, and it escapes
+/// the whole of the Unicode `C*` and `Z*` classes, which takes in the bidi
+/// overrides that reorder a line without carrying a control character at all.
+/// A hostname that is actually a hostname passes through it untouched.
+fn candidate_line(index: usize, total: usize, host: &str, port: u16, outcome: &str) -> String {
+    format!(
+        "candidate {}/{total} {}:{port}: {outcome}",
+        index + 1,
+        host.escape_debug()
+    )
+}
+
 /// Find the first alive candidate from a list of parsed proxy params.
 /// Performs TCP pre-filter then tunnel check; returns the index of the first candidate with acceptable latency.
 pub fn find_alive_params(candidates: &[ProxyParams], xray_bin: &str) -> Result<usize> {
@@ -162,21 +197,17 @@ pub fn find_alive_params(candidates: &[ProxyParams], xray_bin: &str) -> Result<u
         "searching for alive server among {} candidates",
         candidates.len()
     );
+    let total = candidates.len();
     for (i, params) in candidates.iter().enumerate() {
-        eprintln!(
-            "  testing server {}/{}: {}:{}",
-            i + 1,
-            candidates.len(),
-            params.host,
-            params.port
-        );
+        let host = params.host.as_str();
+        let port = params.port;
+        info!("{}", candidate_line(i, total, host, port, "testing"));
 
         // Fast pre-filter: TCP connect
-        if check_tcp(&params.host, params.port, TCP_TIMEOUT).is_err() {
-            debug!(
-                "[{}/{}] TCP check failed, skipping",
-                i + 1,
-                candidates.len()
+        if check_tcp(host, port, TCP_TIMEOUT).is_err() {
+            info!(
+                "{}",
+                candidate_line(i, total, host, port, "TCP check failed, skipping")
             );
             continue;
         }
@@ -184,29 +215,23 @@ pub fn find_alive_params(candidates: &[ProxyParams], xray_bin: &str) -> Result<u
         // Full check: tunnel latency
         match check_tunnel(params, xray_bin) {
             Ok(latency) if latency <= DEGRADED_THRESHOLD => {
-                debug!(
-                    "[{}/{}] server alive (latency: {:?})",
-                    i + 1,
-                    candidates.len(),
-                    latency
+                info!(
+                    "{}",
+                    candidate_line(i, total, host, port, &format!("alive ({latency:?})"))
                 );
                 return Ok(i);
             }
             Ok(latency) => {
-                debug!(
-                    "[{}/{}] server too slow (latency: {:?})",
-                    i + 1,
-                    candidates.len(),
-                    latency
+                info!(
+                    "{}",
+                    candidate_line(i, total, host, port, &format!("too slow ({latency:?})"))
                 );
                 continue;
             }
             Err(e) => {
-                debug!(
-                    "[{}/{}] tunnel check failed: {}",
-                    i + 1,
-                    candidates.len(),
-                    e
+                info!(
+                    "{}",
+                    candidate_line(i, total, host, port, &format!("tunnel check failed: {e}"))
                 );
                 continue;
             }
@@ -241,6 +266,50 @@ pub fn find_alive_server(uris: &[String], xray_bin: &str) -> Result<String> {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// The sweep line is the only progress a long candidate search shows. It
+    /// carries a 1-based index (users count candidates from one), the endpoint,
+    /// and the outcome, and the same format is reused for the verdict so the
+    /// two lines pair up in the log.
+    #[test]
+    fn test_candidate_line_numbers_from_one() {
+        assert_eq!(
+            candidate_line(0, 3, "example.com", 443, "testing"),
+            "candidate 1/3 example.com:443: testing"
+        );
+        assert_eq!(
+            candidate_line(2, 3, "example.com", 8443, "TCP check failed, skipping"),
+            "candidate 3/3 example.com:8443: TCP check failed, skipping"
+        );
+    }
+
+    /// The address in that line comes from the subscription and is never
+    /// checked against anything that looks like a hostname, so a panel can put
+    /// a newline or an escape sequence in it. The line is emitted at the
+    /// default level and goes to `corvex.log` as well as the terminal, which
+    /// makes it forgery: the second half of the address below would otherwise
+    /// arrive in the file as a record of its own, in corvex's own format,
+    /// reporting a start that never happened.
+    #[test]
+    fn candidate_line_escapes_an_address_the_panel_chose() {
+        let forged = "evil.example\n2026-08-25T09:00:00Z [INFO] start complete (0ms)";
+        let line = candidate_line(0, 1, forged, 443, "testing");
+
+        assert!(
+            !line.contains('\n'),
+            "a newline in the address must not split the record: {line}"
+        );
+        assert!(
+            line.contains("evil.example") && line.contains("start complete"),
+            "the bytes are escaped, not dropped, so the log still shows what was sent: {line}"
+        );
+
+        let ansi = candidate_line(0, 1, "evil.example\u{1b}[2J", 443, "testing");
+        assert!(
+            !ansi.contains('\u{1b}'),
+            "an escape sequence must not reach the terminal: {ansi}"
+        );
+    }
 
     #[test]
     fn test_valid_address_format_parsing() {

@@ -1,6 +1,8 @@
-use super::{Platform, ProxyInfo, ProxyStatus};
+use super::{NextHop, Platform, ProxyInfo, ProxyStatus};
+use crate::dns::ResolverEntry;
+use crate::netdiag::{parse_ifconfig_inets, parse_route_get, InetAddr};
 use anyhow::{Context, Result};
-use log::debug;
+use log::{debug, info};
 use std::collections::BTreeMap;
 use std::process::Command;
 
@@ -81,6 +83,7 @@ fn run_networksetup_all(commands: &[Vec<&str>]) -> Result<()> {
         return Ok(());
     }
 
+    let started = std::time::Instant::now();
     for (i, args) in commands.iter().enumerate() {
         match try_networksetup(args)? {
             NsOutcome::Ok(_) => continue,
@@ -94,6 +97,18 @@ fn run_networksetup_all(commands: &[Vec<&str>]) -> Result<()> {
                 // effect already happened, regardless of what the user does next.
                 let already_applied = i > 0;
                 run_networksetup_elevated(commands, already_applied)?;
+                // Logged after the fact, not before: the elapsed time of an
+                // elevated batch is mostly how long the user took to type a
+                // password, which is worth telling apart from a slow
+                // `networksetup`.
+                info!(
+                    "{}",
+                    crate::phase_line(
+                        "networksetup batch",
+                        &format!("{} commands, elevated", commands.len()),
+                        started.elapsed()
+                    )
+                );
                 return Ok(());
             }
             NsOutcome::Failed(detail) => {
@@ -102,6 +117,14 @@ fn run_networksetup_all(commands: &[Vec<&str>]) -> Result<()> {
         }
     }
 
+    info!(
+        "{}",
+        crate::phase_line(
+            "networksetup batch",
+            &format!("{} commands, no elevation needed", commands.len()),
+            started.elapsed()
+        )
+    );
     Ok(())
 }
 
@@ -287,7 +310,22 @@ impl Platform for MacOsPlatform {
     }
 
     fn discover_corporate_dns(&self) -> Result<BTreeMap<String, String>> {
-        debug!("running scutil --dns to discover corp DNS");
+        let resolvers = self.list_system_resolvers()?;
+        // Transitional: the xray DNS path still takes one nameserver per domain,
+        // so the rich resolver list is projected down. See
+        // `dns::corporate_mappings_first` for what that throws away and why.
+        let discovered = crate::dns::corporate_mappings_first(&resolvers);
+        debug!("discovered {} split-DNS resolvers", discovered.len());
+
+        if discovered.is_empty() {
+            anyhow::bail!("No split-DNS resolvers found in scutil --dns output");
+        }
+
+        Ok(discovered)
+    }
+
+    fn list_system_resolvers(&self) -> Result<Vec<ResolverEntry>> {
+        debug!("running scutil --dns to list resolvers");
         let output = Command::new("scutil")
             .arg("--dns")
             .output()
@@ -298,15 +336,46 @@ impl Platform for MacOsPlatform {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let discovered = crate::dns::parse_scutil_dns(&stdout);
-        debug!("discovered {} split-DNS resolvers", discovered.len());
-
-        if discovered.is_empty() {
-            anyhow::bail!("No split-DNS resolvers found in scutil --dns output");
-        }
-
-        Ok(discovered)
+        Ok(crate::dns::parse_scutil_dns(&stdout))
     }
+
+    fn next_hop_status(&self, ip: &str) -> Result<NextHop> {
+        // `-n` keeps route from resolving the addresses it prints; the parser
+        // wants literals and a reverse lookup here would be slow and pointless.
+        let output = Command::new("route")
+            .args(["-n", "get", ip])
+            .output()
+            .with_context(|| format!("Failed to run 'route -n get {ip}'"))?;
+        // Status is not checked: route exits non-zero for a destination it has
+        // no route to, and the parse below says the same thing more clearly.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let route = parse_route_get(&stdout)
+            .with_context(|| format!("no route to {ip}: 'route -n get' named no interface"))?;
+
+        debug!("resolving the next hop to {ip}");
+        let inets = interface_inets(&route.interface);
+        Ok(NextHop::from_route(route, &inets))
+    }
+}
+
+/// Every IPv4 address configured on `interface`, empty if none can be read.
+///
+/// Best-effort by design: `route_is_on_link` reports an interface it cannot
+/// read as on-link, because failing to read it is not evidence that the gateway
+/// is unreachable.
+fn interface_inets(interface: &str) -> Vec<InetAddr> {
+    let Ok(output) = Command::new("ifconfig")
+        .arg(interface)
+        .output()
+        .map_err(|error| debug!("failed to run 'ifconfig {interface}': {error}"))
+    else {
+        return Vec::new();
+    };
+    let inets = parse_ifconfig_inets(&String::from_utf8_lossy(&output.stdout));
+    if inets.is_empty() {
+        debug!("no IPv4 address on {interface}; reachability cannot be judged");
+    }
+    inets
 }
 
 /// Extracts the interface name (e.g. "en0") from `route get default` output.

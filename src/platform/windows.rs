@@ -1,6 +1,8 @@
 #[cfg(windows)]
-use super::Platform;
+use super::{NextHop, Platform};
 use super::{ProxyInfo, ProxyStatus};
+#[cfg(windows)]
+use crate::dns::ResolverEntry;
 #[allow(unused_imports)]
 use anyhow::{Context, Result};
 #[cfg(windows)]
@@ -640,6 +642,19 @@ impl Platform for WindowsPlatform {
         }
 
         Ok(merged)
+    }
+
+    /// Not implemented on Windows: the diagnostic's resolver list needs the
+    /// per-resolver detail `get_adapter_dns_mappings` throws away, and there is
+    /// no `scutil`/`resolvectl` equivalent already parsed here to lift.
+    fn list_system_resolvers(&self) -> Result<Vec<ResolverEntry>> {
+        anyhow::bail!("listing system resolvers is not implemented on Windows")
+    }
+
+    /// Not implemented on Windows: reachability needs the route table and the
+    /// adapter's subnet, neither of which this module reads today.
+    fn next_hop_status(&self, _ip: &str) -> Result<NextHop> {
+        anyhow::bail!("next-hop diagnosis is not implemented on Windows")
     }
 }
 

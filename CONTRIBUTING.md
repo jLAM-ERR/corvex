@@ -2,12 +2,18 @@
 
 ## Development setup
 
-A stable [Rust toolchain](https://rustup.rs) is all you need:
+Install [rustup](https://rustup.rs); nothing else is required:
 
 ```bash
 cargo build           # Build
 cargo run -- --help   # Run the CLI from the checkout
 ```
+
+The toolchain is pinned in `rust-toolchain.toml`, so rustup fetches that exact
+rustc, rustfmt and clippy — plus the cross targets the release job builds — on
+your first `cargo` command in the checkout. Do not use a cargo installed outside
+rustup: it ignores the pin, and rustfmt versions disagree with each other, so
+`cargo fmt --check` would then mean something different locally than in CI.
 
 For shell-script changes, `shellcheck` is recommended (`brew install shellcheck`).
 
@@ -21,6 +27,10 @@ cargo clippy -- -D warnings -A dead_code  # Lint (warnings are errors)
 cargo fmt --check                         # Formatting
 shellcheck install.sh                     # When touching install.sh
 ```
+
+`ralphex-rust.Dockerfile` builds a container carrying the same pinned toolchain,
+for running the gates off the dev machine. Bumping the toolchain means changing
+both `channel` in `rust-toolchain.toml` and `ARG RUST_VERSION` in that file.
 
 ## Code conventions
 
@@ -49,8 +59,10 @@ shellcheck install.sh                     # When touching install.sh
 
 ```powershell
 winget install Rustlang.Rustup
-rustup default stable
 ```
+
+(No `rustup default` needed — `rust-toolchain.toml` selects the toolchain inside
+the checkout regardless of the default.)
 
 ### Build and test
 
